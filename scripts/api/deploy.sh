@@ -1,24 +1,22 @@
 #!/usr/bin/env bash
-set -e
+set -euo pipefail
 
 working_dir=$(pwd)
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Navigate to the script directory
-cd "$script_dir"
-
 # Pull the latest changes
-cd ../../nginx/public/api
+cd "$script_dir/../../nginx/public/api"
 git pull --rebase
 
 # Deploy to docker container
 commands="
-composer install --no-ansi --no-interaction --no-progress --no-scripts --optimize-autoloader
-composer dump-autoload --optimize
+composer install --no-dev --no-ansi --no-interaction --no-progress --optimize-autoloader
 php artisan config:clear
-php artisan cache:clear
 php artisan route:clear
+php artisan event:clear
+php artisan view:clear
 php artisan migrate --force
+chown -R www-data:www-data bootstrap/cache
 php artisan horizon:terminate
 "
 docker exec -t api-service bash -c "$commands"
