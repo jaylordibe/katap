@@ -11,6 +11,7 @@ each project with its own API, database and Redis, behind one HTTPS edge.
 ![Docker Compose](https://img.shields.io/badge/Docker%20Compose-57606a?style=flat-square)
 ![Caddy](https://img.shields.io/badge/Caddy-57606a?style=flat-square)
 ![Bash](https://img.shields.io/badge/bash%205-57606a?style=flat-square)
+[![License: MIT](https://img.shields.io/badge/license-MIT-57606a?style=flat-square)](LICENSE)
 
 Laravel · NestJS · Angular · React · Vue · Next.js · Nuxt · anything in a container
 
@@ -431,5 +432,7 @@ bash 3.2 behaves exactly like the server.
 <div align="center">
 
 **Your projects, spread across one server — each in its own space.**
+
+MIT licensed · see [LICENSE](LICENSE)
 
 </div>
