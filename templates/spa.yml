@@ -1,7 +1,7 @@
 # Component __C__: a single-page app (Angular, React, Vue, ...) served as static
 # files from its own image.
 #
-# What the image must do (README "Publishing a SPA image"):
+# What the image must do (docs/reference.md, "Publishing a SPA image"):
 #   - serve the built files on port 80, answering an unknown path with index.html
 #     (client-side routing) and `/` with 200;
 #   - contain `wget` for the healthcheck below (nginx:alpine and caddy:alpine do),

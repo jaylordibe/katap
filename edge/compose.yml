@@ -15,7 +15,7 @@ services:
     # IPv4 only. IPv6 clients would reach Caddy through Docker's userland proxy with
     # the network gateway as their address, so every one of them would share one
     # client IP (and one rate-limit bucket). Publish no AAAA record for these sites;
-    # IPv6 is a known ceiling (README).
+    # IPv6 is a known ceiling (docs/security.md, "Known limits").
     # EDGE_HTTP_PORT / EDGE_HTTPS_PORT exist for the test suite, which cannot
     # assume 80 and 443 are free on a developer machine. Leave them unset on a server.
     ports:

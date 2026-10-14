@@ -5,7 +5,7 @@
 #    /var/lib/postgresql and each major version keeps its cluster in <major>/docker,
 #    so a changed image major would otherwise initialise a new, empty database and
 #    the application would serve it. Upgrading a major is a deliberate
-#    dump-and-restore (README "Upgrading PostgreSQL").
+#    dump-and-restore (docs/operations.md, "Upgrading PostgreSQL").
 # 2. With a certificate mounted at /katap/tls, serves TLS. PostgreSQL refuses a key
 #    that its own user does not own or that others can read, and a bind mount
 #    carries the host's owner and mode, so the pair is installed into the data
@@ -16,7 +16,7 @@ if [ ! -s "$PGDATA/PG_VERSION" ]; then
     for version_file in /var/lib/postgresql/*/docker/PG_VERSION; do
         [ -s "$version_file" ] || continue
         echo "katap: $PGDATA is empty but $(dirname "$version_file") holds a PostgreSQL $(cat "$version_file") cluster." >&2
-        echo "katap: refusing to start an empty database beside it; see README \"Upgrading PostgreSQL\"." >&2
+        echo "katap: refusing to start an empty database beside it; see docs/operations.md, \"Upgrading PostgreSQL\"." >&2
         exit 1
     done
 fi

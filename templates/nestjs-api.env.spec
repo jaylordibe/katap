@@ -3,6 +3,8 @@
 # start in production with anything missing; the full list, with what each value
 # means, is nestjs-api's docs/deployment/README.md. Fill every `required` value on
 # the host before the first deploy: `katap deploy` refuses while one is empty.
+# `frontend:url` and `frontend:origins` come from the project's one spa or
+# node-ssr component with domains; with none or several they are `required` too.
 
 [db]
 POSTGRES_PASSWORD=hex:32
@@ -16,8 +18,8 @@ REDISCLI_AUTH=same:REDIS_PASSWORD
 NODE_ENV=literal:production
 PORT=literal:3000
 API_BASE_URL=literal:https://{domain}/api
-WEB_BASE_URL=required
-CORS_ORIGIN=required
+WEB_BASE_URL=frontend:url
+CORS_ORIGIN=frontend:origins
 DATABASE_URL=literal:postgresql://app:{secret:APP_DB_PASSWORD}@__C__-db:5432/app?schema=public
 REDIS_HOST=literal:__C__-redis
 REDIS_PORT=literal:6379

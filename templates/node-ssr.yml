@@ -1,7 +1,7 @@
 # Component __C__: a server-rendered web app (Next.js, Nuxt, SvelteKit, Remix, ...)
 # running its own Node server on port 3000.
 #
-# What the image must do (README "Publishing a server-rendered image"):
+# What the image must do (docs/reference.md, "Publishing a server-rendered image"):
 #   - listen on 0.0.0.0:3000 and answer `/` with 200;
 #   - contain `wget` (any alpine-based Node image does), or replace the healthcheck.
 # Server-side calls to an API in the same project can use its internal address

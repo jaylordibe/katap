@@ -128,7 +128,20 @@ rendered() {
 
 section "static"
 
-check "shellcheck: every script" shellcheck -x "$REPO/bin/katap" "$REPO"/lib/*.sh "$REPO"/host/*.sh "$REPO"/action/*.sh "$REPO/tests/run.sh" "$REPO/tests/e2e.sh"
+check "shellcheck: every script" shellcheck -x "$REPO/bin/katap" "$REPO"/lib/*.sh "$REPO"/host/*.sh "$REPO"/action/*.sh "$REPO/install.sh" "$REPO/connect.sh" "$REPO/tests/run.sh" "$REPO/tests/e2e.sh"
+
+check "every link and anchor in README.md and docs/ resolves, and every docs reference in the code names a real heading" \
+    python3 "$REPO/tests/check_docs.py" "$REPO"
+check "laravel-api and nestjs-api never mention Katap (they publish images; how they are deployed is not theirs)" \
+    bash -c "for r in laravel-api nestjs-api; do [ ! -d '$REPO/../'\$r ] || ! grep -rIil katap '$REPO/../'\$r --exclude-dir=.git --exclude-dir=node_modules --exclude-dir=vendor || exit 1; done"
+
+# connect.sh runs alone on the operator's computer, so it restates the server's
+# rules for each value; the copies must stay identical.
+same_rule() { [ "$(grep -m1 "^$1=" "$REPO/bin/katap")" = "$(grep -m1 "^$1=" "$REPO/connect.sh")" ]; }
+check "connect.sh validates with exactly the server's rules" \
+    bash -c "$(declare -f same_rule); REPO='$REPO'; for r in PROJECT_RE COMPONENT_RE DOMAIN_RE REPO_RE IMAGE_RE IPV4_RE; do same_rule \$r || { echo \$r; exit 1; }; done"
+check "provision.sh and the action bind the same project and component names" \
+    bash -c "for f in '$REPO/host/provision.sh' '$REPO/action/deploy.sh'; do grep -qF \"\$(sed -n \"s/^PROJECT_RE='\\(.*\\)'\$/\\1/p\" '$REPO/bin/katap' | sed 's/\\\$\$//')\" \"\$f\" && grep -qF \"\$(sed -n \"s/^COMPONENT_RE='\\(.*\\)'\$/\\1/p\" '$REPO/bin/katap' | sed 's/\\\$\$//')\" \"\$f\" || { echo \$f; exit 1; }; done"
 
 no_match() {
     local pattern="$1"
@@ -513,7 +526,7 @@ rm -f "$WORK/dispatched"
 for request in 'deploy shop api x; rm -rf /' 'deploy $(id)' 'deploy `id`' 'deploy shop api x | sh' 'deploy shop api x && id' "deploy shop api x"$'\n'"id"; do
     refuses "ssh-dispatch refuses: $(printf '%q' "$request")" "characters outside the allowed set" dispatch "$request"
 done
-for request in 'run shop api-artisan tinker' 'restore shop api /tmp/x --confirm shop' 'secrets shop api' 'edge up' 'bash' ''; do
+for request in 'run shop api-artisan tinker' 'restore shop api /tmp/x --confirm shop' 'secrets shop api' 'edge up' 'apply' 'release-info' 'add shop spa x' 'bash' ''; do
     refuses "ssh-dispatch refuses the verb in '$request'" "refused" dispatch "$request"
 done
 refuses "a key without an environment is refused" "this key has no environment" dispatch "deploy shop api $D64" ''
@@ -600,6 +613,263 @@ check "the Redis services read only their own secrets file" \
     test "$(redis_env_files "$REPO/templates/laravel-api.yml") $(redis_env_files "$REPO/templates/nestjs-api.yml")" = "__C__.redis.env __C__.redis.env"
 check "the database health check uses TCP" \
     bash -c "jq -r '.services[\"api-db\"].healthcheck.test | join(\" \")' <<<'$(jq -c . <<<"$shop_config")' | grep -q -- '-h 127.0.0.1'"
+
+# --- katap apply ----------------------------------------------------------------
+
+section "katap apply (projects from katap.json)"
+
+K_MAIN="$K"
+K="$(new_katap)"
+projects_json() { printf '%s\n' "$1" > "$K/srv/katap.json"; }
+tree_sum() { find "$K/srv/projects" "$K/srv/secrets" -type f -exec sha256sum {} + 2>/dev/null | sort; }
+# The edge is not running here: apply's reload is recorded, not performed.
+applies() { KATAP_DOCKER="$WORK/edge-recorder" katap apply; }
+# says <text> <fixed string...>: every string is in the text; lacks: none is.
+says() { local text="$1" f; shift; for f in "$@"; do grep -qF -- "$f" <<<"$text" || { echo "missing: $f"; return 1; }; done; }
+lacks() { local text="$1" f; shift; for f in "$@"; do ! grep -qF -- "$f" <<<"$text" || { echo "present: $f"; return 1; }; done; }
+
+refuses "apply without katap.json names the file to write" "no $K/srv/katap.json" applies
+SHOP_JSON='{
+  "host": "203.0.113.10",
+  "projects": {
+    "shop": {
+      "api": { "type": "laravel-api", "repo": "Acme/Shop-API", "domains": ["api.shop.test"] },
+      "web": { "type": "spa", "repo": "acme/shop-web", "domains": ["shop.test", "www.shop.test"] }
+    },
+    "blog": {
+      "api": { "type": "nestjs-api", "repo": "acme/blog-api", "domains": ["api.blog.test"] }
+    }
+  }
+}'
+projects_json "$SHOP_JSON"
+tool_sum() { (cd "$K" && find . -path ./srv -prune -o -type f -print0 | sort -z | xargs -0 sha256sum); }
+tool_before="$(tool_sum)"
+: > "$WORK/edge.log"
+if apply_out="$(applies 2>&1)"; then ok "apply creates every declared component"; else not_ok "apply creates every declared component" "$apply_out"; fi
+check "…derives the image (lowercase) and keeps the repository as written" \
+    bash -c "grep -qxF image=ghcr.io/acme/shop-api '$K/srv/projects/shop/api.conf' && grep -qxF source_repo=Acme/Shop-API '$K/srv/projects/shop/api.conf'"
+check "…derives a nestjs-api's migrate image" grep -qxF image_migrate=ghcr.io/acme/blog-api-migrate "$K/srv/projects/blog/api.conf"
+check "…and gives a spa no migrate image" bash -c "! grep -q '^image_migrate=' '$K/srv/projects/shop/web.conf'"
+check "…and writes nothing into the tool" test "$tool_before" = "$(tool_sum)"
+check "…and gives a second project the usual modes, not the secrets' strict ones" \
+    bash -c "[ \"\$(stat -c %a '$K/srv/projects/blog')\" = 755 ] && [ \"\$(stat -c %a '$K/srv/projects/blog/api.conf')\" = 644 ] && [ \"\$(stat -c %a '$K/srv/projects/blog/site.caddy')\" = 644 ]"
+check "the API's frontend URL and CORS origins come from the project's one web component" \
+    bash -c "[ \"\$(grep '^APP_FRONTEND_URL=' '$K/srv/secrets/shop/api.env')\" = APP_FRONTEND_URL=https://shop.test ] && [ \"\$(grep '^CORS_ALLOWED_ORIGINS=' '$K/srv/secrets/shop/api.env')\" = CORS_ALLOWED_ORIGINS=https://shop.test,https://www.shop.test ]"
+check "…and stay required in a project without one" \
+    bash -c "grep -A1 -xF '# katap:required' '$K/srv/secrets/blog/api.env' | grep -qxF WEB_BASE_URL="
+check "apply prints an A record per domain, pointing at the host" grep -qE '^  www\.shop\.test +A  203\.0\.113\.10$' <<<"$apply_out"
+check "…the values only the operator knows" says "$apply_out" "shop/api.env: MAIL_MAILER MAIL_FROM_ADDRESS"
+check "…and nothing derived" lacks "$apply_out" APP_FRONTEND_URL CORS_ALLOWED_ORIGINS
+check "…and the one laptop command, carrying only the host" \
+    grep -qxF '  curl -fsSL https://raw.githubusercontent.com/jaylordibe/katap/main/connect.sh | bash -s -- root@203.0.113.10' <<<"$apply_out"
+check "…and reloads the edge for the new sites" grep -q 'ps -q caddy' "$WORK/edge.log"
+
+# The same component made by hand: apply is a driver over add and secrets, not a
+# second way to write a project.
+K_APPLY="$K"
+K="$(new_katap)"
+katap add shop laravel-api api api.shop.test >/dev/null
+katap add shop spa web shop.test www.shop.test >/dev/null
+check "apply writes the compose files and site.caddy exactly as katap add does" \
+    bash -c "cmp '$K/srv/projects/shop/api.yml' '$K_APPLY/srv/projects/shop/api.yml' && cmp '$K/srv/projects/shop/web.yml' '$K_APPLY/srv/projects/shop/web.yml' && cmp '$K/srv/projects/shop/site.caddy' '$K_APPLY/srv/projects/shop/site.caddy'"
+check "…and a .conf that differs from add's only in the keys katap.json owns" \
+    bash -c "diff <(grep -vE '^(image|image_migrate|source_repo|environment|domains|provenance)=' '$K/srv/projects/shop/api.conf') <(grep -vE '^(image|image_migrate|source_repo|environment|domains|provenance)=' '$K_APPLY/srv/projects/shop/api.conf')"
+K="$K_APPLY"
+
+before="$(tree_sum)"
+: > "$WORK/edge.log"
+again="$(applies 2>&1)"
+check "a second apply changes nothing" test "$before" = "$(tree_sum)"
+check "…creates nothing" lacks "$again" "Created:"
+check "…and still reloads the edge, so a site an interrupted run wrote is served" grep -q 'ps -q caddy' "$WORK/edge.log"
+
+# The operator's own edits survive: only the keys katap.json owns are written.
+sed -i 's|^rollout=.*|rollout=api api-worker|; s|^smoke_path=.*|smoke_path=/api/health/live|' "$K/srv/projects/shop/api.conf"
+printf '\nshop.test {\n\timport katap_site\n\tredir https://www.shop.test{uri} permanent\n}\n' >> "$K/srv/projects/shop/site.caddy"
+site_before="$(sha256sum < "$K/srv/projects/shop/site.caddy")"
+projects_json "$(jq '.projects.shop.web.provenance = "none"' <<<"$SHOP_JSON")"
+applies >/dev/null 2>&1
+check "apply keeps a hand-tuned rollout= and smoke_path=" \
+    bash -c "grep -qxF 'rollout=api api-worker' '$K/srv/projects/shop/api.conf' && grep -qxF 'smoke_path=/api/health/live' '$K/srv/projects/shop/api.conf'"
+check "…and a hand-added site block" test "$site_before" = "$(sha256sum < "$K/srv/projects/shop/site.caddy")"
+check "provenance=none is set from katap.json" grep -qxF provenance=none "$K/srv/projects/shop/web.conf"
+check "…with one line per key" test "$(grep -c '^provenance=' "$K/srv/projects/shop/web.conf")" = 1
+
+# A domain change on an existing component: .conf follows, secrets and site.caddy
+# are reported, never rewritten.
+env_before="$(sha256sum < "$K/srv/secrets/shop/api.env")"
+projects_json "$(jq '.projects.shop.web.provenance = "none" | .projects.shop.web.domains = ["shop.test"]' <<<"$SHOP_JSON")"
+drift_out="$(applies 2>&1)"
+check "a domain change updates the .conf" grep -qxF domains=shop.test "$K/srv/projects/shop/web.conf"
+check "…leaves site.caddy and the secrets byte-identical" \
+    bash -c "[ '$site_before' = \"\$(sha256sum < '$K/srv/projects/shop/site.caddy')\" ] && [ '$env_before' = \"\$(sha256sum < '$K/srv/secrets/shop/api.env')\" ]"
+check "…and says what to change by hand" says "$drift_out" "shop/web: its domains changed; edit" \
+    "shop/api: CORS_ALLOWED_ORIGINS is https://shop.test,https://www.shop.test in api.env; the project's frontend now gives https://shop.test."
+
+# Components katap.json does not mention are never touched.
+katap add tools spa docs >/dev/null
+projects_json "$(jq 'del(.projects.blog) | .projects.shop.web.provenance = "none" | .projects.shop.web.domains = ["shop.test"]' <<<"$SHOP_JSON")"
+before="$(tree_sum)"
+unmanaged_out="$(applies 2>&1)"
+check "a component katap.json drops, or never had, keeps every file" test "$before" = "$(tree_sum)"
+check "…and is listed as not managed (dropped)" grep -qxF '  blog/api' <<<"$unmanaged_out"
+check "…and is listed as not managed (made by hand)" grep -qxF '  tools/docs' <<<"$unmanaged_out"
+GOOD_JSON="$(cat "$K/srv/katap.json")"
+
+# Every value is checked before anything is written.
+bad_json() {
+    local name="$1" message="$2" filter="$3"
+    projects_json "$(jq "$filter" <<<"$GOOD_JSON")"
+    before="$(tree_sum)"
+    refuses "apply refuses $name" "$message" applies
+    [ "$before" = "$(tree_sum)" ] || not_ok "…and wrote nothing after refusing $name"
+    projects_json "$GOOD_JSON"
+}
+bad_json "a newline smuggling a second .conf line" "whitespace or a control character" '.projects.shop.api.repo = "acme/x\nprovenance=none"'
+bad_json "a value with a space" "whitespace or a control character" '.projects.shop.api.domains = ["a.test b.test"]'
+bad_json "a type that walks out of templates/" "unknown type '../../edge/compose'" '.projects.shop.new = {"type": "../../edge/compose", "repo": "a/b"}'
+bad_json "an unknown type" "unknown type 'rails'" '.projects.shop.new = {"type": "rails", "repo": "a/b"}'
+bad_json "a repository without an owner" "repo must be owner/name" '.projects.shop.api.repo = "shop-api"'
+bad_json "an image with a tag" "image must be a lowercase repository" '.projects.shop.api.image = "ghcr.io/acme/shop-api:latest"'
+bad_json "an unknown environment" "environment must be production or staging" '.projects.shop.api.environment = "qa"'
+bad_json "an unknown provenance" "provenance must be attested or none" '.projects.shop.api.provenance = "off"'
+bad_json "a domain with shell syntax" "whitespace or a control character" '.projects.shop.api.domains = ["x.test;\nrm"]'
+bad_json "a wildcard domain (never expanded away by a glob)" "invalid domain '*.shop.test'" '.projects.shop.api.domains = ["*.shop.test"]'
+bad_json "a name with a control character" "whitespace or a control character" '.projects["sh\u001fop"] = .projects.shop'
+bad_json "one repository for two components in one environment" "a repository deploys one component per environment" '.projects.other = {"api": {"type": "spa", "repo": "acme/SHOP-API", "domains": ["other.test"]}}'
+bad_json "a repository named only dots" "repo must be owner/name" '.projects.shop.api.repo = "acme/.."'
+bad_json "a type change listed after a component it would rewrite" "never changes type" '.projects.shop.api.provenance = "none" | .projects.shop.web.type = "node-ssr"'
+bad_json "a domain another component still serves" "which shop/api still serves" '.projects.shop.api.domains = [] | .projects.other = {"web": {"type": "spa", "repo": "a/b", "domains": ["api.shop.test"]}}'
+bad_json "a domain a site.caddy block still serves" "site.caddy already serves" '.projects.other = {"web": {"type": "spa", "repo": "a/b", "domains": ["www.shop.test"]}}'
+printf '\nhttps://legacy.shop.test {\n\timport katap_site\n}\nport.shop.test:443 {\n\timport katap_site\n}\n' >> "$K/srv/projects/shop/site.caddy"
+bad_json "a domain a hand-written https:// block serves" "site.caddy already serves" '.projects.other = {"web": {"type": "spa", "repo": "a/b", "domains": ["legacy.shop.test"]}}'
+bad_json "a domain a hand-written block with a port serves" "site.caddy already serves" '.projects.other = {"web": {"type": "spa", "repo": "a/b", "domains": ["port.shop.test"]}}'
+# A component an interrupted run left half-made is named, never silently skipped.
+cp "$K/srv/projects/shop/web.yml" "$K/srv/projects/shop/half.yml"
+bad_json "a component left with a compose file but no .conf" "shop/half is half-created" '.projects.shop.half = {"type": "spa", "repo": "a/half"}'
+rm -f "$K/srv/projects/shop/half.yml"
+mkdir -p "$K/srv/secrets/shop" && : > "$K/srv/secrets/shop/half.db.env"
+projects_json "$(jq '.projects.shop.half = {"type": "spa", "repo": "a/half"}' <<<"$GOOD_JSON")"
+refuses "secrets an interrupted run left half-made are named" "shop/half's secrets are half-made" applies
+rm -f "$K/srv/secrets/shop/half.db.env" "$K/srv/projects/shop/half.conf" "$K/srv/projects/shop/half.yml"
+projects_json "$GOOD_JSON"
+bad_json "an invalid domain" "invalid domain 'x.test;rm'" '.projects.shop.api.domains = ["x.test;rm"]'
+bad_json "one domain on two components" "shop.test is claimed by both" '.projects.blog = {"web": {"type": "spa", "repo": "a/b", "domains": ["shop.test"]}}'
+katap add tools spa site taken.test >/dev/null
+GOOD_JSON="$(cat "$K/srv/katap.json")"
+bad_json "a domain a component made by hand already serves" "which tools/site still serves" '.projects.shop.api.domains = ["taken.test"]'
+bad_json "a misspelled key" "unknown key(s) domain" '.projects.shop.api.domain = ["x.test"]'
+bad_json "a host that is not an IPv4 address" "host must be this server's public IPv4" '.host = "example.com"'
+bad_json "an invalid project name" "invalid project name 'Shop'" '.projects.Shop = .projects.shop'
+bad_json "a component with a hyphen" "invalid component name 'my-web'" '.projects.shop["my-web"] = .projects.shop.web'
+bad_json "a component that changes type" "never changes type" '.projects.shop.web.type = "node-ssr"'
+printf '{"projects": ' > "$K/srv/katap.json"
+refuses "apply refuses a file that is not JSON" "is not valid JSON" applies
+projects_json "$GOOD_JSON"
+
+# A .conf that disagrees with katap.json is never deployed.
+# A problem in another project's part of katap.json holds only that project.
+projects_json "$(jq '.projects.zed = {"api": {"type": "rails", "repo": "a/z"}}' <<<"$GOOD_JSON")"
+check "katap check of one project is not held by a problem in another's part of katap.json" katap check shop
+projects_json "$(jq '.projects.shop.web.type = "rails"' <<<"$GOOD_JSON")"
+refuses "…while a problem in its own part refuses it" "unknown type 'rails'" katap check shop
+printf '{"projects": ' > "$K/srv/katap.json"
+refuses "…and so does a file that does not parse" "fix it and run 'katap apply'" katap check shop
+projects_json "$GOOD_JSON"
+for key in image source_repo environment provenance domains; do
+    cp "$K/srv/projects/shop/api.conf" "$WORK/api.conf.before"
+    set_conf shop api "$key" "$( [ "$key" = environment ] && echo staging || { [ "$key" = provenance ] && echo none; } || echo changed)"
+    refuses "katap check refuses a .conf whose $key was edited away from katap.json" "$key differs from $K/srv/katap.json; run 'katap apply'" katap check shop
+    cp "$WORK/api.conf.before" "$K/srv/projects/shop/api.conf"
+done
+set_conf shop api image ghcr.io/evil/shop-api
+applies >/dev/null 2>&1
+check "…until apply puts it back" katap check shop
+sed -i 's/^api\.shop\.test {$/api.shop.example {/' "$K/srv/projects/shop/site.caddy"
+check "katap check warns when a declared domain has no site block" \
+    bash -c "KATAP_SRV='$K/srv' KATAP_SETTINGS='$K/katap.env' '$K/bin/katap' check shop 2>&1 | grep -qF \"WARNING: shop/api: 'api.shop.test' is not in\""
+sed -i 's/^api\.shop\.example {$/api.shop.test {/' "$K/srv/projects/shop/site.caddy"
+# Ownership on the host's shared folder may not stick inside the runner, so this
+# directory lives in the container's own /tmp.
+OWNED="$(mktemp -d /tmp/katap-owned.XXXXXX)"
+cp -a "$K/srv/projects/." "$OWNED/"
+chown -R nobody "$OWNED"
+check "(the ownership change took effect)" test "$(stat -c %U "$OWNED")" = nobody
+refuses "apply refuses to run as anyone but the owner of the projects directory" "run apply as the owner of $OWNED" \
+    env KATAP_PROJECTS="$OWNED" KATAP_DOCKER="$WORK/edge-recorder" KATAP_SRV="$K/srv" KATAP_SETTINGS="$K/katap.env" "$K/bin/katap" apply
+rm -rf "$OWNED"
+
+# release-info: what connect.sh reads.
+ssh-keygen -q -t ed25519 -N '' -f "$WORK/serverkey" -C 'root@server' >/dev/null
+info() { KATAP_RELEASE_FILE="$WORK/release" KATAP_HOST_KEY_FILE="$WORK/serverkey.pub" katap release-info; }
+rm -f "$WORK/release"
+refuses "release-info without an installed release refuses" "install Katap with install.sh first" info
+git -C "$K" init -q
+echo /srv/ > "$K/.git/info/exclude"
+git -C "$K" -c user.email=t@t -c user.name=t add -A >/dev/null
+git -C "$K" -c user.email=t@t -c user.name=t commit -qm fixture
+printf 'tag=v1.1.0\ncommit=%s\n' "$(git -C "$K" rev-parse HEAD)" > "$WORK/release"
+check "release-info prints the release, the host key and every declared component as JSON" \
+    bash -c "out=\"\$(KATAP_RELEASE_FILE='$WORK/release' KATAP_HOST_KEY_FILE='$WORK/serverkey.pub' KATAP_SRV='$K/srv' KATAP_SETTINGS='$K/katap.env' '$K/bin/katap' release-info)\" &&
+        jq -e --arg c \"\$(git -C '$K' rev-parse HEAD)\" --arg k \"\$(cut -d' ' -f1-2 '$WORK/serverkey.pub')\" '
+            .tag == \"v1.1.0\" and .commit == \$c and .host == \"203.0.113.10\" and .hostkey == \$k
+            and ([.components[] | \"\(.project)/\(.component)\"] == [\"shop/api\", \"shop/web\"])
+            and (.components[0] | .environment == \"production\" and .repo == \"Acme/Shop-API\" and .image == \"ghcr.io/acme/shop-api\" and .domain == \"api.shop.test\" and .smoke_path == \"/api/health/live\")' <<<\"\$out\" >/dev/null"
+info > "$WORK/real-release-info.json" 2>/dev/null || true
+REAL_INFO_COMMIT="$(git -C "$K" rev-parse HEAD)"
+# The deploy user reads root's checkout: git's ownership check must not refuse it.
+# A root-owned copy in the container's own /tmp, read as an unprivileged user.
+OWNED="$(mktemp -d /tmp/katap-tool.XXXXXX)"
+cp -a "$K/." "$OWNED/"
+chown -R root:root "$OWNED"
+chmod -R go+rX "$OWNED" "$WORK/release" "$WORK/serverkey.pub" "$K/srv/katap.json" "$K/srv/projects"
+chmod go+rx "$WORK" "$K" "$K/srv"
+chmod 755 "$OWNED"
+check "(the tool copy is root's)" test "$(stat -c %U "$OWNED/.git")" = root
+check "release-info reads root's tool checkout as another user (the deploy user's view)" \
+    setpriv --reuid=nobody --regid=nobody --clear-groups env HOME=/tmp KATAP_RELEASE_FILE="$WORK/release" KATAP_HOST_KEY_FILE="$WORK/serverkey.pub" \
+        KATAP_SRV="$K/srv" KATAP_SETTINGS="$K/katap.env" "$OWNED/bin/katap" release-info
+rm -rf "$OWNED"
+printf 'tag=v1.1.0\ncommit=%s\n' "$(printf 'b%.0s' $(seq 1 40))" > "$WORK/release"
+refuses "a tool not at the installed release's commit is refused" "not the release install.sh installed" info
+printf 'tag=main\ncommit=%s\n' "$(git -C "$K" rev-parse HEAD)" > "$WORK/release"
+refuses "a release file that names no release is refused" "does not name a release" info
+printf 'tag=v1.1.0\ncommit=%s\n' "$(git -C "$K" rev-parse HEAD)" > "$WORK/release"
+mv "$K/.git" "$K/.git.away"
+refuses "release-info refuses a tool that is not a git checkout (its release cannot be proved)" "is not a git checkout" info
+mv "$K/.git.away" "$K/.git"
+printf 'tag=v1.1.0\ncommit=%s\n' "$(git -C "$K" rev-parse HEAD)" > "$WORK/release"
+echo '# local edit' >> "$K/templates/spa.yml"
+refuses "release-info refuses a modified tool" "has local modifications" info
+git -C "$K" checkout -q -- templates/spa.yml
+fill_required shop api
+projects_json "$(jq '.projects.shop.api.provenance = "none"' <<<"$GOOD_JSON")"
+applies >/dev/null 2>&1
+: > "$WORK/pulls"
+deploy_out="$(KATAP_RELEASE_FILE="$WORK/release" KATAP_DOCKER="$WORK/docker-recorder" katap deploy shop api "ghcr.io/acme/shop-api@$(digest 1)" 2>&1 || true)"
+if [ -s "$WORK/pulls" ]; then ok "a deploy from the installed release's commit goes on to the pull"; else not_ok "a deploy from the installed release's commit goes on to the pull" "$deploy_out"; fi
+printf 'tag=v1.1.0\ncommit=%s\n' "$(printf 'b%.0s' $(seq 1 40))" > "$WORK/release"
+: > "$WORK/pulls"
+refuses "a deploy from any other commit is refused" "not the release install.sh installed" \
+    env KATAP_RELEASE_FILE="$WORK/release" KATAP_DOCKER="$WORK/docker-recorder" KATAP_SRV="$K/srv" KATAP_SETTINGS="$K/katap.env" "$K/bin/katap" deploy shop api "ghcr.io/acme/shop-api@$(digest 1)"
+check "…before anything is pulled" test ! -s "$WORK/pulls"
+# Which component is the frontend: one is, two are not.
+K_FRONT="$K"
+K="$(new_katap)"
+projects_json '{"host": "", "projects": {
+  "duo":  {"api": {"type": "laravel-api", "repo": "a/duo-api", "domains": ["api.duo.test"]},
+           "web": {"type": "spa", "repo": "a/duo-web", "domains": ["duo.test"]},
+           "ssr": {"type": "node-ssr", "repo": "a/duo-ssr", "domains": ["app.duo.test"]}},
+  "nest": {"api": {"type": "nestjs-api", "repo": "a/nest-api", "domains": ["api.nest.test"]},
+           "web": {"type": "spa", "repo": "a/nest-web", "domains": ["nest.test", "www.nest.test"]},
+           "docs": {"type": "spa", "repo": "a/nest-docs"}}}}'
+applies >/dev/null 2>&1
+check "with two web components, the frontend URL stays for the operator" \
+    bash -c "grep -A1 -xF '# katap:required' '$K/srv/secrets/duo/api.env' | grep -qxF APP_FRONTEND_URL= && grep -A1 -xF '# katap:required' '$K/srv/secrets/duo/api.env' | grep -qxF CORS_ALLOWED_ORIGINS="
+check "a nestjs-api takes its frontend from the one web component with domains" \
+    bash -c "grep -qxF WEB_BASE_URL=https://nest.test '$K/srv/secrets/nest/api.env' && grep -qxF CORS_ORIGIN=https://nest.test,https://www.nest.test '$K/srv/secrets/nest/api.env'"
+K="$K_FRONT"
+K="$K_MAIN"
 
 # --- the Katap action ---------------------------------------------------------------
 
@@ -689,6 +959,371 @@ refuses "a key spanning two lines is refused" "single line" authorize "$AK" prod
 refuses "a value that is not a public key is refused" "not an SSH public key" authorize "$AK" production shop api 'command="sh" ssh-ed25519 AAAA'
 check "nothing refused was written" test "$(wc -l < "$AK")" = 1
 
+section "host/provision.sh: token, projects file, and the key-only fast path"
+
+prov() { bash -c '. "$1"; shift; "$@"' _ "$REPO/host/provision.sh" "$@"; }
+SETTINGS="$WORK/katap.env.test"
+printf '# comment\nKATAP_GH_TOKEN=\nKATAP_BACKUP_KEEP=3\nKATAP_GH_TOKEN=\n' > "$SETTINGS"
+chmod 640 "$SETTINGS"
+TOKEN="github_pat_$(printf 'A%.0s' $(seq 1 40))"
+check "a token is written as the one KATAP_GH_TOKEN line" prov write_gh_token "$SETTINGS" "$TOKEN"
+check "…in place, keeping every other line and the mode" \
+    bash -c "[ \"\$(grep -c '^KATAP_GH_TOKEN=' '$SETTINGS')\" = 1 ] && sed -n 2p '$SETTINGS' | grep -qxF 'KATAP_GH_TOKEN=$TOKEN' && grep -qxF KATAP_BACKUP_KEEP=3 '$SETTINGS' && grep -qxF '# comment' '$SETTINGS' && [ \"\$(stat -c %a '$SETTINGS')\" = 640 ]"
+check "…and read back as bin/katap reads it" test "$(prov current_gh_token "$SETTINGS")" = "$TOKEN"
+chgrp nobody "$SETTINGS" 2>/dev/null || chgrp nogroup "$SETTINGS"
+group_before="$(stat -c %G "$SETTINGS")"
+mkdir -p "$WORK/awkspy"
+printf '#!/bin/sh\necho "$*" >> "%s/awk-argv"\nexec %s "$@"\n' "$WORK" "$(command -v awk)" > "$WORK/awkspy/awk"
+chmod +x "$WORK/awkspy/awk"
+rm -f "$WORK/awk-argv"
+PATH="$WORK/awkspy:$PATH" prov write_gh_token "$SETTINGS" "$TOKEN" >/dev/null
+check "the token never reaches a command line (awk gets it through its environment)" \
+    bash -c "[ -s '$WORK/awk-argv' ] && ! grep -q github_pat_ '$WORK/awk-argv'"
+check "…the file keeps its group" test "$(stat -c %G "$SETTINGS")" = "$group_before"
+check "…and no temporary copy of the token is left" test -z "$(find "$WORK" -maxdepth 1 -name '.katap.env.*')"
+cp "$SETTINGS" "$WORK/settings.before"
+refuses "a token carrying a newline is refused" "not a fine-grained GitHub token" prov write_gh_token "$SETTINGS" "$TOKEN"$'\n'"KATAP_DISPATCH_COOLDOWN=0"
+refuses "a classic token is refused" "not a fine-grained GitHub token" prov write_gh_token "$SETTINGS" "ghp_$(printf 'A%.0s' $(seq 1 36))"
+check "…and a refused token changes nothing" cmp "$SETTINGS" "$WORK/settings.before"
+rm -f "$WORK/katap.json.test"
+check "the projects file is written once, as JSON apply accepts" \
+    bash -c ". '$REPO/host/provision.sh'; write_projects_file '$WORK/katap.json.test' && jq -e '.host == \"\" and .projects == {}' '$WORK/katap.json.test' >/dev/null"
+echo '{"host": "203.0.113.9", "projects": {}}' > "$WORK/katap.json.test"
+check "…and never rewritten" bash -c ". '$REPO/host/provision.sh'; write_projects_file '$WORK/katap.json.test' && grep -q 203.0.113.9 '$WORK/katap.json.test'"
+check "--ci-key - takes the key from the first line of standard input" \
+    test "$(printf '%s\nsecond line\n' "$KEY" | prov read_ci_key)" = "$KEY"
+refuses "…and refuses an empty one" "no key on standard input" bash -c ". '$REPO/host/provision.sh'; read_ci_key </dev/null"
+# The fast path, run as the script runs: only --ci-* options authorise the key and
+# touch nothing else. Every host command is a recorder that fails if called.
+mkdir -p "$WORK/hoststubs"
+for cmd in apt-get dpkg-reconfigure systemctl ufw useradd usermod sysctl swapon install-docker; do
+    printf '#!/bin/sh\necho "%s $*" >> "%s/host-calls"\nexit 1\n' "$cmd" "$WORK" > "$WORK/hoststubs/$cmd"
+    chmod +x "$WORK/hoststubs/$cmd"
+done
+rm -f "$WORK/host-calls"
+FAKE_HOME="$(mktemp -d "$WORK/home.XXXXXX")"
+cat > "$WORK/fast-path.sh" <<'EOF'
+#!/usr/bin/env bash
+# provision.sh's main with the tool at $2, the deploy user's home at $3 (root here).
+set -euo pipefail
+. "$1"
+KATAP_ROOT="$2"
+DEPLOY_USER=root
+FAKE_HOME="$3"
+getent() { echo "root:x:0:0::$FAKE_HOME:/bin/sh"; }
+main --ci-key - --ci-env production --ci-project shop --ci-component api
+EOF
+fast_out="$(printf '%s\n' "$KEY" | PATH="$WORK/hoststubs:$PATH" bash "$WORK/fast-path.sh" "$REPO/host/provision.sh" "$K" "$FAKE_HOME" 2>&1)" && fast_rc=0 || fast_rc=$?
+check "provision with only --ci-* options returns success without reaching the host checks" \
+    bash -c "[ '$fast_rc' = 0 ] && ! grep -q 'supported on' <<<'$fast_out'"
+check "provision with only --ci-* options authorises the key from standard input" \
+    grep -qxF "restrict,command=\"$K/bin/katap ssh-dispatch production shop api\" $KEY" "$FAKE_HOME/.ssh/authorized_keys"
+check "…and runs no host setup at all" test ! -e "$WORK/host-calls"
+
+# --- install.sh -----------------------------------------------------------------
+
+section "install.sh (a local repository stands in for GitHub)"
+
+ORIGIN="$WORK/origin"
+git init -q "$ORIGIN"
+gitc() { git -C "$ORIGIN" -c user.email=t@t -c user.name=t "$@"; }
+mkdir -p "$ORIGIN/host"
+# Each release's own provision.sh records which release ran it.
+release_commit() {
+    printf '#!/bin/sh\necho "%s $*" > "%s/provisioned-by-release"\n' "$1" "$WORK" > "$ORIGIN/host/provision.sh"
+    chmod +x "$ORIGIN/host/provision.sh"
+    echo "$1" > "$ORIGIN/VERSION"
+    gitc add -A >/dev/null
+    gitc commit -qm "$1"
+    gitc tag -a "$1" -m "$1"
+}
+for v in v1.0.0 v1.1.0 v1.2.0 v2.0.0; do release_commit "$v"; done
+# A lightweight tag, as GitHub's "create a new tag" on a release makes.
+echo v1.4.0 > "$ORIGIN/VERSION"; gitc commit -qam v1.4.0; gitc tag v1.4.0
+API="$WORK/api"
+mkdir -p "$API/releases"
+latest_is() { printf '{"tag_name": "%s"}\n' "$1" > "$API/releases/latest"; }
+cat > "$WORK/provision-recorder" <<EOF
+#!/usr/bin/env bash
+echo "\$*" > "$WORK/provisioned"
+EOF
+chmod +x "$WORK/provision-recorder"
+INST="$WORK/inst"
+installs() {
+    rm -f "$WORK/provisioned"
+    env KATAP_REPO_URL="$ORIGIN" KATAP_API_URL="file://$API" KATAP_INSTALL_ROOT="$INST/katap" \
+        KATAP_RELEASE_FILE="$INST/release" KATAP_PROVISION="$WORK/provision-recorder" bash "$REPO/install.sh" "$@"
+}
+tag_commit() { git -C "$ORIGIN" rev-parse "$1^{commit}"; }
+
+refuses "no published release is refused, never guessed from tags" "could not reach GitHub" installs
+echo '{"message": "Not Found"}' > "$API/releases/latest"
+refuses "…and GitHub's 'Not Found' says there is no release" "no published release" installs
+check "…and nothing was installed" test ! -e "$INST/katap"
+check "--help works when the script is piped" bash -c "bash -s -- --help < '$REPO/install.sh' | grep -q -- '--version vX.Y.Z'"
+refuses "--version without a release says so" "--version needs a release" installs --version
+latest_is v1.1.0
+check "a first install checks out the latest release" installs --harden-ssh
+check "…at exactly its tag's commit, detached" \
+    bash -c "[ \"\$(git -C '$INST/katap' rev-parse HEAD)\" = '$(tag_commit v1.1.0)' ] && ! git -C '$INST/katap' symbolic-ref -q HEAD"
+check "…records the release" test "$(cat "$INST/release")" = "$(printf 'tag=v1.1.0\ncommit=%s' "$(tag_commit v1.1.0)")"
+check "…and hands over to that release's provision.sh with the passed options" test "$(cat "$WORK/provisioned")" = --harden-ssh
+rm -f "$WORK/provisioned-by-release"
+env KATAP_REPO_URL="$ORIGIN" KATAP_API_URL="file://$API" KATAP_INSTALL_ROOT="$INST/katap" KATAP_RELEASE_FILE="$INST/release" \
+    bash "$REPO/install.sh" --version v1.1.0 --harden-ssh >/dev/null 2>&1 || true
+check "…which is the checked-out release's own host/provision.sh" test "$(cat "$WORK/provisioned-by-release" 2>/dev/null)" = "v1.1.0 --harden-ssh"
+check "running it again upgrades to a newer release" installs --version v1.2.0
+check "…to its commit" test "$(git -C "$INST/katap" rev-parse HEAD)" = "$(tag_commit v1.2.0)"
+before="$(cat "$INST/release")"
+echo edited >> "$INST/katap/VERSION"
+refuses "a checkout with local changes is never upgraded over" "has local changes" installs --version v1.1.0
+git -C "$INST/katap" checkout -q -- VERSION
+touch "$INST/katap/planted.service"
+refuses "…nor one with an added file" "has local changes" installs --version v1.1.0
+rm -f "$INST/katap/planted.service"
+check "…and a refusal leaves the release as it was" test "$before" = "$(cat "$INST/release")"
+check "…without running provision" test ! -e "$WORK/provisioned"
+# unchanged: HEAD and the release record are as they were, and nothing ran.
+unchanged() { [ "$(git -C "$INST/katap" rev-parse HEAD)" = "$1" ] && [ "$(cat "$INST/release")" = "$2" ] && [ ! -e "$WORK/provisioned" ]; }
+check "a new major version installs like any other (its release notes are the operator's to read)" installs --version v2.0.0
+check "going back to an earlier release works the same way" installs --version v1.2.0
+check "a lightweight release tag installs at its commit" installs --version v1.4.0
+check "…exactly" test "$(git -C "$INST/katap" rev-parse HEAD)" = "$(tag_commit v1.4.0)"
+head_before="$(git -C "$INST/katap" rev-parse HEAD)"; rec_before="$(cat "$INST/release")"
+refuses "a release older than the installer supports is refused" "older than this installer supports" installs --version v1.0.0
+check "…and that refusal changed nothing" unchanged "$head_before" "$rec_before"
+refuses "a version that is not vX.Y.Z is refused" "is not a release" installs --version main
+refuses "an unknown release is refused" "no release v9.9.9" installs --version v9.9.9
+rm -rf "$INST"
+mkdir -p "$INST/katap"
+touch "$INST/katap/something"
+refuses "a /srv/katap that is not a checkout is refused" "is not a Katap checkout" installs --version v1.1.0
+rm -rf "$INST"
+latest_is v1.1.0
+cut_ran=''
+lines="$(wc -l < "$REPO/install.sh")"
+for n in $(seq 1 "$((lines - 1))"); do
+    head -n "$n" "$REPO/install.sh" > "$WORK/install-cut.sh"
+    env KATAP_REPO_URL="$ORIGIN" KATAP_API_URL="file://$API" KATAP_INSTALL_ROOT="$INST/katap" \
+        KATAP_RELEASE_FILE="$INST/release" KATAP_PROVISION="$WORK/provision-recorder" bash "$WORK/install-cut.sh" >/dev/null 2>&1 || true
+    if [ -e "$INST" ] || [ -e "$WORK/provisioned" ]; then cut_ran+=" $n"; rm -rf "$INST" "$WORK/provisioned"; fi
+done
+check "a download cut short at any line runs nothing" test -z "$cut_ran"
+
+# --- connect.sh -----------------------------------------------------------------
+
+section "connect.sh (stub ssh stands in for the server, stub gh for GitHub)"
+
+CN="$WORK/connect"
+mkdir -p "$CN/bin" "$CN/tmp"
+ssh-keygen -q -t ed25519 -N '' -f "$CN/server-key" -C '' >/dev/null
+SERVER_KEY="$(cut -d' ' -f1-2 "$CN/server-key.pub")"
+echo "203.0.113.10 $SERVER_KEY" > "$CN/known_hosts"
+CN_COMMIT="$(printf 'c%.0s' $(seq 1 40))"
+cat > "$CN/bin/ssh" <<'STUB'
+#!/usr/bin/env bash
+# `ssh -G <target>`: the configuration; otherwise `ssh <options> -- <target> <command…>`.
+if [ "$1" = -G ]; then
+    printf 'hostname 203.0.113.10\nport 22\nuserknownhostsfile %s\n' "$CN_KNOWN_HOSTS"
+    exit 0
+fi
+while [ "$1" != -- ]; do shift; done
+shift 2
+echo "$*" >> "$CN_SSH_LOG"
+case "$*" in
+    *release-info*) cat "$CN_INFO" ;;
+    *provision.sh*)
+        [ -z "${CN_PROVISION_FAIL:-}" ] || exit 1
+        cat >> "$CN_SERVER_KEYS" ;;
+    *) exit 1 ;;
+esac
+STUB
+cat > "$CN/bin/gh" <<'STUB'
+#!/usr/bin/env bash
+# GitHub, as files under $CN_STATE/<owner>/<repo>/: <environment>/<NAME> for each
+# secret and variable.
+echo "gh $*" >> "$CN_GH_LOG"
+case "$1 $2" in
+    "auth status") exit 0 ;;
+    "variable delete")
+        name="$3"; shift 3; env=_repo; repo=''
+        while [ "$#" -gt 0 ]; do case "$1" in --env) env="$2"; shift 2 ;; --repo) repo="$2"; shift 2 ;; *) shift ;; esac; done
+        rm -f "$CN_STATE/$repo/$env/$name"; exit 0 ;;
+    "secret set"|"variable set")
+        [ "$1 $2 $3" != "secret set KATAP_SSH_KEY" ] || echo "key $*" >> "$CN_ORDER"
+        name="$3"; shift 3; env=_repo; repo=''; body=''; has_body=false
+        while [ "$#" -gt 0 ]; do
+            case "$1" in --env) env="$2"; shift 2 ;; --repo) repo="$2"; shift 2 ;; --body) body="$2"; has_body=true; shift 2 ;; *) shift ;; esac
+        done
+        mkdir -p "$CN_STATE/$repo/$env"
+        if [ "$has_body" = true ]; then printf '%s\n' "$body" > "$CN_STATE/$repo/$env/$name"; else cat > "$CN_STATE/$repo/$env/$name"; fi
+        exit 0 ;;
+esac
+[ "$1" = api ] || exit 1
+shift
+method=GET
+if [ "$1" = -X ]; then method="$2"; shift 2; fi
+path="$1"
+case "$method $path" in
+    "GET repos/jaylordibe/katap/git/ref/tags/"*)
+        if [ -n "${CN_LIGHTWEIGHT:-}" ]; then echo "commit $CN_GITHUB_COMMIT"; else echo "tag 1111111111111111111111111111111111111111"; fi ;;
+    "GET repos/jaylordibe/katap/git/tags/"*) echo "$CN_GITHUB_COMMIT" ;;
+    "GET repos/"*/environments/*/secrets/KATAP_SSH_KEY)
+        [ -z "${CN_SECRETS_403:-}" ] || { echo "HTTP 403: Resource not accessible" >&2; exit 1; }
+        r="${path#repos/}"; r="${r%/environments/*}"; e="${path#*/environments/}"; e="${e%/secrets/*}"
+        [ -f "$CN_STATE/$r/$e/KATAP_SSH_KEY" ] || { echo "HTTP 404" >&2; exit 1; }
+        echo '{"name": "KATAP_SSH_KEY"}' ;;
+    "GET repos/"*/environments/*/deployment-branch-policies)
+        d="$CN_STATE/${path#repos/}"; d="${d%/environments/*}"; e="${path#*/environments/}"; e="${e%/deployment-branch-policies}"
+        sed 's/^/branch:/' "$d/$e/.branches" | sort | tr '\n' ' ' | sed 's/ $//' ;;
+    "GET repos/"*/environments/*)
+        d="$CN_STATE/${path#repos/}"; d="${d%/environments/*}/${path##*/environments/}"
+        if [ -f "$d/.policy" ]; then echo custom; elif [ -d "$d" ]; then echo none; else echo "HTTP 404" >&2; exit 1; fi ;;
+    "PUT repos/"*/environments/*)
+        d="$CN_STATE/${path#repos/}"; d="${d%/environments/*}/${path##*/environments/}"
+        mkdir -p "$d"; cat > "$d/.policy"; echo "environment ${path#repos/}" >> "$CN_ORDER" ;;
+    "POST repos/"*/deployment-branch-policies)
+        d="$CN_STATE/${path#repos/}"; d="${d%/environments/*}"; e="${path#*/environments/}"; e="${e%/deployment-branch-policies}"
+        for arg in "$@"; do case "$arg" in name=*) echo "${arg#name=}" >> "$d/$e/.branches" ;; esac; done ;;
+    *) echo "unexpected: $method $path" >&2; exit 1 ;;
+esac
+STUB
+chmod +x "$CN/bin/ssh" "$CN/bin/gh"
+connect_info() {
+    jq -n --arg commit "${1:-$CN_COMMIT}" --arg hostkey "$SERVER_KEY" '{
+        tag: "v1.1.0", commit: $commit, host: "203.0.113.10", hostkey: $hostkey,
+        components: [
+            {project: "shop", component: "api", environment: "production", repo: "acme/shop-api", image: "ghcr.io/acme/shop-api", image_migrate: "", domain: "api.shop.test", smoke_path: "/api/health/ready"},
+            {project: "shop", component: "web", environment: "production", repo: "acme/shop-web", image: "ghcr.io/acme/shop-web", image_migrate: "", domain: "shop.test", smoke_path: "/"},
+            {project: "blog", component: "api", environment: "staging", repo: "acme/blog-api", image: "ghcr.io/acme/blog-api", image_migrate: "ghcr.io/acme/blog-api-migrate", domain: "api.blog.test", smoke_path: "/api/health/readiness"}
+        ]}'
+}
+connect_info > "$CN/info.json"
+echo y > "$CN/yes"
+echo n > "$CN/no"
+# connects [VAR=value...] -- <connect.sh args>
+connects() {
+    local vars=()
+    while [ "$1" != -- ]; do vars+=("$1"); shift; done
+    shift
+    env KATAP_SSH="$CN/bin/ssh" KATAP_GH="$CN/bin/gh" KATAP_TTY="$CN/yes" TMPDIR="$CN/tmp" \
+        CN_KNOWN_HOSTS="$CN/known_hosts" CN_INFO="$CN/info.json" CN_SSH_LOG="$CN/ssh.log" CN_SERVER_KEYS="$CN/server-authorized" \
+        CN_GH_LOG="$CN/gh.log" CN_STATE="$CN/state" CN_GITHUB_COMMIT="$CN_COMMIT" CN_ORDER="$CN/order" \
+        "${vars[@]}" bash "$REPO/connect.sh" "$@"
+}
+connect_reset() { rm -rf "$CN/state" "$CN/ssh.log" "$CN/gh.log" "$CN/server-authorized" "$CN/order" "$CN/tmp"/*; }
+gh_writes() { grep -E '^gh (secret set|variable set|api -X|pr create)' "$CN/gh.log" 2>/dev/null || true; }
+
+connect_reset
+if out="$(connects -- root@203.0.113.10 2>&1)"; then ok "connect.sh connects every declared component"; else not_ok "connect.sh connects every declared component" "$out"; fi
+check "…authorising one key per component on the server, for that component only" \
+    bash -c "[ \"\$(grep -c 'provision.sh --ci-key -' '$CN/ssh.log')\" = 3 ] && grep -qF -- '--ci-env staging --ci-project blog --ci-component api' '$CN/ssh.log'"
+check "…whose private half is the one GitHub holds" \
+    bash -c "for e in acme/shop-api/production acme/shop-web/production acme/blog-api/staging; do grep -qF \"\$(ssh-keygen -y -f '$CN/state/'\$e/KATAP_SSH_KEY | cut -d' ' -f2)\" '$CN/server-authorized' || exit 1; done"
+deploy_names="$(grep -oE '(secrets|vars)\.[A-Z_]+' "$REPO/examples/deploy.yml" | sed 's/^[a-z]*\.//' | sort -u)"
+check "…setting exactly the secrets and variables examples/deploy.yml reads" \
+    test "$deploy_names" = "$( (ls "$CN/state/acme/blog-api/staging"; ls "$CN/state/acme/blog-api/_repo") | sort -u)"
+check "…with the host key the server reported, under the address deploys use" \
+    test "$(cat "$CN/state/acme/shop-api/production/KATAP_KNOWN_HOSTS")" = "203.0.113.10 $SERVER_KEY"
+check "…and the public URL check from the component's own smoke path" \
+    test "$(cat "$CN/state/acme/shop-api/production/KATAP_URL")" = https://api.shop.test/api/health/ready
+check "no private key ever appears on a command line" bash -c "! grep -q 'PRIVATE KEY' '$CN/gh.log' '$CN/ssh.log'"
+check "…and none is left on this computer" test -z "$(ls -A "$CN/tmp")"
+# The printed command: the example at the server's release, its pin filled in.
+check "the printed command fetches examples/deploy.yml at the server's release" \
+    grep -qF "curl -fsSL https://raw.githubusercontent.com/jaylordibe/katap/$CN_COMMIT/examples/deploy.yml" <<<"$out"
+pin_sed="$(sed -n "s/^    | sed '\(.*\)' > \.github\/workflows\/deploy\.yml$/\1/p" <<<"$out")"
+sed "$pin_sed" "$REPO/examples/deploy.yml" > "$CN/deploy.yml"
+check "…and its sed fills only the pin, with the release's commit and tag" \
+    bash -c "diff <(grep -vE 'uses: jaylordibe/katap@' '$REPO/examples/deploy.yml') <(grep -vE 'uses: jaylordibe/katap@' '$CN/deploy.yml') && grep -qE '^\s+uses: jaylordibe/katap@$CN_COMMIT # v1\.1\.0$' '$CN/deploy.yml'"
+check "…and opens no pull request" bash -c "! grep -qE '^gh (pr |api -X (PUT|POST) repos/[^ ]*/(contents|git/refs))' '$CN/gh.log'"
+val() { cat "$CN/state/$1/$2" 2>/dev/null; }
+check "…with each component's own project, component and image" \
+    bash -c "[ \"\$($(declare -f val); CN='$CN'; val acme/blog-api/staging KATAP_PROJECT)\" = blog ] && [ \"\$($(declare -f val); CN='$CN'; val acme/blog-api/staging KATAP_COMPONENT)\" = api ] && [ \"\$($(declare -f val); CN='$CN'; val acme/blog-api/staging KATAP_IMAGE)\" = ghcr.io/acme/blog-api ] && [ \"\$($(declare -f val); CN='$CN'; val acme/blog-api/staging KATAP_MIGRATE_IMAGE)\" = ghcr.io/acme/blog-api-migrate ] && [ \"\$($(declare -f val); CN='$CN'; val acme/shop-web/production KATAP_COMPONENT)\" = web ] && [ \"\$($(declare -f val); CN='$CN'; val acme/shop-api/production KATAP_HOST)\" = 203.0.113.10 ] && [ \"\$($(declare -f val); CN='$CN'; val acme/shop-api/_repo PUBLISH_ENABLED)\" = true ]"
+check "…no migrate image where the component has none" test ! -e "$CN/state/acme/shop-api/production/KATAP_MIGRATE_IMAGE"
+check "each environment is created limited to its branches before its key is set" \
+    bash -c "[ \"\$(cat '$CN/state/acme/shop-api/production/.branches')\" = main ] && [ \"\$(sort '$CN/state/acme/blog-api/staging/.branches' | tr '\n' ' ')\" = 'main staging ' ] && grep -q custom_branch_policies '$CN/state/acme/shop-api/production/.policy' && awk '/^environment acme\/shop-api/ { e = NR } /^key .*acme\/shop-api/ { k = NR } END { exit !(e && k && e < k) }' '$CN/order'"
+
+: > "$CN/ssh.log"; : > "$CN/gh.log"
+connects -- root@203.0.113.10 >/dev/null 2>&1 || true
+check "running it again makes no key and authorises nothing" bash -c "! grep -q 'provision.sh' '$CN/ssh.log' && ! grep -q 'secret set KATAP_SSH_KEY' '$CN/gh.log'"
+jq '.components[0].domain = "api2.shop.test"' "$CN/info.json" > "$CN/info2.json"
+connects CN_INFO="$CN/info2.json" -- root@203.0.113.10 >/dev/null 2>&1 || true
+check "…but brings a connected repository's variables up to date" test "$(val acme/shop-api/production KATAP_URL)" = https://api2.shop.test/api/health/ready
+
+connect_reset
+check "a project name limits it to that project" connects -- root@203.0.113.10 blog
+check "…and nothing else is connected" bash -c "[ -d '$CN/state/acme/blog-api/staging' ] && [ ! -e '$CN/state/acme/shop-api' ]"
+
+connect_reset
+refuses "a declined confirmation changes nothing" "nothing was changed" connects KATAP_TTY="$CN/no" -- root@203.0.113.10
+check "…no key was authorised, no GitHub write made" bash -c "! grep -q provision.sh '$CN/ssh.log' && [ -z \"\$($(declare -f gh_writes); CN='$CN'; gh_writes)\" ]"
+
+connect_reset
+check "a lightweight release tag is matched by its commit" connects CN_LIGHTWEIGHT=1 -- root@203.0.113.10 blog
+connect_reset
+mkdir -p "$CN/state/acme/blog-api/staging"
+refuses "an existing environment open to every branch gets no key" "must allow deployments from exactly: main staging (it allows none)" connects -- root@203.0.113.10 blog
+check "…and nothing was authorised" bash -c "! grep -q provision.sh '$CN/ssh.log'"
+connect_reset
+refuses "a gh error other than 'not found' stops before any key is made" "check that your gh login administers" connects CN_SECRETS_403=1 -- root@203.0.113.10
+check "…and nothing was authorised" bash -c "! grep -q provision.sh '$CN/ssh.log' 2>/dev/null"
+connect_reset
+mkdir -p "$CN/state/acme/blog-api/staging"
+echo custom > "$CN/state/acme/blog-api/staging/.policy"
+printf 'main\n*\n' > "$CN/state/acme/blog-api/staging/.branches"
+refuses "an existing environment open to more branches than its own gets no key" "must allow deployments from exactly: main staging" connects -- root@203.0.113.10 blog
+check "…and nothing was authorised" bash -c "! grep -q provision.sh '$CN/ssh.log' 2>/dev/null"
+connect_reset
+if [ -s "$WORK/real-release-info.json" ]; then
+    jq --arg k "$(cut -d' ' -f1-2 "$WORK/serverkey.pub")" '.hostkey = $k' "$WORK/real-release-info.json" > "$CN/real-info.json"
+    echo "203.0.113.10 $(cut -d' ' -f1-2 "$WORK/serverkey.pub")" > "$CN/known_hosts.real"
+    check "connect.sh accepts what the server's real release-info prints" \
+        connects CN_INFO="$CN/real-info.json" CN_KNOWN_HOSTS="$CN/known_hosts.real" CN_GITHUB_COMMIT="$REAL_INFO_COMMIT" -- root@203.0.113.10
+else
+    not_ok "connect.sh accepts what the server's real release-info prints" "no release-info output was saved"
+fi
+connect_reset
+refuses "a server release GitHub does not have for that tag is refused" "but GitHub's v1.1.0 is" connects CN_GITHUB_COMMIT="$(printf 'd%.0s' $(seq 1 40))" -- root@203.0.113.10
+check "…before any write" test -z "$(gh_writes)"
+
+connect_reset
+ssh-keygen -q -t ed25519 -N '' -f "$CN/other-key" -C '' >/dev/null
+echo "203.0.113.10 $(cut -d' ' -f1-2 "$CN/other-key.pub")" > "$CN/known_hosts.other"
+refuses "a host key this computer does not already trust is refused" "is not in your known_hosts" \
+    connects CN_KNOWN_HOSTS="$CN/known_hosts.other" -- root@203.0.113.10
+check "…before any write" test -z "$(gh_writes)"
+
+# What a compromised server could send: each is refused before anything is written.
+hostile() {
+    local name="$1" message="$2" filter="$3"
+    connect_reset
+    jq "$filter" <<<"$(connect_info)" > "$CN/info.json"
+    refuses "connect.sh refuses $name" "$message" connects -- root@203.0.113.10
+    if [ -n "$(gh_writes)" ] || grep -q provision.sh "$CN/ssh.log" 2>/dev/null; then not_ok "…and wrote nothing after refusing $name"; fi
+}
+# shellcheck disable=SC2016 # literal shell syntax is the input under test
+hostile "shell syntax in a project" "invalid project name" '.components[0].project = "shop;id"'
+# shellcheck disable=SC2016
+hostile "a command substitution in a repository" "invalid repository" '.components[0].repo = "acme/$(id)"'
+hostile "a newline smuggling a second component" "not a release description" '.components[0].smoke_path = "/x\nblog\u001fapi"'
+hostile "a repository outside owner/name" "invalid repository" '.components[0].repo = "../../etc"'
+hostile "a migrate image unlike the image" "invalid migrate image" '.components[2].image_migrate = "ghcr.io/evil/x"'
+hostile "a host that is not an address" "is not an IPv4 address" '.host = "evil.example"'
+hostile "a tag that is not a release" "names no release" '.tag = "main"'
+hostile "a host key of another type" "not an ed25519 key" '.hostkey = "ssh-rsa AAAA"'
+hostile "a repository named only dots" "invalid repository" '.components[0].repo = "acme/.."'
+hostile "an address outside IPv4" "is not an IPv4 address" '.host = "999.1.1.1"'
+hostile "one repository twice in one environment" "a repository deploys one component per environment" '.components[1].repo = "acme/shop-api"'
+hostile "a smoke path that is not a plain path" "cannot use as a URL" '.components[0].smoke_path = "/x?y"'
+connect_info > "$CN/info.json"
+
+connect_reset
+refuses "a server that refuses the key stops before GitHub holds it" "the server refused the key" connects CN_PROVISION_FAIL=1 -- root@203.0.113.10
+check "…no KATAP_SSH_KEY was set" test -z "$(find "$CN/state" -name KATAP_SSH_KEY 2>/dev/null)"
+check "…and the key it made is gone" test -z "$(ls -A "$CN/tmp")"
+refuses "an argument that is not user@host is refused" "is not user@host" connects -- 'root@x;id'
+
 # --- deploy refusals that need no image ------------------------------------------
 
 section "katap deploy / rollback / cron / backup with a fake docker"
@@ -757,6 +1392,11 @@ refuses "a second rollback goes further back, never forward to what was rolled a
     env FAKE_PULL_FAIL=1 KATAP_DOCKER="$WORK/fake-docker" KATAP_SRV="$K/srv" "$K/bin/katap" rollback shop api
 refuses "a rollback names only a release this host has deployed" "was never deployed here" \
     fake rollback shop api "$(rel 99)"
+printf '{"projects": ' > "$K/srv/katap.json"
+refuses "a rollback never depends on katap.json (a half-edited one leaves the way back open)" "was never deployed here" \
+    fake rollback shop api "$(rel 99)"
+refuses "…while a deploy is held until it is fixed" "fix it and run 'katap apply'" fake deploy shop api "$D64"
+rm -f "$K/srv/katap.json"
 echo "IMAGE_API=$(rel 10)" > "$K/srv/state/shop/images.env"
 refuses "the first release has nothing before it" "no earlier release" fake rollback shop api
 

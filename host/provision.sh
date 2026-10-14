@@ -1,19 +1,22 @@
 #!/usr/bin/env bash
 #
 # Prepares an Ubuntu/Debian host to run Katap. Idempotent: safe to run again, and
-# it never touches project data, secrets or running containers.
+# it never touches project data, secrets or running containers. install.sh runs it
+# after checking out a release; run it by hand only from a checkout at /srv/katap.
 #
 #   sudo /srv/katap/host/provision.sh [--harden-ssh]
-#   sudo /srv/katap/host/provision.sh --ci-key '<ssh public key>' --ci-env production|staging \
+#   sudo /srv/katap/host/provision.sh --ci-key '<ssh public key>'|- --ci-env production|staging \
 #        --ci-project <project> --ci-component <component>[,<component>...]
 #
-# Katap must already be cloned at /srv/katap (the systemd units and the forced SSH
-# command name that path).
+# Katap must already be at /srv/katap (the systemd units and the forced SSH
+# command name that path). With only --ci-* options it authorises the key and
+# changes nothing else; connect.sh calls it that way.
 #
 #   --ci-key        authorise an application's deploy key for the deploy user,
 #                   restricted to `katap ssh-dispatch <environment> <project> <components>`:
 #                   deploy and rollback of exactly those components, nothing else.
-#                   One key per application repository and environment.
+#                   One key per application repository and environment. `-` reads
+#                   the key from standard input.
 #   --ci-env        the environment that key serves
 #   --ci-project    the project it may deploy
 #   --ci-component  the component(s) of that project it may deploy, comma-separated
@@ -21,7 +24,10 @@
 #                 Refused unless an authorised key already exists for root or the
 #                 user running sudo, so it cannot lock you out.
 #
-# Environment: KATAP_DEPLOY_USER (deploy), KATAP_SWAP_SIZE (2G; 0 skips).
+# Environment: KATAP_DEPLOY_USER (deploy), KATAP_SWAP_SIZE (2G; 0 skips),
+# KATAP_GH_TOKEN (written to /etc/katap/katap.env when it holds none; otherwise
+# asked for on the terminal). sudo drops the environment: pass it with
+# `sudo --preserve-env=KATAP_GH_TOKEN`, never on the command line.
 set -euo pipefail
 
 KATAP_ROOT=/srv/katap
@@ -78,31 +84,93 @@ pin_edge_settings() {
     } > "$dest"
 }
 
+# The GitHub token of <file>, or nothing: the last line for the key wins, as
+# bin/katap reads it.
+current_gh_token() {
+    local line
+    line="$(grep -E '^KATAP_GH_TOKEN=' "$1" | tail -n 1 || true)"
+    line="${line#*=}"
+    line="${line//[[:space:]\"\']/}"
+    printf '%s' "$line"
+}
+
+# Writes <token> as the one KATAP_GH_TOKEN= line of <file>, in place of the first
+# and dropping any other, keeping every other line, the owner and the mode. A
+# token is one word of the fine-grained format: a pasted newline would otherwise
+# add settings of its own.
+write_gh_token() {
+    local file="$1" token="$2" tmp
+    [[ "$token" =~ ^github_pat_[A-Za-z0-9_]{20,255}$ ]] \
+        || die "that is not a fine-grained GitHub token (github_pat_…); create one with read-only access (see /etc/katap/katap.env)."
+    tmp="$(mktemp "$(dirname "$file")/.katap.env.XXXXXX")"
+    # The token reaches awk through its environment, never its command line,
+    # where any local user could read it; the copy goes however this ends.
+    # shellcheck disable=SC2064 # expanded now: the path of this temporary file
+    trap "rm -f '$tmp'" EXIT
+    KATAP_LINE="KATAP_GH_TOKEN=$token" awk '
+        /^KATAP_GH_TOKEN=/ { if (!done) { print ENVIRON["KATAP_LINE"]; done = 1 }; next }
+        { print }
+        END { if (!done) print ENVIRON["KATAP_LINE"] }
+    ' "$file" > "$tmp"
+    chown --reference="$file" "$tmp"
+    chmod --reference="$file" "$tmp"
+    mv "$tmp" "$file"
+    trap - EXIT
+}
+
+# Reads the deploy key from standard input for `--ci-key -`: one line, so the key
+# never sits in a remote command line.
+read_ci_key() {
+    local key=''
+    IFS= read -r key || [ -n "$key" ] || die "--ci-key -: no key on standard input."
+    printf '%s' "$key"
+}
+
+# Writes /srv/katap.json once: the projects `katap apply` creates. Root-owned and
+# read by the deploy user, so nothing it runs can change what this host deploys.
+write_projects_file() {
+    local file="$1"
+    [ ! -e "$file" ] || return 0
+    printf '%s\n' '{' '  "host": "",' '  "projects": {}' '}' > "$file"
+    chown root:root "$file"
+    chmod 0644 "$file"
+}
+
 main() {
 [ "$(id -u)" -eq 0 ] || die "run as root (sudo)."
-[ -x "$KATAP_ROOT/bin/katap" ] || die "clone Katap to $KATAP_ROOT first."
-# shellcheck disable=SC1091
-. /etc/os-release
-case "${ID:-}" in
-    ubuntu|debian) ;;
-    *) die "supported on Ubuntu and Debian only (this is '${ID:-unknown}')." ;;
-esac
+[ -x "$KATAP_ROOT/bin/katap" ] || die "install Katap at $KATAP_ROOT first (see install.sh)."
 
 ci_key=''
 ci_env=''
 ci_project=''
 ci_components=''
 harden_ssh=false
+host_options=false
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --ci-key) ci_key="${2:-}"; shift 2 ;;
         --ci-env) ci_env="${2:-}"; shift 2 ;;
         --ci-project) ci_project="${2:-}"; shift 2 ;;
         --ci-component) ci_components="${2:-}"; shift 2 ;;
-        --harden-ssh) harden_ssh=true; shift ;;
+        --harden-ssh) harden_ssh=true; host_options=true; shift ;;
         *) die "unknown option '$1'." ;;
     esac
 done
+[ "$ci_key" != - ] || ci_key="$(read_ci_key)"
+
+# Only --ci-* options: authorise the key and change nothing else on the host.
+if [ "$host_options" = false ] && [ -n "$ci_key$ci_env$ci_project$ci_components" ]; then
+    id "$DEPLOY_USER" >/dev/null 2>&1 || die "no user '$DEPLOY_USER'; provision the host first."
+    authorize_deploy_key
+    return 0
+fi
+
+# shellcheck disable=SC1091
+. /etc/os-release
+case "${ID:-}" in
+    ubuntu|debian) ;;
+    *) die "supported on Ubuntu and Debian only (this is '${ID:-unknown}')." ;;
+esac
 
 # --- Packages -------------------------------------------------------------------
 
@@ -197,7 +265,13 @@ usermod -aG docker "$DEPLOY_USER"
 # release of Katap replaces the tool and nothing else.
 install -d -o "$DEPLOY_USER" -g "$DEPLOY_USER" -m 0755 /srv/state /srv/edge /srv/edge/certs /srv/projects
 install -d -o "$DEPLOY_USER" -g "$DEPLOY_USER" -m 0700 /srv/secrets /srv/backups
-chown -R "$DEPLOY_USER:$DEPLOY_USER" "$KATAP_ROOT"
+# The tool is root's and only readable by the deploy user: install.sh runs git in
+# it as root, which must never pick up hooks or config another user wrote, and the
+# deploy keys' forced command runs it.
+chown -R root:root "$KATAP_ROOT"
+# Readable whatever root's umask was when install.sh cloned it.
+chmod -R u+rwX,go+rX,go-w "$KATAP_ROOT"
+write_projects_file /srv/katap.json
 pin_edge_settings "$KATAP_ROOT/edge/edge.env" /srv/edge/edge.env
 chown "$DEPLOY_USER:$DEPLOY_USER" /srv/edge/edge.env
 
@@ -232,14 +306,25 @@ fi
 chown "root:$DEPLOY_USER" /etc/katap/katap.env
 chmod 0640 /etc/katap/katap.env
 
-if [ -n "$ci_key" ] || [ -n "$ci_env$ci_project$ci_components" ]; then
-    [ -n "$ci_key" ] || die "--ci-env, --ci-project and --ci-component go with --ci-key."
-    home="$(getent passwd "$DEPLOY_USER" | cut -d: -f6)"
-    install -d -o "$DEPLOY_USER" -g "$DEPLOY_USER" -m 0700 "$home/.ssh"
-    authorize_ci_key "$home/.ssh/authorized_keys" "$ci_env" "$ci_project" "$ci_components" "$ci_key"
-    chown "$DEPLOY_USER:$DEPLOY_USER" "$home/.ssh/authorized_keys"
-    chmod 600 "$home/.ssh/authorized_keys"
+# The token the host verifies images with: from KATAP_GH_TOKEN, else asked for on
+# the terminal (never standard input, which is install.sh itself when piped).
+if [ -z "$(current_gh_token /etc/katap/katap.env)" ]; then
+    token="${KATAP_GH_TOKEN:-}"
+    if [ -z "$token" ] && { : </dev/tty; } 2>/dev/null; then
+        echo "A GitHub token lets this host verify that each image was built by its own repository."
+        echo "Create a fine-grained token with read-only access to public repositories (or"
+        echo "\"Attestations: read\" on private ones): https://github.com/settings/personal-access-tokens/new"
+        read -rs -p "GitHub token (github_pat_…, input hidden; Enter to skip): " token </dev/tty || token=''
+        echo
+    fi
+    if [ -n "$token" ]; then
+        write_gh_token /etc/katap/katap.env "$token"
+        log "wrote the GitHub token to /etc/katap/katap.env."
+    fi
+    unset token
 fi
+
+[ -z "$ci_key$ci_env$ci_project$ci_components" ] || authorize_deploy_key
 
 # --- SSH hardening (opt-in) -----------------------------------------------------
 if [ "$harden_ssh" = true ]; then
@@ -258,7 +343,9 @@ SSHD
 fi
 
 # --- Timers ---------------------------------------------------------------------
-install -m 0644 "$KATAP_ROOT"/host/systemd/katap-*.service "$KATAP_ROOT"/host/systemd/katap-*.timer /etc/systemd/system/
+# Named, never globbed: a file that is not part of the release never becomes a unit.
+units=(katap-cron.service katap-cron.timer katap-backup.service katap-backup.timer)
+install -m 0644 "${units[@]/#/$KATAP_ROOT/host/systemd/}" /etc/systemd/system/
 sed -i "s/^User=.*/User=$DEPLOY_USER/" /etc/systemd/system/katap-cron.service /etc/systemd/system/katap-backup.service
 systemctl daemon-reload
 systemctl enable --now katap-cron.timer katap-backup.timer
@@ -267,8 +354,22 @@ systemctl enable --now katap-cron.timer katap-backup.timer
 sudo -u "$DEPLOY_USER" "$KATAP_ROOT/bin/katap" edge up
 
 log "done. Next:"
-log "  1. set KATAP_GH_TOKEN in /etc/katap/katap.env (see the comments there);"
-log "  2. if images are private: sudo -u $DEPLOY_USER docker login ghcr.io -u <user> --password-stdin   (a read:packages token)."
+[ -n "$(current_gh_token /etc/katap/katap.env)" ] \
+    || log "  - set KATAP_GH_TOKEN in /etc/katap/katap.env (see the comments there);"
+log "  - describe your projects in /srv/katap.json (sudo nano /srv/katap.json), then:"
+log "      sudo -u $DEPLOY_USER $KATAP_ROOT/bin/katap apply"
+log "  - if images are private: sudo -u $DEPLOY_USER docker login ghcr.io -u <user> --password-stdin   (a read:packages token)."
+}
+
+# The deploy user's authorized_keys gains the key from the --ci-* options.
+authorize_deploy_key() {
+    [ -n "$ci_key" ] || die "--ci-env, --ci-project and --ci-component go with --ci-key."
+    local home
+    home="$(getent passwd "$DEPLOY_USER" | cut -d: -f6)"
+    install -d -o "$DEPLOY_USER" -g "$DEPLOY_USER" -m 0700 "$home/.ssh"
+    authorize_ci_key "$home/.ssh/authorized_keys" "$ci_env" "$ci_project" "$ci_components" "$ci_key"
+    chown "$DEPLOY_USER:$DEPLOY_USER" "$home/.ssh/authorized_keys"
+    chmod 600 "$home/.ssh/authorized_keys"
 }
 
 # Sourced by tests for authorize_ci_key; run as a script, it provisions the host.

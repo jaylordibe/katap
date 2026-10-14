@@ -78,24 +78,24 @@ e2e() {
     spa="$(publish "$REG/katap-e2e/spa:1")"
     check "every release is a registry digest" bash -c "for r in '$ref1' '$ref2' '$broken' '$spa'; do [[ \$r =~ @sha256:[0-9a-f]{64}\$ ]] || exit 1; done"
 
-    # --- The project, defined and provisioned the way the README says ----------
+    # --- The project, defined the way the README says: katap.json, then apply --
     K="$(new_katap)"
     # This host's edge settings, overriding the tool's defaults.
     mkdir -p "$K/srv/edge"
     echo TLS_MODE=internal > "$K/srv/edge/edge.env"
-    katap add e2e laravel-api api api.e2e.test >/dev/null
-    katap add e2e spa web www.e2e.test >/dev/null
-    set_conf e2e api image "$REG/katap-e2e/laravel-api"
-    set_conf e2e web image "$REG/katap-e2e/spa"
-    # Built locally, so no GitHub attestation exists for them: the host is told so.
-    set_conf e2e api provenance none
-    set_conf e2e web provenance none
-    katap secrets e2e api >/dev/null
-    katap secrets e2e web >/dev/null
+    # The images come from the local registry, and were built locally, so no
+    # GitHub attestation exists for them: the host is told so.
+    jq -n --arg api "$REG/katap-e2e/laravel-api" --arg web "$REG/katap-e2e/spa" '{
+        host: "127.0.0.1",
+        projects: {e2e: {
+            api: {type: "laravel-api", repo: "katap-e2e/laravel-api", image: $api, provenance: "none", domains: ["api.e2e.test"]},
+            web: {type: "spa", repo: "katap-e2e/spa", image: $web, provenance: "none", domains: ["www.e2e.test"]}
+        }}}' > "$K/srv/katap.json"
+    check "katap apply defines the project from katap.json" katap apply
     local env="$K/srv/secrets/e2e/api.env"
-    sed -i -e 's|^APP_FRONTEND_URL=$|APP_FRONTEND_URL=https://www.e2e.test|' \
-        -e 's|^CORS_ALLOWED_ORIGINS=$|CORS_ALLOWED_ORIGINS=https://www.e2e.test|' \
-        -e 's|^MAIL_MAILER=$|MAIL_MAILER=log|' -e 's|^MAIL_FROM_ADDRESS=$|MAIL_FROM_ADDRESS=noreply@e2e.test|' "$env"
+    check "…the API's frontend and CORS origins taken from the web component" \
+        bash -c "grep -qxF APP_FRONTEND_URL=https://www.e2e.test '$env' && grep -qxF CORS_ALLOWED_ORIGINS=https://www.e2e.test '$env'"
+    sed -i -e 's|^MAIL_MAILER=$|MAIL_MAILER=log|' -e 's|^MAIL_FROM_ADDRESS=$|MAIL_FROM_ADDRESS=noreply@e2e.test|' "$env"
     # Test-only: an admin to sign in as. A real deployment never seeds users.
     printf 'SYSAD_EMAIL=sysad@e2e.test\nSYSAD_PASSWORD=e2e-%s\nAPPAD_EMAIL=appad@e2e.test\nAPPAD_PASSWORD=e2e-%s\n' \
         "$(openssl rand -hex 8)" "$(openssl rand -hex 8)" >> "$env"

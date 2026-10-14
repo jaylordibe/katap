@@ -1,11 +1,13 @@
-# Reference deploy workflow for an application repository. Copy it to
-# .github/workflows/deploy.yml next to publish-image.yml.
+# Deploy workflow for an application repository, at .github/workflows/deploy.yml
+# next to publish-image.yml. connect.sh prints the command that writes it with the
+# pin below filled in, and sets everything this header lists; to do it by hand,
+# copy it and follow docs/connecting-apps.md.
 #
 #   Staging:    deploys automatically after each successful publish from `staging`.
 #   Production: Actions → Deploy → Run workflow, then a required reviewer approves.
 #
-# In this repository's settings, create the environments `staging` and
-# `production`, each with:
+# This header is the one list of what the workflow reads. In the repository's
+# settings, the environments `staging` and/or `production`, each with:
 #   secrets    KATAP_HOST            the server's address
 #              KATAP_SSH_KEY         the private half of the key authorised with
 #                                    provision.sh --ci-key … --ci-env <environment>
@@ -16,8 +18,9 @@
 #              KATAP_IMAGE           the image repository, e.g. ghcr.io/you/shop-api
 #              KATAP_MIGRATE_IMAGE   only for a nestjs-api: ghcr.io/you/shop-api-migrate
 #              KATAP_URL             optional: a public URL to check afterwards
-#   and, for production, required reviewers ("prevent self-review" on) and
-#   deployment branches limited to `main`.
+#   and the repository variable PUBLISH_ENABLED=true (publish-image.yml publishes
+#   nothing without it). Always yours to set, for production: required reviewers
+#   ("prevent self-review" on) and deployment branches limited to `main`.
 #
 # Pin the Katap action to the commit of a release, never to a tag: it receives
 # the deploy key. Replace the all-zero commit below with that release's commit.

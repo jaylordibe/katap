@@ -2,13 +2,16 @@
 #
 # katap — run several containerized projects on one host, behind one Caddy.
 #
-# Katap is a tool: clone it as-is and update it by checking out a newer release.
-# Nothing about your projects lives in this repository. A project is a directory
-# under $KATAP_PROJECTS (default /srv/projects) holding one compose file per
-# component (copied from templates/ by `katap add`), a <component>.conf of deploy
-# settings, and site.caddy. Secrets live under /srv/secrets, never in a repository.
+# Katap is a tool: install.sh puts a release at /srv/katap and running it again
+# upgrades. Nothing about your projects lives in this repository. /srv/katap.json
+# says which projects and components this host runs; `katap apply` creates them. A
+# project is a directory under $KATAP_PROJECTS (default /srv/projects) holding one
+# compose file per component (copied from templates/ by `katap add`), a
+# <component>.conf of deploy settings, and site.caddy. Secrets live under
+# /srv/secrets, never in a repository.
 #
-#   katap add <project> <type> <component> [domain...]   define a component
+#   katap apply                                          create what /srv/katap.json declares
+#   katap add <project> <type> <component> [domain...]   define one component by hand
 #   katap secrets <project> <component>                  generate its secrets ONCE
 #   katap edge up|reload                                 start the shared edge / reload its config
 #   katap deploy <project> <component> <image@sha256:…> [migrate=<image@sha256:…>]
@@ -20,8 +23,10 @@
 #   katap check [<project>...]                           enforce the project contract
 #   katap ssh-dispatch <environment> <project> <component>[,<component>...]
 #                                                        forced command of an app's deploy key
+#   katap release-info                                   what connect.sh reads (JSON)
 #
 # Host layout (KATAP_SRV, default /srv):
+#   katap.json                                             the projects apply creates
 #   projects/<project>/<component>.yml, .conf, site.caddy  what runs (KATAP_PROJECTS)
 #   edge/edge.env                                          this host's edge settings
 #   secrets/<project>/<component>.env, .db.env, -db-tls/   0700 dir, 0600 files
@@ -30,6 +35,7 @@
 #   state/.dispatch/<project>/                             each CI dispatch's log
 #   backups/<project>/<component>-<time>-<reason>.dump
 # Host settings: /etc/katap/katap.env (KATAP_GH_TOKEN, KATAP_RCLONE_REMOTE, ...).
+# The installed release: /etc/katap/release (tag= and commit=, written by install.sh).
 #
 # Nothing here ever regenerates a secret, drops a database or volume, or runs a
 # destructive migration. `restore` replaces data and is never reachable from CI.
@@ -72,6 +78,9 @@ fi
 
 KATAP_SRV="${KATAP_SRV:-/srv}"
 KATAP_PROJECTS="${KATAP_PROJECTS:-$KATAP_SRV/projects}"
+KATAP_PROJECTS_FILE="${KATAP_PROJECTS_FILE:-$KATAP_SRV/katap.json}"
+KATAP_RELEASE_FILE="${KATAP_RELEASE_FILE:-/etc/katap/release}"
+KATAP_HOST_KEY_FILE="${KATAP_HOST_KEY_FILE:-/etc/ssh/ssh_host_ed25519_key.pub}"
 # Test seams: the docker and gh binaries, and the program ssh-dispatch hands over to.
 KATAP_DOCKER="${KATAP_DOCKER:-docker}"
 KATAP_GH="${KATAP_GH:-gh}"
@@ -85,6 +94,11 @@ PROJECT_RE='^[a-z][a-z0-9-]{0,29}$'
 # No hyphen: the component name becomes part of an environment variable name.
 COMPONENT_RE='^[a-z][a-z0-9]{0,19}$'
 DOMAIN_RE='^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$'
+# owner/name, as GitHub allows: no dots in the owner, and a name that is not only dots.
+REPO_RE='^[A-Za-z0-9-]+/[A-Za-z0-9_.-]*[A-Za-z0-9_-][A-Za-z0-9_.-]*$'
+# An image repository: lowercase, no tag and no digest (release_lines adds those).
+IMAGE_RE='^[a-z0-9][a-z0-9.-]*(:[0-9]+)?(/[a-z0-9._-]+)+$'
+IPV4_RE='^((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])$'
 DIGEST_SUFFIX_RE='@sha256:[0-9a-f]{64}$'
 
 die() { echo "katap: $*" >&2; exit 1; }
@@ -221,12 +235,14 @@ cmd_add() {
         || die "component '$component' already exists in project '$project'."
 
     # Names are validated above to [a-z0-9-], so they are safe sed replacements.
+    # The .conf is written last: it is what marks the component as created, so an
+    # interrupted add leaves a component that is visibly half-made, never one
+    # that looks complete without its site block.
     sed -e "s/__C__/$component/g" -e "s/__CU__/$cu/g" "$KATAP_ROOT/templates/$type.yml" > "$dir/$component.yml"
-    sed -e "s/__C__/$component/g" -e "s/__CU__/$cu/g" -e "s/__DOMAINS__/$*/" "$KATAP_ROOT/templates/$type.conf" > "$dir/$component.conf"
 
     if [ "$#" -gt 0 ] && [ -f "$KATAP_ROOT/templates/$type.site" ]; then
         local port domains
-        port="$(conf_get "$project" "$component" port)"
+        port="$(file_get "$KATAP_ROOT/templates/$type.conf" port)"
         domains="$(printf '%s, ' "$@")"
         domains="${domains%, }"
         local separator=''
@@ -237,6 +253,11 @@ cmd_add() {
                 -e "s/__UPSTREAM__/$project-$component:$port/" "$KATAP_ROOT/templates/$type.site"
         } >> "$dir/site.caddy"
     fi
+    local conf_tmp
+    conf_tmp="$(mktemp "$dir/.$component.conf.XXXXXX")"
+    sed -e "s/__C__/$component/g" -e "s/__CU__/$cu/g" -e "s/__DOMAINS__/$*/" "$KATAP_ROOT/templates/$type.conf" > "$conf_tmp"
+    chmod 0644 "$conf_tmp"
+    mv "$conf_tmp" "$dir/$component.conf"
 
     cat <<EOF
 Added $type component '$component' to project '$project' ($dir).
@@ -277,9 +298,11 @@ cmd_secrets() {
     mkdir -p "$dir"
     chmod 700 "$dir"
 
-    local domain cloudflare caddy_ip
+    local domain cloudflare caddy_ip frontend_url frontend_origins
     domain="$(conf_get "$project" "$component" domains)"
     domain="${domain%% *}"
+    frontend_url="$(frontend_of "$project" "$component" url)"
+    frontend_origins="$(frontend_of "$project" "$component" origins)"
     caddy_ip="$(edge_get CADDY_IP)"
     cloudflare=false
     [ "$(edge_get TLS_MODE)" != cloudflare ] || cloudflare=true
@@ -347,6 +370,15 @@ cmd_secrets() {
                     out="${out//\{secret:${BASH_REMATCH[1]}\}/${value[${BASH_REMATCH[1]}]}}"
                 done
                 ;;
+            frontend:url|frontend:origins)
+                out="$frontend_url"
+                [ "$generator" = frontend:url ] || out="$frontend_origins"
+                if [ -z "$out" ]; then
+                    printf '# katap:required\n%s=\n' "$key" >> "$work/$section"
+                    value[$key]=''
+                    continue
+                fi
+                ;;
             required)
                 printf '# katap:required\n%s=\n' "$key" >> "$work/$section"
                 value[$key]=''
@@ -362,18 +394,59 @@ cmd_secrets() {
     done < "$spec"
 
     if grep -qF "\${KATAP_SECRETS}/$component-db-tls" "$(project_dir "$project")/$component.yml"; then
-        mkdir -p "$tls_dir"
+        mkdir -p "$work/tls"
         openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -subj "/CN=$component-db" \
-            -keyout "$tls_dir/server.key" -out "$tls_dir/server.crt" 2>/dev/null
-        chmod 600 "$tls_dir/server.key" "$tls_dir/server.crt"
+            -keyout "$work/tls/server.key" -out "$work/tls/server.crt" 2>/dev/null
+        chmod 600 "$work/tls/server.key" "$work/tls/server.crt"
     fi
 
-    for name in "${!section_file[@]}"; do
-        mv "$work/$name" "${section_file[$name]}"
-        chmod 600 "${section_file[$name]}"
-    done
+    # Everything is made before anything is moved into place, and the app's file
+    # last: it is what marks the secrets as made.
+    chmod 600 "$work/db" "$work/redis" "$work/app"
+    mv "$work/db" "${section_file[db]}"
+    mv "$work/redis" "${section_file[redis]}"
+    [ ! -d "$work/tls" ] || mv "$work/tls" "$tls_dir"
+    mv "$work/app" "${section_file[app]}"
 
     echo "Wrote ${section_file[app]} and its database and Redis files (mode 0600). Fill every empty value marked '# katap:required' before the first deploy."
+}
+
+# The frontend a component's API serves: the one spa or node-ssr component of
+# its project that has domains. <what> is `url` (https:// and its first domain)
+# or `origins` (https:// and every domain, comma-separated). Nothing when the
+# project has none or several: which one is the frontend is then the operator's
+# to say.
+frontend_of() {
+    local project="$1" component="$2" what="$3" other found='' type domains
+    for other in $(components_of "$project"); do
+        [ "$other" != "$component" ] || continue
+        type="$(conf_get "$project" "$other" type)"
+        domains="$(conf_get "$project" "$other" domains)"
+        case "$type" in spa|node-ssr) ;; *) continue ;; esac
+        [ -n "$domains" ] || continue
+        [ -z "$found" ] || return 0
+        found="$domains"
+    done
+    [ -n "$found" ] || return 0
+    if [ "$what" = url ]; then
+        printf 'https://%s' "${found%% *}"
+    else
+        local list=() names d
+        read -ra names <<<"$found"
+        for d in "${names[@]}"; do list+=("https://$d"); done
+        (IFS=,; printf '%s' "${list[*]}")
+    fi
+}
+
+# The keys still empty under a '# katap:required' marker in a component's
+# secret files, one per line.
+empty_required() {
+    local file
+    file="$(secrets_dir "$1")/$2.env"
+    local files=("$file")
+    [ ! -f "${file%.env}.db.env" ] || files+=("${file%.env}.db.env")
+    [ ! -f "${file%.env}.redis.env" ] || files+=("${file%.env}.redis.env")
+    awk '/^# katap:required$/ { getline; if ($0 ~ /^[A-Z0-9_]+=$/) print substr($0, 1, length($0) - 1) }' "${files[@]}"
 }
 
 # Refuses a deploy while a required value is still empty.
@@ -382,14 +455,15 @@ require_filled_secrets() {
     file="$(secrets_dir "$project")/$component.env"
     [ -f "$file" ] || die "no secrets for '$project/$component'; run 'katap secrets $project $component' on this host first."
     local missing
-    local files=("$file")
-    [ ! -f "${file%.env}.db.env" ] || files+=("${file%.env}.db.env")
-    [ ! -f "${file%.env}.redis.env" ] || files+=("${file%.env}.redis.env")
-    missing="$(awk '/^# katap:required$/ { getline; if ($0 ~ /^[A-Z0-9_]+=$/) print substr($0, 1, length($0) - 1) }' "${files[@]}")"
+    missing="$(empty_required "$project" "$component")"
     [ -z "$missing" ] || die "required values are empty in $file: $(echo "$missing" | tr '\n' ' ')"
 }
 
 # --- check ----------------------------------------------------------------------
+
+# Whether check_project also holds declared components to katap.json. A rollback
+# sets it false: the way back must never depend on a file being edited.
+CHECK_DRIFT=true
 
 # The project contract, enforced on the merged compose configuration rendered with
 # placeholder digests and empty secret files.
@@ -479,6 +553,40 @@ check_project() {
                 || problems+=$'\n'"$component.conf: cron service '$name' is not in the cron profile"
         done
     done
+
+    # What katap.json declares is what may deploy: a .conf edited away from it, or
+    # a katap.json changed without `katap apply`, is refused until the two agree.
+    # Only this project's part of the file is held against it: an edit to another
+    # project not applied yet does not hold this project's deploys. A file that
+    # does not parse holds every deploy.
+    if [ -f "$KATAP_PROJECTS_FILE" ] && [ "$CHECK_DRIFT" = true ]; then
+        local own err file="$KATAP_PROJECTS_FILE"
+        own="$(mktemp)"
+        CLEANUP+=("$own")
+        if ! jq --arg p "$project" '{host: (.host // ""), projects: (if (.projects // {}) | has($p) then {($p): .projects[$p]} else {} end)}' \
+            "$file" > "$own" 2>/dev/null; then
+            problems+=$'\n'"$file does not parse; fix it and run 'katap apply'"
+        elif ! err="$(load_projects_file "$own" 2>&1)"; then
+            problems+=$'\n'"$file: ${err##*"$own": }; fix it and run 'katap apply'"
+        else
+            # Loaded for this project alone: a check of several projects reads each afresh.
+            WANTED=(); WANTED_LIST=(); WANTED_LOADED=false
+            load_projects_file "$own"
+            for component in $(components_of "$project"); do
+                [ -n "${WANTED[$project/$component/type]+set}" ] || continue
+                for key in type "${JSON_KEYS[@]}"; do
+                    [ "$(conf_get "$project" "$component" "$key")" = "${WANTED[$project/$component/$key]}" ] \
+                        || problems+=$'\n'"$component.conf: $key differs from $KATAP_PROJECTS_FILE; run 'katap apply'"
+                done
+                local names
+                read -ra names <<<"${WANTED[$project/$component/domains]}"
+                for name in "${names[@]}"; do
+                    site_serves "$site" "$name" \
+                        || log "WARNING: $project/$component: '$name' is not in $site; add it there and run 'katap edge reload'."
+                done
+            done
+        fi
+    fi
 
     problems="$(sed '/^$/d' <<<"$problems")"
     if [ -n "$problems" ]; then
@@ -620,21 +728,33 @@ try_lock_project() {
     flock -n 9 || { exec 9>&-; return 1; }
 }
 
+# git on the tool's own checkout. The .git is named outright, so git never falls
+# back to an enclosing repository when this one cannot be read, and its ownership
+# check (made only when it searches for a repository) never refuses the deploy
+# user reading root's checkout; safe.directory says the same for any git that
+# would. Hooks and fsmonitor are off, so reading it never runs anything.
+tool_git() {
+    git -c safe.directory="$KATAP_ROOT" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
+        --git-dir="$KATAP_ROOT/.git" --work-tree="$KATAP_ROOT" "$@"
+}
+
 # A deploy runs only a tool checkout without uncommitted changes to its tracked
-# files (which release is checked out is the operator's choice). Skipped only when
-# the tool is not a git checkout at all; any git failure is a refusal, never a pass. safe.directory
-# lets root check the deploy user's checkout instead of failing open on git's
-# ownership check.
+# files, and, once install.sh has recorded a release in $KATAP_RELEASE_FILE, only
+# that release's commit. Skipped only when the tool is not a git checkout at all;
+# any git failure is a refusal, never a pass.
 require_clean_tool() {
     [ -e "$KATAP_ROOT/.git" ] || return 0
     local out
-    # The tool's own .git, named outright: git never falls back to an enclosing
-    # repository when this one cannot be read.
-    out="$(git -c safe.directory="$KATAP_ROOT" --git-dir="$KATAP_ROOT/.git" --work-tree="$KATAP_ROOT" \
-        status --porcelain --untracked-files=no 2>&1)" \
+    out="$(tool_git status --porcelain --untracked-files=no 2>&1)" \
         || die "could not check $KATAP_ROOT with git ($out); nothing was changed."
     [ -z "$out" ] \
         || die "$KATAP_ROOT has local modifications; restore it to a release (git -C $KATAP_ROOT status) before deploying."
+    [ -f "$KATAP_RELEASE_FILE" ] || return 0
+    local recorded head
+    recorded="$(file_get "$KATAP_RELEASE_FILE" commit)"
+    head="$(tool_git rev-parse HEAD 2>&1)" || die "could not read $KATAP_ROOT's commit ($head); nothing was changed."
+    [ "$head" = "$recorded" ] \
+        || die "$KATAP_ROOT is at ${head:0:12}, not the release install.sh installed (${recorded:0:12}, $KATAP_RELEASE_FILE); run install.sh again."
 }
 
 # The source commit one image was built from, per a build-provenance attestation
@@ -680,7 +800,7 @@ verify_release() {
         attested) ;;
         *) die "$project/$component: provenance= must be 'attested' or 'none'." ;;
     esac
-    [[ "$source_repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] && [ "$source_repo" != OWNER/REPO ] \
+    [[ "$source_repo" =~ $REPO_RE ]] && [ "$source_repo" != OWNER/REPO ] \
         || die "set source_repo= (owner/repository) in $(conf_file "$project" "$component")."
     [ -n "${KATAP_GH_TOKEN:-}" ] \
         || die "set KATAP_GH_TOKEN in $KATAP_SETTINGS: the host verifies build provenance before deploying."
@@ -711,6 +831,9 @@ release() {
     local mode="$1" project="$2" component="$3"
     shift 3
     require_component "$project" "$component"
+    # Before the .conf is read: apply rewrites it under this lock, so every check
+    # below and the rollout see one version of it.
+    lock_project "$project"
     require_filled_secrets "$project" "$component"
 
     local images=() arg
@@ -728,6 +851,7 @@ release() {
     set -- "${images[@]}"
 
     [ "$mode" != deploy ] || require_clean_tool
+    [ "$mode" = deploy ] || CHECK_DRIFT=false
     check_project "$project" || die "fix the project contract before deploying."
 
     local lines cu current candidate state
@@ -750,7 +874,6 @@ release() {
             || die "${lines#*=} was never deployed here as one release; deploy it instead of rolling back to it."
     fi
 
-    lock_project "$project"
     state="$(state_dir "$project")"
     current="$(images_file "$project")"
     candidate="$(mktemp "$state/images.XXXXXX")"
@@ -1067,6 +1190,312 @@ cmd_restore() {
     log "restored '$project/$component' from $(basename "$dump"), with the release that wrote it."
 }
 
+# --- apply ----------------------------------------------------------------------
+
+# Whether <site.caddy> has a site block for <domain>: the name in a block's
+# address list, not inside a directive.
+site_serves() {
+    [ -f "$1" ] && grep -qE "^([^[:space:]#{][^{]*[ ,])?([a-z]+://)?${2//./\\.}(:[0-9]+)?([ ,]|\{|$)" "$1"
+}
+
+# The .conf keys katap.json owns. apply writes them; every other key, the compose
+# file, site.caddy and the secrets stay the operator's after the first apply.
+JSON_KEYS=(image image_migrate source_repo environment domains provenance)
+
+# Reads $KATAP_PROJECTS_FILE (or the file given) into WANTED[<project>/<component>/<key>] (type and the
+# JSON_KEYS), WANTED_LIST (<project>/<component>, in file order) and WANTED_HOST.
+# Every value is validated before anything uses it: these values become lines of
+# a .conf, read first-match by file_get, so one stray newline would be a second
+# setting. Dies naming the first problem.
+declare -A WANTED=()
+WANTED_LIST=()
+WANTED_HOST=''
+WANTED_LOADED=false
+load_projects_file() {
+    [ "$WANTED_LOADED" = false ] || return 0
+    local file="${1:-$KATAP_PROJECTS_FILE}" rows
+    [ -f "$file" ] || die "no $file; write it first (docs/projects-file.md)."
+    rows="$(jq -r '
+        def fail($m): "error\u001f\($m)";
+        def allowed: ["type", "repo", "domains", "environment", "provenance", "image"];
+        if type != "object" then fail("the file must be one JSON object")
+        elif ((keys - ["host", "projects"]) | length) > 0 then fail("unknown key(s) \((keys - ["host", "projects"]) | join(", ")); expected host and projects")
+        elif ([.. | strings, (objects | keys[]) | select(test("[[:space:][:cntrl:]]"))] | length) > 0 then fail("a name or value contains whitespace or a control character")
+        elif ((.host // "") | type) != "string" then fail("host must be a string")
+        elif ((.projects // {}) | type) != "object" then fail("projects must be an object of projects")
+        else
+            "host\u001f\(.host // "")",
+            ((.projects // {}) | to_entries[] | .key as $p |
+                if (.value | type) != "object" then fail("project \($p) must be an object of components")
+                else .value | to_entries[] | .key as $c | .value as $v |
+                    if ($v | type) != "object" then fail("\($p)/\($c) must be an object")
+                    elif ((($v | keys) - allowed) | length) > 0 then fail("\($p)/\($c): unknown key(s) \((($v | keys) - allowed) | join(", "))")
+                    elif ([$v.type, $v.repo] | any(type != "string")) then fail("\($p)/\($c): type and repo are required")
+                    elif ([$v.environment, $v.provenance, $v.image] | any(. != null and type != "string")) then fail("\($p)/\($c): environment, provenance and image are strings")
+                    elif (($v.domains // []) | (type != "array") or any(.[]; type != "string")) then fail("\($p)/\($c): domains must be a list of names")
+                    elif ([($v.domains // [])[] | select(test($domain_re) | not)] | length) > 0 then fail("\($p)/\($c): invalid domain '"'"'\([($v.domains // [])[] | select(test($domain_re) | not)][0])'"'"'")
+                    else ["component", $p, $c, $v.type, $v.repo, ($v.image // ""), ($v.environment // "production"), ($v.provenance // "attested"), (($v.domains // []) | join(" "))] | join("\u001f")
+                    end
+                end)
+        end' --arg domain_re "$DOMAIN_RE" "$file" 2>&1)" || die "$file is not valid JSON: $rows"
+
+    local kind project component type repo image environment provenance domains d id list
+    declare -A owner=() binding=()
+    # The unit separator, not a tab: empty fields (no image, no domains) must not
+    # collapse into each other, as runs of whitespace separators do.
+    while IFS=$'\x1f' read -r kind project component type repo image environment provenance domains; do
+        case "$kind" in
+            error) die "$file: $project" ;;
+            host)
+                WANTED_HOST="$project"
+                [ -z "$WANTED_HOST" ] || [[ "$WANTED_HOST" =~ $IPV4_RE ]] || die "$file: host must be this server's public IPv4 address."
+                continue
+                ;;
+        esac
+        id="$project/$component"
+        [[ "$project" =~ $PROJECT_RE ]] || die "$file: invalid project name '$project' (expected ${PROJECT_RE})."
+        [[ "$component" =~ $COMPONENT_RE ]] || die "$file: $project: invalid component name '$component' (expected ${COMPONENT_RE})."
+        if ! [[ "$type" =~ ^[a-z][a-z0-9-]*$ ]] || [ ! -f "$KATAP_ROOT/templates/$type.yml" ] || [ ! -f "$KATAP_ROOT/templates/$type.conf" ]; then
+            local known=() template
+            for template in "$KATAP_ROOT"/templates/*.yml; do known+=("$(basename "$template" .yml)"); done
+            die "$file: $id: unknown type '$type' (expected one of: ${known[*]})."
+        fi
+        [[ "$repo" =~ $REPO_RE ]] || die "$file: $id: repo must be owner/name."
+        [ -n "$image" ] || image="ghcr.io/$(tr '[:upper:]' '[:lower:]' <<<"$repo")"
+        [[ "$image" =~ $IMAGE_RE ]] || die "$file: $id: image must be a lowercase repository without a tag or digest."
+        case "$environment" in production|staging) ;; *) die "$file: $id: environment must be production or staging." ;; esac
+        case "$provenance" in attested|none) ;; *) die "$file: $id: provenance must be attested or none." ;; esac
+        # Split without globbing: a pattern such as *.example.com must reach the
+        # check, not expand to nothing (nullglob) and skip it.
+        read -ra list <<<"$domains"
+        for d in "${list[@]}"; do
+            [[ "$d" =~ $DOMAIN_RE ]] || die "$file: $id: invalid domain '$d'."
+            [ -z "${owner[$d]+set}" ] || die "$file: $d is claimed by both ${owner[$d]} and $id."
+            owner[$d]="$id"
+        done
+        [ -z "${WANTED[$id/type]+set}" ] || die "$file: $id appears twice."
+        # One GitHub environment holds one component's deploy key and names: two
+        # components of one repository in one environment would overwrite each other.
+        d="$(tr '[:upper:]' '[:lower:]' <<<"$repo")/$environment"
+        [ -z "${binding[$d]+set}" ] || die "$file: ${binding[$d]} and $id are both $repo in $environment; a repository deploys one component per environment."
+        binding[$d]="$id"
+        if [ -f "$(conf_file "$project" "$component")" ] && [ "$(conf_get "$project" "$component" type)" != "$type" ]; then
+            die "$file: $id is a $(conf_get "$project" "$component" type) component; it says $type. A component never changes type."
+        fi
+        WANTED_LIST+=("$id")
+        WANTED[$id/type]="$type"
+        WANTED[$id/image]="$image"
+        WANTED[$id/image_migrate]=''
+        ! grep -q '^image_migrate=' "$KATAP_ROOT/templates/$type.conf" || WANTED[$id/image_migrate]="$image-migrate"
+        WANTED[$id/source_repo]="$repo"
+        WANTED[$id/environment]="$environment"
+        WANTED[$id/provenance]="$provenance"
+        WANTED[$id/domains]="$domains"
+    done <<<"$rows"
+
+    # A domain another component serves now, by its .conf or by a block in a
+    # site.caddy, is still served after this apply: site.caddy is never rewritten,
+    # and two site blocks for one name stop the edge. Moving a domain takes two
+    # applies, with site.caddy edited in between.
+    local p c
+    for p in $(all_projects); do
+        for c in $(components_of "$p"); do
+            read -ra list <<<"$(conf_get "$p" "$c" domains)"
+            for d in "${list[@]}"; do
+                [ -z "${owner[$d]+set}" ] || [ "${owner[$d]}" = "$p/$c" ] \
+                    || die "$file: ${owner[$d]} claims $d, which $p/$c still serves; remove it from $p/$c (and its site.caddy block) first."
+            done
+        done
+        for d in "${!owner[@]}"; do
+            [ -f "$(conf_file "${owner[$d]%%/*}" "${owner[$d]#*/}")" ] && [ "${owner[$d]%%/*}" = "$p" ] && continue
+            ! site_serves "$(project_dir "$p")/site.caddy" "$d" \
+                || die "$file: ${owner[$d]} claims $d, which $(project_dir "$p")/site.caddy already serves; remove that block first."
+        done
+    done
+    WANTED_LOADED=true
+}
+
+# Sets <key>=<value> lines in a .conf: the first line for each key is replaced in
+# place, later ones dropped, a missing one appended. Written to a temporary file
+# and renamed, so a deploy reading the .conf never sees half of it.
+set_conf_keys() {
+    local file="$1" tmp
+    shift
+    tmp="$(mktemp "$file.XXXXXX")"
+    CLEANUP+=("$tmp")
+    KATAP_SET="$(printf '%s\n' "$@")" awk '
+        BEGIN { n = split(ENVIRON["KATAP_SET"], pairs, "\n"); for (i = 1; i <= n; i++) if (pairs[i] != "") { k = pairs[i]; sub(/=.*/, "", k); want[k] = pairs[i]; order[++count] = k } }
+        { k = $0; sub(/=.*/, "", k) }
+        $0 ~ /^[a-z_]+=/ && (k in want) { if (!(k in done)) { print want[k]; done[k] = 1 }; next }
+        { print }
+        END { for (i = 1; i <= count; i++) if (!(order[i] in done)) print want[order[i]] }
+    ' "$file" > "$tmp"
+    chmod --reference="$file" "$tmp" 2>/dev/null || true
+    mv "$tmp" "$file"
+}
+
+cmd_apply() {
+    [ "$#" -eq 0 ] || die "usage: katap apply   (reads $KATAP_PROJECTS_FILE)"
+    # Everything apply creates must belong to whoever runs deploys, cron and
+    # backups: run as root, it would leave a project the deploy user cannot open.
+    [ -d "$KATAP_PROJECTS" ] && [ -O "$KATAP_PROJECTS" ] \
+        || die "run apply as the owner of $KATAP_PROJECTS: sudo -u deploy $KATAP_ROOT/bin/katap apply"
+    load_projects_file
+
+    local id project component key created=() updated=() drift=() pairs list umask_before
+    declare -A new_component=()
+    local projects=() seen=' '
+    for id in "${WANTED_LIST[@]}"; do
+        project="${id%%/*}"
+        [[ "$seen" == *" $project "* ]] || { projects+=("$project"); seen+="$project "; }
+    done
+
+    for project in "${projects[@]}"; do
+        mkdir -p "$(project_dir "$project")"
+        lock_project "$project"
+        # Every component first, then the secrets: a frontend added in the same
+        # run is known to the API's secrets.
+        for id in "${WANTED_LIST[@]}"; do
+            [ "${id%%/*}" = "$project" ] || continue
+            component="${id#*/}"
+            if [ ! -f "$(conf_file "$project" "$component")" ]; then
+                [ ! -e "$(project_dir "$project")/$component.yml" ] \
+                    || die "$id is half-created ($(project_dir "$project")/$component.yml without its .conf); remove that file and any '# $component' block in site.caddy, then run apply again."
+                read -ra list <<<"${WANTED[$id/domains]}"
+                cmd_add "$project" "${WANTED[$id/type]}" "$component" "${list[@]}" >/dev/null
+                new_component[$id]=1
+                created+=("$id (${WANTED[$id/type]})")
+            fi
+            local before
+            before="$(conf_get "$project" "$component" domains)"
+            pairs=()
+            for key in "${JSON_KEYS[@]}"; do
+                [ "$(conf_get "$project" "$component" "$key")" = "${WANTED[$id/$key]}" ] || pairs+=("$key=${WANTED[$id/$key]}")
+            done
+            if [ "${#pairs[@]}" -gt 0 ]; then
+                set_conf_keys "$(conf_file "$project" "$component")" "${pairs[@]}"
+                [ -n "${new_component[$id]+set}" ] || updated+=("$id: ${pairs[*]%%=*}")
+            fi
+            if [ -z "${new_component[$id]+set}" ] && [ "$before" != "${WANTED[$id/domains]}" ]; then
+                drift+=("$id: its domains changed; edit $(project_dir "$project")/site.caddy to match, then run 'katap edge reload'. Values generated from the old domain (APP_URL, API_BASE_URL) stay as they are in $(secrets_dir "$project")/$component.env.")
+            fi
+        done
+        for id in "${WANTED_LIST[@]}"; do
+            [ "${id%%/*}" = "$project" ] || continue
+            component="${id#*/}"
+            if [ ! -e "$(secrets_dir "$project")/$component.env" ]; then
+                local partial=() f
+                for f in "$component.db.env" "$component.redis.env" "$component-db-tls"; do
+                    [ ! -e "$(secrets_dir "$project")/$f" ] || partial+=("$(secrets_dir "$project")/$f")
+                done
+                [ "${#partial[@]}" -eq 0 ] \
+                    || die "$id's secrets are half-made (${partial[*]} without $component.env); nothing in them was used yet: remove them, then run apply again."
+                # secrets sets a strict umask for its own files; the next project's
+                # directories and files get the usual modes.
+                umask_before="$(umask)"
+                cmd_secrets "$project" "$component" >/dev/null
+                umask "$umask_before"
+            fi
+        done
+        exec 9>&-
+    done
+
+    # Every time, not only when something was created: a run that stopped after
+    # writing a site block must not leave it unloaded once the next run has
+    # nothing left to create. A no-op while the edge is down; validated first.
+    edge_reload || die "the edge rejected the sites; the previous configuration keeps serving. Fix site.caddy and run 'katap edge reload'."
+    apply_report
+}
+
+# What is left for the operator after apply: the A records, the values only they
+# know, what apply did not touch, and the one command to run on their laptop. All
+# of it is printed from validated values; nothing here is meant to be run blindly
+# except the last line, which carries only the validated host.
+apply_report() {
+    local id project component d missing spec key generator want have list
+    [ "${#created[@]}" -eq 0 ] || { echo "Created:"; printf '  %s\n' "${created[@]}"; }
+    [ "${#updated[@]}" -eq 0 ] || { echo "Updated in .conf:"; printf '  %s\n' "${updated[@]}"; }
+
+    echo "DNS (an A record each, no AAAA: the edge is IPv4 only):"
+    for id in "${WANTED_LIST[@]}"; do
+        read -ra list <<<"${WANTED[$id/domains]}"
+        for d in "${list[@]}"; do
+            printf '  %-40s A  %s\n' "$d" "${WANTED_HOST:-<set host in $KATAP_PROJECTS_FILE>}"
+        done
+    done
+
+    local todo=()
+    for id in "${WANTED_LIST[@]}"; do
+        project="${id%%/*}"
+        component="${id#*/}"
+        missing="$(empty_required "$project" "$component" | tr '\n' ' ')"
+        [ -z "$missing" ] || todo+=("$(secrets_dir "$project")/$component.env: $missing")
+        # A value derived from the frontend when the secrets were made, which the
+        # project's frontend no longer gives: reported, never rewritten.
+        spec="$KATAP_ROOT/templates/${WANTED[$id/type]}.env.spec"
+        while IFS='=' read -r key generator; do
+            case "$generator" in frontend:url|frontend:origins) ;; *) continue ;; esac
+            want="$(frontend_of "$project" "$component" "${generator#frontend:}")"
+            have="$(file_get "$(secrets_dir "$project")/$component.env" "$key")"
+            [ -z "$want" ] || [ -z "$have" ] || [ "$want" = "$have" ] \
+                || drift+=("$id: $key is $have in $component.env; the project's frontend now gives $want.")
+        done < <(grep -E '^[A-Z][A-Z0-9_]*=' "$spec")
+    done
+    if [ "${#todo[@]}" -gt 0 ]; then
+        echo "Fill in (deploys are refused while these are empty):"
+        printf '  %s\n' "${todo[@]}"
+    fi
+    [ "${#drift[@]}" -eq 0 ] || { echo "Check by hand:"; printf '  %s\n' "${drift[@]}"; }
+
+    local unmanaged=() p c
+    for p in $(all_projects); do
+        for c in $(components_of "$p"); do
+            [ -n "${WANTED[$p/$c/type]+set}" ] || unmanaged+=("$p/$c")
+        done
+    done
+    [ "${#unmanaged[@]}" -eq 0 ] || { echo "Not in $KATAP_PROJECTS_FILE (left as they are; apply never removes anything):"; printf '  %s\n' "${unmanaged[@]}"; }
+
+    echo "Connect every application's repository, from your own computer (it uses your ssh and gh logins):"
+    printf '  curl -fsSL https://raw.githubusercontent.com/jaylordibe/katap/main/connect.sh | bash -s -- root@%s\n' \
+        "${WANTED_HOST:-<this server>}"
+}
+
+# --- release-info ---------------------------------------------------------------
+
+# What connect.sh needs, as JSON: the release this host runs, its host key, and
+# each component katap.json declares. Data only, built by jq from validated
+# values; connect.sh validates all of it again.
+cmd_release_info() {
+    [ "$#" -eq 0 ] || die "usage: katap release-info"
+    [ -f "$KATAP_RELEASE_FILE" ] || die "no $KATAP_RELEASE_FILE: install Katap with install.sh first."
+    local tag commit hostkey
+    tag="$(file_get "$KATAP_RELEASE_FILE" tag)"
+    commit="$(file_get "$KATAP_RELEASE_FILE" commit)"
+    [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] && [[ "$commit" =~ ^[0-9a-f]{40}$ ]] \
+        || die "$KATAP_RELEASE_FILE does not name a release; run install.sh again."
+    [ -e "$KATAP_ROOT/.git" ] || die "$KATAP_ROOT is not a git checkout, so its release cannot be proved; run install.sh again."
+    require_clean_tool
+    load_projects_file
+    [ -n "$WANTED_HOST" ] || die "set host (this server's public IPv4) in $KATAP_PROJECTS_FILE."
+    hostkey="$(cut -d' ' -f1-2 "$KATAP_HOST_KEY_FILE" 2>/dev/null || true)"
+    [[ "$hostkey" =~ ^ssh-ed25519\ [A-Za-z0-9+/]+=*$ ]] || die "could not read this host's ed25519 key ($KATAP_HOST_KEY_FILE)."
+
+    local id project component rows=()
+    for id in "${WANTED_LIST[@]}"; do
+        project="${id%%/*}"
+        component="${id#*/}"
+        [ -f "$(conf_file "$project" "$component")" ] || die "$id is not created yet; run 'katap apply' first."
+        rows+=("$(jq -cn --arg project "$project" --arg component "$component" \
+            --arg environment "${WANTED[$id/environment]}" --arg repo "${WANTED[$id/source_repo]}" \
+            --arg image "${WANTED[$id/image]}" --arg image_migrate "${WANTED[$id/image_migrate]}" \
+            --arg domain "$(cut -d' ' -f1 <<<"${WANTED[$id/domains]}")" \
+            --arg smoke_path "$(conf_get "$project" "$component" smoke_path)" \
+            '$ARGS.named')")
+    done
+    printf '%s\n' "${rows[@]}" | jq -s --arg tag "$tag" --arg commit "$commit" --arg host "$WANTED_HOST" --arg hostkey "$hostkey" \
+        '{tag: $tag, commit: $commit, host: $host, hostkey: $hostkey, components: .}'
+}
+
 # --- ssh-dispatch ---------------------------------------------------------------
 
 # The forced command of an application's deploy key:
@@ -1098,7 +1527,7 @@ cmd_ssh_dispatch() {
     for word in "${words[@]:3}"; do
         case "$word" in
             env=*) die "refused: the environment is the key's, not the request's." ;;
-            katap=*) die "refused: katap= is no longer part of a request; this server deploys from the Katap action (see Updating Katap in the README)." ;;
+            katap=*) die "refused: katap= is no longer part of a request; this server deploys from the Katap action (see docs/updating.md)." ;;
             migrate=*|*@sha256:*) ;;
             *) die "refused: unexpected word '$word' in the request." ;;
         esac
@@ -1177,6 +1606,8 @@ main() {
         backup) cmd_backup "$@" ;;
         restore) cmd_restore "$@" ;;
         check) cmd_check "$@" ;;
+        apply) cmd_apply "$@" ;;
+        release-info) cmd_release_info "$@" ;;
         ssh-dispatch) cmd_ssh_dispatch "$@" ;;
         help|-h|--help) awk 'NR > 2 && /^#/ { sub(/^# ?/, ""); print; next } NR > 2 { exit }' "$KATAP_ROOT/bin/katap" ;;
         *) die "unknown command '$command'; see 'katap help'." ;;

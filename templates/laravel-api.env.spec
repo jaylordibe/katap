@@ -5,7 +5,10 @@
 # (<component>.redis.env).
 #
 # Everything marked `required` must be filled in on the host before the first
-# deploy: `katap deploy` refuses while one is empty. Anything else the application
+# deploy: `katap deploy` refuses while one is empty. `frontend:url` and
+# `frontend:origins` come from the project's one spa or node-ssr component with
+# domains (https://<its first domain>, and every domain); with none or several
+# they are `required` too. Anything else the application
 # reads (mail credentials, storage, HORIZON_DASHBOARD_EMAILS, ...) is added to the
 # generated file by hand; see the application's DEPLOYMENT.md §4.
 
@@ -24,8 +27,8 @@ APP_DEBUG=literal:false
 APP_KEY=laravel-key
 APP_URL=literal:https://{domain}
 APP_DOMAIN=literal:{domain}
-APP_FRONTEND_URL=required
-CORS_ALLOWED_ORIGINS=required
+APP_FRONTEND_URL=frontend:url
+CORS_ALLOWED_ORIGINS=frontend:origins
 LOG_CHANNEL=literal:stderr
 DB_CONNECTION=literal:pgsql
 DB_HOST=literal:__C__-db
@@ -45,8 +48,8 @@ SESSION_DRIVER=literal:redis
 # One token both parsers accept: the base image's nginx and Laravel read this
 # variable differently, and only a single CIDR satisfies both. Nothing outside this
 # host can reach the container; public components of OTHER projects on the shared
-# edge network can, and could set their own client address (README "Trusted
-# proxies" and "Known limits").
+# edge network can, and could set their own client address (docs/reference.md,
+# "Trusted proxies", and docs/security.md, "Known limits").
 TRUSTED_PROXIES=literal:0.0.0.0/0
 PASSPORT_PRIVATE_KEY=rsa-private:passport
 PASSPORT_PUBLIC_KEY=rsa-public:passport
