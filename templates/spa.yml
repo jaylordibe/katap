@@ -11,7 +11,7 @@
 
 services:
   __C__:
-    image: ${IMAGE___CU__:-kit/unreleased:none}
+    image: ${IMAGE___CU__:-katap/unreleased:none}
     restart: unless-stopped
     mem_limit: 128m
     security_opt:
@@ -32,9 +32,9 @@ services:
       default: {}
       edge:
         aliases:
-          - ${KIT_PROJECT}-__C__
+          - ${KATAP_PROJECT}-__C__
 
 networks:
   edge:
-    name: kit-edge
+    name: katap-edge
     external: true

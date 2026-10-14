@@ -4,7 +4,7 @@
 # whose provenance does not trace back to the component's own publish workflow.
 #
 # Input (environment): ENVIRONMENT, PROJECT, COMPONENT, IMAGE, MIGRATE_IMAGE,
-# GITHUB_SHA. Output ($GITHUB_OUTPUT): request (the words `kit ssh-dispatch`
+# GITHUB_SHA. Output ($GITHUB_OUTPUT): request (the words `katap ssh-dispatch`
 # receives), smoke_url, smoke_body.
 #
 # Requires docker (logged in to the registry), gh (GH_TOKEN able to read the source
@@ -14,7 +14,7 @@ set -euo pipefail
 
 die() { echo "::error::$*" >&2; exit 1; }
 warn() { echo "::warning::$*" >&2; }
-conf() { bin/kit conf "$PROJECT" "$COMPONENT" "$1"; }
+conf() { bin/katap conf "$PROJECT" "$COMPONENT" "$1"; }
 
 IMAGE="${IMAGE:?IMAGE is not set}"
 case "$ENVIRONMENT" in
@@ -107,8 +107,8 @@ if [ -n "$image_migrate" ]; then
 elif [ -n "${MIGRATE_IMAGE:-}" ]; then
     die "this component has no migrate image."
 fi
-# The host refuses unless its checkout is this commit (bin/kit release).
-request+=" kit=$GITHUB_SHA"
+# The host refuses unless its checkout is this commit (bin/katap release).
+request+=" katap=$GITHUB_SHA"
 
 domain="$(conf domains)"
 domain="${domain%% *}"

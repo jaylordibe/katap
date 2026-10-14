@@ -1,0 +1,16 @@
+[Unit]
+Description=katap: per-minute jobs of every project (e.g. Laravel's schedule:run)
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+User=deploy
+EnvironmentFile=-/etc/katap/katap.env
+# `katap cron --all` starts one detached process per project and returns at once, so a
+# slow job in one project never holds back the next minute of another. process: the
+# unit ending must not kill them (each is bounded by KATAP_CRON_TIMEOUT, default 10m,
+# and skips a minute while its project is busy).
+KillMode=process
+TimeoutStartSec=30s
+ExecStart=/srv/katap/bin/katap cron --all

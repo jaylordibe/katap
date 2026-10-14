@@ -7,7 +7,7 @@
 #
 #   __C__              node dist/main.js, with the queue worker in-process
 #                      (QUEUE_WORKER_ENABLED=true, the single-host default)
-#   __C__-migrate      predeploy (migrate image); also `kit run` for `yarn prisma:seed`
+#   __C__-migrate      predeploy (migrate image); also `katap run` for `yarn prisma:seed`
 #   __C__-db           PostgreSQL
 #   __C__-redis        BullMQ queues and rate limits, appendonly
 #
@@ -22,9 +22,9 @@ x-__C__-logging: &__C__-logging
 
 services:
   __C__:
-    image: ${IMAGE___CU__:-kit/unreleased:none}
+    image: ${IMAGE___CU__:-katap/unreleased:none}
     env_file:
-      - ${KIT_SECRETS}/__C__.env
+      - ${KATAP_SECRETS}/__C__.env
     environment:
       QUEUE_WORKER_ENABLED: 'true'
     restart: unless-stopped
@@ -53,12 +53,12 @@ services:
       default: {}
       edge:
         aliases:
-          - ${KIT_PROJECT}-__C__
+          - ${KATAP_PROJECT}-__C__
 
   __C__-migrate:
-    image: ${IMAGE___CU___MIGRATE:-kit/unreleased:none}
+    image: ${IMAGE___CU___MIGRATE:-katap/unreleased:none}
     env_file:
-      - ${KIT_SECRETS}/__C__.env
+      - ${KATAP_SECRETS}/__C__.env
     profiles: [predeploy]
     restart: 'no'
     init: true
@@ -76,14 +76,14 @@ services:
     shm_size: 256mb
     stop_grace_period: 60s
     env_file:
-      - ${KIT_SECRETS}/__C__.db.env
+      - ${KATAP_SECRETS}/__C__.db.env
     # Refuses to start an empty cluster beside one of another major version.
-    entrypoint: ['/bin/sh', '/kit/postgres-entrypoint.sh']
+    entrypoint: ['/bin/sh', '/katap/postgres-entrypoint.sh']
     volumes:
       - __C__-db:/var/lib/postgresql
-      - ${KIT_ROOT}/lib/postgres-entrypoint.sh:/kit/postgres-entrypoint.sh:ro
-      - ${KIT_ROOT}/lib/postgres-init.sh:/docker-entrypoint-initdb.d/10-kit-app-role.sh:ro
-      - ${KIT_ROOT}/lib/app-database.sql:/kit/app-database.sql:ro
+      - ${KATAP_ROOT}/lib/postgres-entrypoint.sh:/katap/postgres-entrypoint.sh:ro
+      - ${KATAP_ROOT}/lib/postgres-init.sh:/docker-entrypoint-initdb.d/10-katap-app-role.sh:ro
+      - ${KATAP_ROOT}/lib/app-database.sql:/katap/app-database.sql:ro
     healthcheck:
       # Over TCP: the image's first-start temporary server answers on the socket only.
       test: ['CMD-SHELL', 'pg_isready -h 127.0.0.1 -U postgres -d app']
@@ -97,7 +97,7 @@ services:
     restart: unless-stopped
     logging: *__C__-logging
     env_file:
-      - ${KIT_SECRETS}/__C__.redis.env
+      - ${KATAP_SECRETS}/__C__.redis.env
     command: ['sh', '-c', 'exec redis-server --requirepass "$$REDIS_PASSWORD" --appendonly yes']
     volumes:
       - __C__-redis:/data
@@ -109,7 +109,7 @@ services:
 
 networks:
   edge:
-    name: kit-edge
+    name: katap-edge
     external: true
 
 volumes:

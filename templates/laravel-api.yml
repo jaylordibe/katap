@@ -7,11 +7,11 @@
 #   __C__-worker       Horizon
 #   __C__-migrate      predeploy, then __C__-permissions (DEPLOYMENT.md §13-§14)
 #   __C__-scheduler    cron: `schedule:run`, once a minute (never a looping service)
-#   __C__-artisan      tools: `kit run <project> __C__-artisan <artisan args>`
+#   __C__-artisan      tools: `katap run <project> __C__-artisan <artisan args>`
 #   __C__-db           PostgreSQL with TLS (app:check-config refuses sslmode disable)
 #   __C__-redis        cache, queue, locks, rate limits
 #
-# Copied into projects/<project>/ by `kit add`; edit it there per project.
+# Copied into projects/<project>/ by `katap add`; edit it there per project.
 
 x-__C__-logging: &__C__-logging
   driver: json-file
@@ -20,9 +20,9 @@ x-__C__-logging: &__C__-logging
     max-file: '3'
 
 x-__C__-app: &__C__-app
-  image: ${IMAGE___CU__:-kit/unreleased:none}
+  image: ${IMAGE___CU__:-katap/unreleased:none}
   env_file:
-    - ${KIT_SECRETS}/__C__.env
+    - ${KATAP_SECRETS}/__C__.env
   # One-shot runtimes install no SIGTERM handler as PID 1; an init forwards it.
   init: true
   logging: *__C__-logging
@@ -57,7 +57,7 @@ services:
       default: {}
       edge:
         aliases:
-          - ${KIT_PROJECT}-__C__
+          - ${KATAP_PROJECT}-__C__
 
   __C__-worker:
     <<: *__C__-app
@@ -111,16 +111,16 @@ services:
     # A clean shutdown checkpoint, not a SIGKILL after Docker's 10s default.
     stop_grace_period: 60s
     env_file:
-      - ${KIT_SECRETS}/__C__.db.env
+      - ${KATAP_SECRETS}/__C__.db.env
     # The key must belong to the postgres user and be unreadable by others, which a
     # bind mount cannot guarantee, so it is installed into the data volume first.
-    entrypoint: ['/bin/sh', '/kit/postgres-entrypoint.sh']
+    entrypoint: ['/bin/sh', '/katap/postgres-entrypoint.sh']
     volumes:
       - __C__-db:/var/lib/postgresql
-      - ${KIT_SECRETS}/__C__-db-tls:/kit/tls:ro
-      - ${KIT_ROOT}/lib/postgres-entrypoint.sh:/kit/postgres-entrypoint.sh:ro
-      - ${KIT_ROOT}/lib/postgres-init.sh:/docker-entrypoint-initdb.d/10-kit-app-role.sh:ro
-      - ${KIT_ROOT}/lib/app-database.sql:/kit/app-database.sql:ro
+      - ${KATAP_SECRETS}/__C__-db-tls:/katap/tls:ro
+      - ${KATAP_ROOT}/lib/postgres-entrypoint.sh:/katap/postgres-entrypoint.sh:ro
+      - ${KATAP_ROOT}/lib/postgres-init.sh:/docker-entrypoint-initdb.d/10-katap-app-role.sh:ro
+      - ${KATAP_ROOT}/lib/app-database.sql:/katap/app-database.sql:ro
     healthcheck:
       # Over TCP: the image's first-start temporary server answers on the socket only.
       test: ['CMD-SHELL', 'pg_isready -h 127.0.0.1 -U postgres -d app']
@@ -134,7 +134,7 @@ services:
     restart: unless-stopped
     logging: *__C__-logging
     env_file:
-      - ${KIT_SECRETS}/__C__.redis.env
+      - ${KATAP_SECRETS}/__C__.redis.env
     # appendonly: queued jobs (verification mail, among others) survive a restart.
     command: ['sh', '-c', 'exec redis-server --requirepass "$$REDIS_PASSWORD" --appendonly yes']
     volumes:
@@ -147,7 +147,7 @@ services:
 
 networks:
   edge:
-    name: kit-edge
+    name: katap-edge
     external: true
 
 volumes:

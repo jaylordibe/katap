@@ -1,309 +1,422 @@
-# kit — several projects on one server
+<div align="center">
 
-Run any number of containerized projects — each with its own API, database and
-Redis — on one low-cost VPS, behind one reverse proxy with automatic HTTPS.
+# Katap
 
-A **project** is a set of **components**; a component is a container image. The
-kit does not care what language or framework built it. It ships templates for:
+## Many projects. One server. Deployed safely.
 
-| Type | For | Brings its own |
+Self-hosted deploys for containerized apps on one low-cost VPS —<br>
+each project with its own API, database and Redis, behind one HTTPS edge.
+
+[![Test](https://img.shields.io/github/actions/workflow/status/jaylordibe/katap/test.yml?branch=main&label=tests&style=flat-square)](https://github.com/jaylordibe/katap/actions/workflows/test.yml)
+![Docker Compose](https://img.shields.io/badge/Docker%20Compose-57606a?style=flat-square)
+![Caddy](https://img.shields.io/badge/Caddy-57606a?style=flat-square)
+![Bash](https://img.shields.io/badge/bash%205-57606a?style=flat-square)
+
+Laravel · NestJS · Angular · React · Vue · Next.js · Nuxt · anything in a container
+
+**[Why&nbsp;Katap](#why-katap)** · **[How&nbsp;it&nbsp;works](#how-it-works)** ·
+**[Quick&nbsp;start](#quick-start)** · **[Day&nbsp;to&nbsp;day](#day-to-day)** ·
+**[Security](#security-model)** · **[Reference](#reference)**
+
+</div>
+
+---
+
+*Katap* is Cebuano for **spreading out**: one server, and your projects spread
+across it, each in its own space.
+
+## Why Katap
+
+Side projects and early products rarely earn an autoscaling cluster, but they
+still deserve HTTPS, backups, rollbacks and a database nobody on the internet can
+reach. The usual shortcut is one `docker-compose.yml` per app, ports opened by hand,
+and `git pull` on the server. It works until a second project needs ports 80 and
+443, a migration fails halfway, or a reprovision wipes the data.
+
+Katap is the small, boring layer that makes one server host many projects
+properly.
+
+| One compose file per app, by hand | With Katap |
+|---|---|
+| Each app fights for 80/443 | **One Caddy edge** routes every domain, with automatic HTTPS |
+| Databases and Redis published "just for now" | **Only the edge publishes a port.** Each project's data stays on its own private network |
+| `git pull` and rebuild on the server | **Images built and scanned in CI**, deployed by immutable digest |
+| A failed migration leaves a half-deployed app | **Dump → migrate → roll out → smoke check**, rolling back automatically on failure |
+| Backups are a cron line someone meant to add | **Nightly and pre-deploy dumps**, with a restore that puts the matching release back too |
+| A CI key that can do anything on the box | **A forced-command SSH key** that can only deploy its own environment's components |
+
+**Not a platform.** No dashboard, no daemon, no database of its own: one Bash
+CLI, Docker Compose, Caddy and systemd timers. Your projects are plain files in
+this repository, reviewed like any other code. If you'd rather operate a
+platform with a UI, Coolify and Dokku do this job too; Katap is for people who want
+to read every line that runs on their server.
+
+## How it works
+
+```mermaid
+flowchart LR
+    subgraph app["Each app repository"]
+        P["publish-image.yml<br/>test · build · scan · attest"]
+    end
+    REG[("Container registry<br/>(GHCR)")]
+    subgraph katap["This repository"]
+        D["Deploy workflow<br/>verify provenance"]
+    end
+    subgraph server["Your server"]
+        E["Caddy edge<br/>:80 :443"]
+        subgraph A["project: shop"]
+            A1["api"] --- A2[("postgres")]
+            A1 --- A3[("redis")]
+            A4["web (SPA)"]
+        end
+        subgraph B["project: blog"]
+            B1["api"] --- B2[("postgres")]
+            B1 --- B3[("redis")]
+        end
+    end
+    U(("Users")) --> E
+    E --> A1 & A4 & B1
+    P -- "push :sha-commit" --> REG
+    D -- "SSH: deploy by digest" --> server
+    REG -. "pull by digest" .-> server
+```
+
+Three parties, three different credentials:
+
+| | Does | Holds |
+|---|---|---|
+| **Application repository** | Tests, builds, scans and publishes its image with a build-provenance attestation. Never deploys. | Push access to its own image |
+| **This repository** | Defines your projects (`projects/`) and deploys: the Deploy workflow resolves a tag to a digest, verifies it was attested by that app's own publish workflow, then asks the server to run it. | The SSH key for each environment |
+| **The server** | Pulls by digest and runs `katap deploy`. | Read access to images |
+
+A **project** is a set of **components**, and a component is a container image.
+Katap doesn't care what built it. It ships templates for:
+
+| Template | For | Brings its own |
 |---|---|---|
 | `laravel-api` | [jaylordibe/laravel-api](https://github.com/jaylordibe/laravel-api) and forks | API, Horizon worker, scheduler, PostgreSQL (TLS), Redis |
-| `nestjs-api` | [jaylordibe/nestjs-api](https://github.com/jaylordibe/nestjs-api) and forks | API with in-process queue worker, PostgreSQL, Redis |
+| `nestjs-api` | [jaylordibe/nestjs-api](https://github.com/jaylordibe/nestjs-api) and forks | API with in-process queue worker, migrate image, PostgreSQL, Redis |
 | `spa` | Angular, React, Vue, … built to static files | — |
 | `node-ssr` | Next.js, Nuxt, SvelteKit, Remix, … | — |
 
-**Who does what**
+The templates are copied into your project, not referenced, so each project can
+change memory limits or add a worker without affecting the others.
 
-| | Does | Holds credentials for |
+### What a deploy does
+
+Every step either succeeds or leaves the current release serving.
+
+| Step | What happens | If it fails |
 |---|---|---|
-| Application repository | Tests, then builds, scans and publishes its image to GHCR with a provenance attestation (`publish-image.yml`). Never deploys. | Pushing its own image; optionally starting a staging deploy (Actions: write here, nothing else) |
-| This repository | Defines the projects (`projects/`), and deploys: `.github/workflows/deploy.yml` verifies the image's attestation and asks the server to run it. | SSH to the server |
-| The server | Pulls by digest and runs `kit deploy`. | Reading images |
+| **Validate** | The digest belongs to the component's `image=`; no required secret is blank | Refused; nothing changed |
+| **Pull** | `docker pull` by digest | Nothing changed |
+| **Dump** | `pg_dump` of the component's database, kept with the nightly dumps | Refused; nothing changed |
+| **Migrate** | One-shots in order — Laravel: `migrate`, then `permissions`; Nest: the migrate image (Prisma deploy + RBAC sync) | The current release keeps serving |
+| **Roll out** | Services recreated in order (Laravel: worker, then API), waiting for each healthcheck; Caddy holds requests across the swap | **Automatic rollback** to the previous release |
+| **Smoke check** | An HTTP check from inside the project network: 200, the expected body, no redirects followed | **Automatic rollback** |
+| **Record** | The release joins the history; the edge reloads | A bad site file is a warning; the release is serving |
 
-An application repository can publish an image, and its staging dispatch token can
-start the Deploy workflow, which is all an Actions: write token can do here (it can
-also cancel or delete runs; it cannot change a file). What that workflow then
-deploys is bound: a component belongs to one environment (`environment=` in its
-`.conf`), and each host's key serves one environment, so a staging request can never
-replace a production component, even on a shared server. A production request still
-waits for its reviewers. The Deploy workflow deploys only
-digests attested by that repository's own publish workflow (from `main` for
-production). That check runs in the workflow: the server itself accepts any digest
-of the component's repository from the deploy key, so guard this repository as the
-holder of that key (below).
+The workflow then checks the public URL with the same smoke check. The deploy
+runs detached on the server, so a cancelled workflow or a dropped connection
+never stops it halfway; its log is in `/srv/state/dispatch/`.
 
-## Is a single server right for this?
+<details>
+<summary><b>What a deploy looks like</b> — illustrative shape, not captured output</summary>
 
-Yes, for side projects and low-traffic apps. It is the same model Coolify and Dokku
-use. Know the two costs:
+```text
+Actions → Deploy → production · shop · api · ghcr.io/you/shop-api:main
 
-- **Shared fate.** One server down means every project is down. Backups (below) are
-  what make that recoverable; nothing here makes it highly available.
-- **Memory is the limit.** Approximate steady-state RAM per component:
+  ── waits for a production reviewer ──
+  resolve     ghcr.io/you/shop-api:main → sha256:9f2c…
+  verify      attested by you/shop-api/.github/workflows/publish-image.yml @ main
+  pull        ghcr.io/you/shop-api@sha256:9f2c…
+  dump        /srv/backups/shop/api-20261014T091005Z-predeploy.dump
+  migrate     migrate ✓  permissions ✓
+  roll out    api-worker ✓ healthy   api ✓ healthy
+  smoke       GET /api/health/ready → 200 "ready"
+  record      shop/api is now sha256:9f2c…
+  public      https://api.shop.com/api/health/ready → 200
+```
+
+</details>
+
+## Is one server right for you?
+
+Yes, for side projects, internal tools and low-traffic products. Know the two
+costs:
+
+- **Shared fate.** One server down means every project is down. Backups make
+  that recoverable; nothing here makes it highly available.
+- **Memory is the limit.** Approximate steady state per component:
 
   | Component | RAM |
   |---|---|
-  | laravel-api: API (php-fpm, up to 20 workers in the base image) | 150 MB idle, up to ~1 GB (`mem_limit`) |
-  | laravel-api: Horizon worker | 100–300 MB |
+  | laravel-api API (php-fpm, up to 20 workers in the base image) | 150 MB idle, up to ~1 GB (`mem_limit`) |
+  | laravel-api Horizon worker | 100–300 MB |
   | nestjs-api | 150–400 MB |
-  | PostgreSQL / Redis (each project) | 50–100 MB / ~10 MB |
+  | PostgreSQL / Redis, per project | 50–100 MB / ~10 MB |
   | spa / Caddy | ~10 MB / ~30 MB |
 
   A 4 GB VPS holds two or three small projects. Lower `mem_limit` in a project's
-  compose file to fit more, and move a project to its own server or a managed
-  database when it outgrows its share.
+  compose file to fit more. When a project outgrows its share, move it to its own
+  server or a managed database: its images and settings go with it unchanged.
 
-## Layout
+## Quick start
 
-```
-bin/kit                     the CLI (bash 5; runs on the server)
-edge/                       the shared Caddy: compose.yml, Caddyfile, edge.env (TLS mode, network)
-templates/<type>.*          compose file, deploy settings, secret spec and site block per type
-projects/<project>/         YOUR projects: <component>.yml, <component>.conf, site.caddy (no secrets)
-host/provision.sh           prepares a server; host/systemd/ holds the timers it installs
-lib/                        shared scripts (smoke check, PostgreSQL TLS and app role)
-.github/workflows/deploy.yml   the deploy workflow
-examples/publish-image.yml  the publish workflow an application repository copies
-tests/run.sh                the kit's tests (E2E=1 for a real deploy on local Docker)
-```
-
-On the server (`/srv`): `kit/` (this repository), `secrets/<project>/` (0700, never
-in git), `state/<project>/` (what is deployed, and the history), `backups/<project>/`,
-`edge/certs/` (Cloudflare mode only).
-
-## Setting up a server
-
-1. **A fresh Ubuntu 24.04 (or Debian 12) VPS**, with your SSH key on it.
-2. Clone and provision:
-
-   ```bash
-   sudo git clone https://github.com/<you>/cicd.git /srv/kit
-   # on your machine: one CI key per environment this server hosts
-   ssh-keygen -t ed25519 -N '' -f ci_production
-   ssh-keygen -t ed25519 -N '' -f ci_staging
-   sudo /srv/kit/host/provision.sh --ci-key "$(cat ci_production.pub)" --ci-env production --harden-ssh
-   sudo /srv/kit/host/provision.sh --ci-key "$(cat ci_staging.pub)" --ci-env staging
-   ```
-
-   It installs Docker, sets log rotation, a firewall (22, 80, 443), unattended
-   security upgrades, a swap file, the `deploy` user, the per-minute and nightly
-   timers, and starts the edge. It is safe to run again.
-3. **Private images:** log the deploy user in with a token that can only read packages:
-   `sudo -u deploy docker login ghcr.io -u <user> --password-stdin`.
-
-## Adding a project
-
-In your copy of this repository:
+**1. Prepare a server** — a fresh Ubuntu 24.04 or Debian 12 VPS with your SSH key.
 
 ```bash
-bin/kit add shop laravel-api api api.shop.com
-bin/kit add shop spa web shop.com www.shop.com
+sudo git clone https://github.com/<you>/katap.git /srv/katap
+
+# on your machine: one CI key per environment this server hosts
+ssh-keygen -t ed25519 -N '' -f ci_production
+ssh-keygen -t ed25519 -N '' -f ci_staging
+
+sudo /srv/katap/host/provision.sh --ci-key "$(cat ci_production.pub)" --ci-env production --harden-ssh
+sudo /srv/katap/host/provision.sh --ci-key "$(cat ci_staging.pub)" --ci-env staging
 ```
 
-Then, in `projects/shop/api.conf` and `web.conf`, set `image=` (e.g.
-`ghcr.io/you/shop-api`) and `source_repo=` (`you/shop-api`); a `nestjs-api` also
-needs `image_migrate=`. Components are `environment=production` by default; a
-staging copy of a project is its own project (`shop-staging`) with
-`environment=staging`. Review the copied compose files — they are yours to edit
-(memory limits, an extra worker). Run `bin/kit check shop`, commit, push.
+`provision.sh` installs Docker with log rotation, a firewall (22, 80, 443),
+unattended security upgrades, a swap file, the `deploy` user and the timers, then
+starts the edge. It is safe to run again: it never touches project data, secrets
+or running containers. For private images, log the deploy user in with a
+read-only token: `sudo -u deploy docker login ghcr.io -u <user> --password-stdin`.
 
-On the server, as the deploy user:
+**2. Define a project** — in your copy of this repository.
 
 ```bash
-cd /srv/kit && git pull
-bin/kit secrets shop api        # once: APP_KEY, Passport keys, database and Redis passwords
-bin/kit secrets shop web
-nano /srv/secrets/shop/api.env  # fill every value under '# kit:required', add mail/storage settings
+bin/katap add shop laravel-api api api.shop.com
+bin/katap add shop spa web shop.com www.shop.com
 ```
 
-`kit secrets` never overwrites: it refuses if the files exist. Point the project's
-DNS at the server; Caddy obtains certificates on the first request.
+In `projects/shop/api.conf` and `web.conf`, set `image=` (`ghcr.io/you/shop-api`)
+and `source_repo=` (`you/shop-api`); a `nestjs-api` also needs `image_migrate=`.
+Components are `environment=production` by default; a staging copy is its own
+project (`shop-staging`) with `environment=staging`. Then `bin/katap check shop`,
+commit and push.
 
-## Publishing and deploying
+**3. Generate its secrets** — on the server, as `deploy`, once.
 
-**In each application repository:**
+```bash
+cd /srv/katap && git pull
+bin/katap secrets shop api     # APP_KEY, Passport keys, database and Redis passwords
+bin/katap secrets shop web
+nano /srv/secrets/shop/api.env # fill every value marked '# katap:required'
+```
 
-- `laravel-api` and `nestjs-api` ship `.github/workflows/publish-image.yml`. It does not know about this kit; to have a staging push start a deploy here, add the dispatch step from `examples/publish-image.yml`.
-- For anything else, copy `examples/publish-image.yml` to that path. The path matters: the deploy verifies the attestation came from it.
+`katap secrets` never overwrites existing files. Point the project's DNS at the
+server; Caddy obtains certificates on the first request.
 
-Set the repository variable `PUBLISH_ENABLED=true`. Every push to `main` or `staging` then:
+**4. Publish images** — in each application repository.
+`laravel-api` and `nestjs-api` already ship `.github/workflows/publish-image.yml`;
+for anything else, copy [`examples/publish-image.yml`](examples/publish-image.yml)
+to that exact path (the deploy verifies the attestation came from it). Set the
+repository variable `PUBLISH_ENABLED=true`. Every push to `main` or `staging` then
+pushes `:sha-<commit>`, scans that digest, attests it, and only then moves
+`:<branch>`.
 
-1. runs the repository's gates (laravel-api skips its test suite on `staging`, by design);
-2. pushes `ghcr.io/<owner>/<repo>:sha-<commit>`;
-3. scans that digest, attests its provenance, and only then moves `:<branch>`.
+**5. Secure the deploy path, then deploy.** Complete
+[Securing the deploy path](#securing-the-deploy-path) first — it is required, not
+optional. Then: **Actions → Deploy → Run workflow**, choosing environment,
+project, component and image (`ghcr.io/you/shop-api:main`).
 
-**Attestations need a public repository**, or a GitHub plan that offers them on
-private ones (then set `ATTEST_PROVENANCE=true`). For a private repository without
-them, set `provenance=none` in the component's `.conf`: the Deploy workflow then
-trusts anything pushed to that image repository, and says so on every run.
+**6. First deploy only:**
 
-### Securing the deploy path (required)
-
-This repository's code holds the deploy keys: whoever can change `main` can deploy
-anything to any host. Before adding secrets:
-
-1. **Ruleset on `main`** (Settings → Rules): require a pull request, block force
-   pushes and deletion, and allow **no bypass**, not even for yourself.
-2. **Deployment branches**: each environment accepts `main` only.
-3. **Required reviewers on production.**
-4. The staging dispatch token in an application repository is fine-grained with
-   **only Actions: write** on this repository.
-
-**In this repository**, create the environments `production` and `staging` (Settings →
-Environments), each with:
-- the secrets listed at the top of `.github/workflows/deploy.yml`;
-- for production, **required reviewers**.
-
-Get `DEPLOY_KNOWN_HOSTS` once, from the server itself:
-`ssh-keyscan -t ed25519 localhost | sed "s/^localhost/<server>/"`.
-
-**Deploy:** Actions → Deploy → Run workflow → environment, project, component, image
-(`ghcr.io/you/shop-api:main`, resolved to its digest before anything runs; for a
-nestjs-api the same tag names its migrate image). A `staging` push can also start
-its own staging deploy (`DEPLOY_DISPATCH_*` in `examples/publish-image.yml`); production
-always waits for its reviewers. The host refuses a request resolved against a
-different commit of this repository than its own checkout, so `git pull` on the
-server after merging project changes.
-
-What `kit deploy` does on the server, in order:
-
-1. Validates the digest against the component's `image=`, and refuses an empty required secret.
-2. Pulls the image. On failure nothing has changed.
-3. Dumps the database (pre-deploy, kept with the nightly dumps).
-4. Runs the one-shots: `migrate`, then `permissions` (Laravel); `migrate` (Nest: prisma deploy + rbac:sync). If one fails, the current release keeps serving.
-5. Recreates the services in order (Laravel: worker, then API) and waits for their healthchecks. Caddy holds requests across the swap.
-6. Smoke-checks the component from inside the project network. If unhealthy, it **rolls back** to the previous release automatically.
-7. Records the release, and reloads the edge. A site file that fails to load is a
-   warning: the release is serving, the edge keeps its previous configuration.
-
-The workflow then checks the public URL with the same smoke check. The deploy runs
-detached on the host: a cancelled workflow or a dropped connection never stops it
-half-way (its log is in `/srv/state/dispatch/`).
-
-**First deploy only:**
-- **laravel-api:** create the Passport personal access client (sign-in needs it), and your first admin:
+- **laravel-api:** create the Passport personal access client, which sign-in needs:
   ```bash
-  bin/kit run shop api-artisan passport:client --personal --name='API Personal Access Client' --provider=users --no-interaction
+  bin/katap run shop api-artisan passport:client --personal --name='API Personal Access Client' --provider=users --no-interaction
   ```
-  Never run `db:seed` or `UserSeeder` in production: it creates test users with a published password.
-- **nestjs-api:** `bin/kit run blog api-migrate yarn prisma:seed` creates the admin from `SEED_ADMIN_*`.
+  Never run `db:seed` or `UserSeeder` in production: it creates test users with a
+  published password.
+- **nestjs-api:** `bin/katap run blog api-migrate yarn prisma:seed` creates the admin
+  from `SEED_ADMIN_*`.
+
+## Securing the deploy path
+
+This repository holds the deploy keys, so whoever can change `main` can deploy
+anything. Before adding any secret:
+
+1. **A ruleset on `main`** (Settings → Rules): require a pull request, block force
+   pushes and deletion, and allow **no bypass** — not even for yourself.
+2. **Environments** `production` and `staging` (Settings → Environments), each
+   accepting deployments from `main` only, holding the secrets listed at the top of
+   [`deploy.yml`](.github/workflows/deploy.yml).
+3. **Required reviewers on production**, so every production deploy is a person
+   approving it.
+4. **`DEPLOY_KNOWN_HOSTS`** taken once from the server itself:
+   `ssh-keyscan -t ed25519 localhost | sed "s/^localhost/<server>/"`.
+
+**Optional staging auto-deploy.** An app repository can start a staging deploy
+after it publishes: add the dispatch step from
+[`examples/publish-image.yml`](examples/publish-image.yml), with a fine-grained
+token holding **only Actions: write** on this repository. That token can start
+the Deploy workflow but cannot change a file here, and production still waits
+for its reviewers.
+
+**Private repositories.** Attestations need a public repository or a GitHub plan
+that offers them on private ones (set `ATTEST_PROVENANCE=true`). Without them, set
+`provenance=none` in the component's `.conf`: the Deploy workflow then trusts
+anything pushed to that image repository, and says so on every run.
 
 ## Day to day
 
-| Task | Command (on the server, as `deploy`) |
+Run on the server as `deploy`, from `/srv/katap`.
+
+| Task | Command |
 |---|---|
-| Roll back to the previous release | `bin/kit rollback shop api`: the release deployed before the one serving, and again for the one before that. A named digest must be one this host has deployed. Never runs migrations backwards: keep them expand-only |
-| A one-off command | `bin/kit run shop api-artisan <artisan args>` — as the application user, never root |
-| Long scheduled work | each project's per-minute run is cut off after 10 minutes (`KIT_CRON_TIMEOUT`), below the 15 a deploy waits for it: put long work on the queue |
-| Logs | `docker compose -p shop logs -f api` |
-| Status | `docker compose -p shop ps` |
-| Back up now | `bin/kit backup shop` (nightly by timer; keeps 14 of each kind per component, `KIT_BACKUP_KEEP`: nightly, pre-deploy and pre-restore are counted apart) |
-| Off-host copies | install rclone, set `KIT_RCLONE_REMOTE=remote:bucket/path` in `/etc/kit/kit.env`; use an rclone `crypt` remote, the dumps hold personal data |
-| Restore | `bin/kit restore shop api /srv/backups/shop/<file>.dump --confirm shop` (see below) |
-| Change a site or add a domain | edit `projects/<project>/site.caddy`, pull, `bin/kit edge reload` |
-| Change the TLS mode | edit `edge/edge.env`, pull, `bin/kit edge up` |
+| Roll back | `bin/katap rollback shop api` — to the release before the one serving; run again to go further back. Never runs migrations backwards, so keep migrations expand-only |
+| One-off command | `bin/katap run shop api-artisan <args>` — as the application user, never root |
+| Logs / status | `docker compose -p shop logs -f api` · `docker compose -p shop ps` |
+| Back up now | `bin/katap backup shop` — nightly by timer; keeps 14 of each kind per component (`KATAP_BACKUP_KEEP`) |
+| Off-server copies | Install rclone and set `KATAP_RCLONE_REMOTE=remote:bucket/path` in `/etc/katap/katap.env`; use an rclone `crypt` remote, because dumps hold personal data |
+| Restore | `bin/katap restore shop api /srv/backups/shop/<file>.dump --confirm shop` |
+| Add a domain / change a site | Edit `projects/<project>/site.caddy`, pull, `bin/katap edge reload` |
+| Change the TLS mode | Edit `edge/edge.env`, pull, `bin/katap edge up` |
+| Scheduled work | Each project's per-minute run is cut off after 10 minutes (`KATAP_CRON_TIMEOUT`); put long work on the queue |
 
-**Restore** puts back the database **and the release that was serving when the dump
-was taken** (recorded beside each dump as `<dump>.images`). It stops the component,
-dumps the current data, restores into a new database and swaps it in only when
-complete, so a failed restore changes nothing. It also empties the component's
-Redis: queued jobs and caches (permissions, sessions) described the replaced data.
-Tokens issued after the dump work again, because the keys did not change.
+The server refuses a deploy resolved against a different commit of this
+repository than its own checkout, so `git pull` on the server after merging
+project changes.
 
-**Test a restore** before you need one: a backup that has never been restored is a
-hope, not a backup. Keep a copy of `/srv/secrets` somewhere safe too: a dump without
-its `APP_KEY` cannot decrypt what the application encrypted.
+### Restoring
 
-**Upgrading PostgreSQL** (a new major in a template's image), never with the
-application serving in between:
+`restore` puts back the database **and the release that was serving when the dump
+was taken**. It stops the component, dumps the current data first, restores into a
+new database and swaps it in only when complete, so a failed restore changes
+nothing. It also empties the component's Redis, whose queued jobs and caches
+described the replaced data.
 
-1. `docker compose -p <project> stop <component> <component>-worker` (its rollout services);
-2. `bin/kit backup <project>`;
+> [!IMPORTANT]
+> **Test a restore before you need one.** A backup that has never been restored is
+> a hope, not a backup. Keep a copy of `/srv/secrets` somewhere safe as well: a
+> dump without its `APP_KEY` cannot decrypt what the application encrypted.
+
+<details>
+<summary><b>Upgrading PostgreSQL to a new major version</b></summary>
+
+Never with the application serving in between:
+
+1. `docker compose -p <project> stop <component> <component>-worker`;
+2. `bin/katap backup <project>`;
 3. change the image in `projects/<project>/<component>.yml`, commit, pull;
 4. `docker volume rm <project>_<component>-db`;
 5. `docker compose -p <project> up -d <component>-db` (the database alone);
-6. `bin/kit restore <project> <component> <that dump> --confirm <project>`, which
+6. `bin/katap restore <project> <component> <that dump> --confirm <project>`, which
    restores the data and starts the release again.
 
-The database refuses to start an empty cluster beside an old one, so a forgotten step
-stops the database rather than serving an empty one.
+The database refuses to start an empty cluster beside an old one, so a forgotten
+step stops the database rather than serving an empty one.
 
-## Troubleshooting
-
-| Symptom | Likely cause | Check |
-|---|---|---|
-| `kit deploy` refuses: required values are empty | A `# kit:required` value in the component's secrets is blank | `/srv/secrets/<project>/<component>.env` |
-| A deploy fails and rolls back | The new release never became healthy, or its smoke check failed | `docker compose -p <project> logs --tail=200 <service>` |
-| `502` from the edge | The upstream container is down or unhealthy | `docker compose -p <project> ps` |
-| No certificate (acme mode) | DNS does not point at the server yet, or 80/443 are blocked upstream | `docker compose -p kit-edge logs caddy` |
-| `525`/`526` from Cloudflare | Origin certificate missing or wrong, or Authenticated Origin Pulls off | `ls -l /srv/edge/certs`, the Cloudflare dashboard |
-| Every client shares one IP (per-IP limits act globally) | The application does not trust the edge's address | nestjs-api: `TRUST_PROXY` equals `CADDY_IP`; laravel-api: `TRUSTED_PROXIES=0.0.0.0/0` |
-| API logs `ECONNREFUSED` to its database | The database is still starting, or restarting | `docker compose -p <project> logs <component>-db` |
-| Disk filling up | Old images | `docker image prune` (logs are already capped) |
-
-## The project contract
-
-`kit check` enforces it, and `kit deploy` refuses a project that breaks it:
-
-- **No `ports:` anywhere.** Only the edge publishes ports. Docker-published ports
-  bypass the firewall, so this rule is what keeps databases off the internet.
-- **Every image is pinned by digest.** Application images come from the deploy, as
-  `${IMAGE_<COMPONENT>}`.
-- **Every long-running service has a healthcheck.** That is what `--wait` and the
-  automatic rollback rely on.
-- **One-shot services** are in the `predeploy`, `cron` or `tools` profile, and never
-  restart.
-- **Databases never join the `edge` network.**
-- **Never privileged, host networking, the host PID namespace, or the Docker socket.**
-- **No fixed `hostname:`.**
-- **Every service a `.conf` names exists.**
-
-## Publishing an image: what each type expects
-
-- **spa:**
-  - Serves the built files on port 80, answering unknown paths with `index.html`.
-  - Contains `wget`. `nginx:alpine` or `caddy:alpine` with a `try_files … /index.html` rule both do.
-  - The API URL is usually baked in at build time, so pass it as a build argument in the SPA's publish workflow.
-- **node-ssr:**
-  - Listens on `0.0.0.0:3000` and answers `/` with 200.
-  - Contains `wget` (any alpine Node image does).
-  - Runtime variables go in `/srv/secrets/<project>/<component>.env`.
-- **laravel-api / nestjs-api:** their own `Dockerfile` and `publish-image.yml`, as shipped.
-
-## TLS: `edge/edge.env`
-
-- **`acme`** (default): Let's Encrypt, issued and renewed automatically. Ports 80 and 443 must reach the server.
-- **`cloudflare`**: behind Cloudflare's proxy, with an Origin Certificate and Authenticated Origin Pulls.
-  - Put `origin.pem`, `origin.key` and Cloudflare's `cf-origin-pull-ca.pem` in `/srv/edge/certs`.
-  - Set SSL mode Full (strict) and turn Authenticated Origin Pulls on.
-  - Only Cloudflare's ranges may connect, which is what makes `CF-Connecting-IP` trustworthy.
-  - You do not re-run `kit secrets` after a switch. A nestjs-api's `TRUST_CLOUDFLARE_HEADERS` reflects the mode at the time its secrets were generated, so update that one value by hand if you switch.
-- **`internal`**: Caddy's own CA, for local testing only.
-
-## Trusted proxies
-
-Every request reaches an application from Caddy's fixed address on the `edge`
-network (`CADDY_IP`). Caddy replaces any `X-Forwarded-For` a client sends with the
-address it actually saw.
-- **nestjs-api** trusts exactly `CADDY_IP` (`TRUST_PROXY`).
-- **laravel-api** is given `TRUSTED_PROXIES=0.0.0.0/0`, deliberately: its base image's nginx and Laravel parse that variable differently, and a single all-addresses CIDR is the only value both accept while keeping the real client address and HTTPS detection. Nothing outside the host can reach the API container (the contract above). Public components of other projects on the same edge network can, which is accepted under Known limits.
+</details>
 
 ## Security model
 
-- **Exposure:** only 22, 80 and 443 are open; only Caddy publishes. Each project's database and Redis sit on that project's private network: another project cannot even resolve their names.
-- **Secrets:** generated once on the server (`openssl`), 0600, outside git; never regenerated. The database superuser password stays in `<component>.db.env`, which only the database container reads. The application connects as a non-superuser role owning its database.
-- **Deploys:** images are pinned by digest, scanned, and provenance-verified by the Deploy workflow. Each CI key's `authorized_keys` entry is `restrict,command="kit ssh-dispatch <environment>"`, so it can deploy, or roll back to a release the host has served, only components of its own environment, with validated arguments, and do nothing else. The workflow's own code is protected by the ruleset above.
-- **Destructive operations:** none are automated. No path drops a volume, regenerates a key or runs a fresh migration. `restore` is human-only and dumps first.
+| Concern | How Katap handles it |
+|---|---|
+| **Exposure** | Only 22, 80 and 443 are open, and only Caddy publishes. Each project's database and Redis sit on that project's private network; another project cannot even resolve their names |
+| **Secrets** | Generated once on the server, mode 0600, never in git, never regenerated. The database superuser password is readable only by the database container; the app connects as a non-superuser role that owns its database |
+| **Supply chain** | Images are scanned in CI, deployed by digest, and their build provenance is verified before deploy. Caddy, PostgreSQL, Redis and the smoke-check image are pinned by digest |
+| **CI access** | Each CI key is `restrict,command="katap ssh-dispatch <environment>"`: it can deploy, or roll back to a release this server has served, only components of its own environment, with validated arguments, and nothing else |
+| **Destructive operations** | None are automated. Nothing drops a volume, regenerates a key or runs a fresh migration. `restore` is human-only, needs `--confirm`, and dumps first |
 
-**Known limits.** These are accepted as residual risk:
-- IPv4 only: the edge publishes no IPv6 port (an IPv6 client would reach every site with the same address). Publish no AAAA record.
-- The `deploy` user is in the `docker` group, which is root-equivalent on the host. Protect its keys.
-- Public components of different projects share the `edge` network, so one could call another's public service directly, and a laravel-api trusts any address there to set the client IP (`TRUSTED_PROXIES`). They cannot reach databases.
-- laravel-api's database link uses `sslmode=require`: encrypted, but the certificate is not verified. The traffic never leaves the host.
-- Have a person review this repository's deploy path before trusting it with real data. Automated tests do not replace that review.
+**Known limits** — accepted as residual risk:
 
-## Testing the kit
+- **IPv4 only.** The edge publishes no IPv6 port; publish no AAAA record.
+- **The `deploy` user is root-equivalent** through the `docker` group. Protect its keys.
+- **Public components share the edge network**, so one project's public service
+  could call another's directly, and a laravel-api trusts any address there to set
+  the client IP. Databases stay unreachable.
+- **laravel-api's database link uses `sslmode=require`:** encrypted, certificate not
+  verified. The traffic never leaves the server.
+- **Have a person review the deploy path** before trusting it with real data.
+  Automated tests do not replace that review.
+
+## Reference
+
+### Layout
+
+```text
+bin/katap                      the CLI (bash 5; runs on the server)
+edge/                          the shared Caddy: compose.yml, Caddyfile, edge.env
+templates/<type>.*             compose file, deploy settings, secret spec and site block per type
+projects/<project>/            YOUR projects: <component>.yml, <component>.conf, site.caddy (no secrets)
+host/provision.sh              prepares a server; host/systemd/ holds its timers
+lib/                           smoke check, PostgreSQL entrypoint, TLS and app role
+.github/workflows/deploy.yml   the Deploy workflow
+examples/publish-image.yml     the publish workflow an application repository copies
+tests/                         static, unit and end-to-end tests
+```
+
+On the server, under `/srv`: `katap/` (this repository), `secrets/<project>/` (0700,
+never in git), `state/<project>/` (what is serving, and the history),
+`backups/<project>/`, and `edge/certs/` (Cloudflare mode only).
+
+### The project contract
+
+`katap check` enforces it, and `katap deploy` refuses a project that breaks it:
+
+- **No `ports:` anywhere.** Docker-published ports bypass the firewall, so this is
+  what keeps databases off the internet.
+- **Every image pinned by digest.** Application images come from the deploy, as
+  `${IMAGE_<COMPONENT>}`.
+- **Every long-running service has a healthcheck**, which the rollout and the
+  automatic rollback rely on.
+- **One-shot services** sit in the `predeploy`, `cron` or `tools` profile and never
+  restart.
+- **Databases never join the edge network.**
+- **Never privileged**, host networking, the host PID namespace or the Docker socket.
+- **No fixed `hostname:`**, and every service a `.conf` names exists.
+
+### What each template expects from an image
+
+- **spa** — serves the built files on port 80, answering unknown paths with
+  `index.html`, and contains `wget` (`nginx:alpine` or `caddy:alpine` with a
+  `try_files … /index.html` rule both do). The API URL is usually baked in at build
+  time, so pass it as a build argument.
+- **node-ssr** — listens on `0.0.0.0:3000`, answers `/` with 200, and contains `wget`
+  (any alpine Node image does). Runtime variables go in
+  `/srv/secrets/<project>/<component>.env`.
+- **laravel-api / nestjs-api** — their own `Dockerfile` and `publish-image.yml`, as
+  shipped.
+
+### TLS modes — `edge/edge.env`
+
+| Mode | Use | Needs |
+|---|---|---|
+| `acme` (default) | Let's Encrypt, issued and renewed automatically | Ports 80 and 443 reaching the server |
+| `cloudflare` | Behind Cloudflare's proxy; only Cloudflare's ranges may connect, which is what makes `CF-Connecting-IP` trustworthy | `origin.pem`, `origin.key` and `cf-origin-pull-ca.pem` in `/srv/edge/certs`; SSL mode Full (strict); Authenticated Origin Pulls on |
+| `internal` | Local testing only | — |
+
+After switching to or from `cloudflare`, update a nestjs-api's
+`TRUST_CLOUDFLARE_HEADERS` by hand: it reflects the mode at the time its secrets
+were generated.
+
+### Trusted proxies
+
+Every request reaches an application from Caddy's fixed address on the edge
+network (`CADDY_IP`), and Caddy replaces any client-sent `X-Forwarded-For` with the
+address it actually saw.
+
+- **nestjs-api** trusts exactly `CADDY_IP` (`TRUST_PROXY`).
+- **laravel-api** gets `TRUSTED_PROXIES=0.0.0.0/0`, deliberately: its base image's
+  nginx and Laravel parse that variable differently, and one all-addresses CIDR is
+  the only value both accept while keeping the real client address and HTTPS
+  detection. Nothing outside the server can reach the API container.
+
+### Troubleshooting
+
+| Symptom | Likely cause | Check |
+|---|---|---|
+| Deploy refused: required values are empty | A `# katap:required` value is blank | `/srv/secrets/<project>/<component>.env` |
+| Deploy fails and rolls back | The new release never became healthy, or failed its smoke check | `docker compose -p <project> logs --tail=200 <service>` |
+| `502` from the edge | The upstream container is down or unhealthy | `docker compose -p <project> ps` |
+| No certificate (acme) | DNS not pointing at the server yet, or 80/443 blocked upstream | `docker compose -p katap-edge logs caddy` |
+| `525` / `526` from Cloudflare | Origin certificate missing or wrong, or Authenticated Origin Pulls off | `ls -l /srv/edge/certs`, the Cloudflare dashboard |
+| Every client shares one IP | The application does not trust the edge's address | nestjs-api: `TRUST_PROXY` = `CADDY_IP`; laravel-api: `TRUSTED_PROXIES=0.0.0.0/0` |
+| API logs `ECONNREFUSED` to its database | The database is still starting | `docker compose -p <project> logs <component>-db` |
+| Disk filling up | Old images | `docker image prune` (logs are already capped) |
+
+### Testing Katap
 
 ```bash
 tests/run.sh          # shellcheck, the contract, secrets, refusals, ssh-dispatch, smoke check, edge config
@@ -312,3 +425,11 @@ E2E=1 tests/run.sh    # plus a real deploy on local Docker: build laravel-api, d
 
 Both run inside a pinned Linux container (`tests/runner.Dockerfile`), so a Mac's
 bash 3.2 behaves exactly like the server.
+
+---
+
+<div align="center">
+
+**Your projects, spread across one server — each in its own space.**
+
+</div>

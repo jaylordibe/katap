@@ -1,5 +1,5 @@
 [Unit]
-Description=kit: nightly database dumps
+Description=katap: nightly database dumps
 
 [Timer]
 OnCalendar=*-*-* 03:00:00

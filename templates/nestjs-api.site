@@ -1,6 +1,6 @@
 # __C__ (nestjs-api)
 __DOMAINS__ {
-	import kit_site
+	import katap_site
 	# CORP on the responses the edge serves itself (a 401, an edge 404), which
 	# never reach the application's own headers.
 	header Cross-Origin-Resource-Policy "same-origin"
@@ -16,5 +16,5 @@ __DOMAINS__ {
 	# 	staging <bcrypt hash>
 	# }
 
-	import kit_proxy __UPSTREAM__
+	import katap_proxy __UPSTREAM__
 }

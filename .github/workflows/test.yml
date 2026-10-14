@@ -1,6 +1,6 @@
 name: Test
 
-# The kit's own checks: shellcheck, the project contract, secrets, deploy refusals,
+# Katap's own checks: shellcheck, the project contract, secrets, deploy refusals,
 # ssh-dispatch, the smoke check and the edge configuration (tests/run.sh), plus
 # actionlint on every workflow this repository ships. The end-to-end deploy
 # (E2E=1 tests/run.sh) needs a laravel-api checkout and runs locally.

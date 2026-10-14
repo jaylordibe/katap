@@ -1,11 +1,11 @@
 # Secrets and settings for component __C__ (laravel-api), generated ONCE by
-# `kit secrets`. Each line is KEY=GENERATOR; see the generator list in bin/kit.
+# `katap secrets`. Each line is KEY=GENERATOR; see the generator list in bin/katap.
 # [app] is the API's environment (<component>.env); [db] is read only by the
 # database container (<component>.db.env) and [redis] only by Redis
 # (<component>.redis.env).
 #
 # Everything marked `required` must be filled in on the host before the first
-# deploy: `kit deploy` refuses while one is empty. Anything else the application
+# deploy: `katap deploy` refuses while one is empty. Anything else the application
 # reads (mail credentials, storage, HORIZON_DASHBOARD_EMAILS, ...) is added to the
 # generated file by hand; see the application's DEPLOYMENT.md §4.
 

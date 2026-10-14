@@ -1,8 +1,8 @@
 # Secrets and settings for component __C__ (nestjs-api), generated ONCE by
-# `kit secrets`. The application validates its environment at boot and refuses to
+# `katap secrets`. The application validates its environment at boot and refuses to
 # start in production with anything missing; the full list, with what each value
 # means, is nestjs-api's docs/deployment/README.md. Fill every `required` value on
-# the host before the first deploy: `kit deploy` refuses while one is empty.
+# the host before the first deploy: `katap deploy` refuses while one is empty.
 
 [db]
 POSTGRES_PASSWORD=hex:32

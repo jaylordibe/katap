@@ -1,25 +1,25 @@
 #!/usr/bin/env bash
 #
-# kit — run several containerized projects on one host, behind one Caddy.
+# katap — run several containerized projects on one host, behind one Caddy.
 #
 # A project is a directory under projects/ holding one compose file per component
-# (copied from templates/ by `kit add`), a <component>.conf of deploy settings, and
+# (copied from templates/ by `katap add`), a <component>.conf of deploy settings, and
 # site.caddy. Secrets live on the host only, never in this repository.
 #
-#   kit add <project> <type> <component> [domain...]   define a component (in the repo)
-#   kit secrets <project> <component>                  generate its secrets ONCE (on the host)
-#   kit edge up|reload                                 start the shared edge / reload its config
-#   kit deploy <project> <component> <image@sha256:…> [migrate=<image@sha256:…>]
-#   kit rollback <project> <component> [<image@sha256:…> [migrate=<image@sha256:…>]]
-#   kit run <project> <service> [args...]              one-off command in a one-shot service
-#   kit cron --all | <project>                         per-minute jobs (systemd timer)
-#   kit backup --all | <project>                       database dumps (systemd timer)
-#   kit restore <project> <component> <dump> --confirm <project>
-#   kit check [<project>...]                           enforce the project contract
-#   kit conf <project> <component> <key>               print one deploy setting (read-only)
-#   kit ssh-dispatch                                   forced command for the CI deploy key
+#   katap add <project> <type> <component> [domain...]   define a component (in the repo)
+#   katap secrets <project> <component>                  generate its secrets ONCE (on the host)
+#   katap edge up|reload                                 start the shared edge / reload its config
+#   katap deploy <project> <component> <image@sha256:…> [migrate=<image@sha256:…>]
+#   katap rollback <project> <component> [<image@sha256:…> [migrate=<image@sha256:…>]]
+#   katap run <project> <service> [args...]              one-off command in a one-shot service
+#   katap cron --all | <project>                         per-minute jobs (systemd timer)
+#   katap backup --all | <project>                       database dumps (systemd timer)
+#   katap restore <project> <component> <dump> --confirm <project>
+#   katap check [<project>...]                           enforce the project contract
+#   katap conf <project> <component> <key>               print one deploy setting (read-only)
+#   katap ssh-dispatch <environment>                     forced command for the CI deploy key
 #
-# Host layout (KIT_SRV, default /srv):
+# Host layout (KATAP_SRV, default /srv):
 #   secrets/<project>/<component>.env, .db.env, -db-tls/   0700 dir, 0600 files
 #   state/<project>/images.env                             the digests now serving
 #   state/<project>/history                                every deploy and rollback
@@ -34,16 +34,16 @@ shopt -s nullglob
 shopt -u patsub_replacement 2>/dev/null || true
 
 if [ "${BASH_VERSINFO[0]}" -lt 4 ]; then
-    echo "kit: bash 4 or newer is required (this is ${BASH_VERSION})." >&2
+    echo "katap: bash 4 or newer is required (this is ${BASH_VERSION})." >&2
     exit 1
 fi
 
-KIT_ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
-KIT_SRV="${KIT_SRV:-/srv}"
+KATAP_ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+KATAP_SRV="${KATAP_SRV:-/srv}"
 # Test seams: the docker binary, and the program ssh-dispatch hands over to.
-KIT_DOCKER="${KIT_DOCKER:-docker}"
-KIT_SELF="${KIT_SELF:-$KIT_ROOT/bin/kit}"
-KIT_BACKUP_KEEP="${KIT_BACKUP_KEEP:-14}"
+KATAP_DOCKER="${KATAP_DOCKER:-docker}"
+KATAP_SELF="${KATAP_SELF:-$KATAP_ROOT/bin/katap}"
+KATAP_BACKUP_KEEP="${KATAP_BACKUP_KEEP:-14}"
 
 # Runs lib/smoke-check.sh on a project network. Pinned like every other image.
 CURL_IMAGE='curlimages/curl:8.22.0@sha256:58adaa4e8dca9c988bae2aba4ab3434a0bb2da16bbe3f92dec39ec7785166777'
@@ -54,22 +54,22 @@ COMPONENT_RE='^[a-z][a-z0-9]{0,19}$'
 DOMAIN_RE='^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$'
 DIGEST_SUFFIX_RE='@sha256:[0-9a-f]{64}$'
 
-die() { echo "kit: $*" >&2; exit 1; }
+die() { echo "katap: $*" >&2; exit 1; }
 
 # Temporary paths removed on exit, however the command ends.
 CLEANUP=()
 cleanup() { [ "${#CLEANUP[@]}" -eq 0 ] || rm -rf -- "${CLEANUP[@]}"; }
 trap cleanup EXIT
-log() { echo "kit: $*" >&2; }
+log() { echo "katap: $*" >&2; }
 
 # --- Names and files ------------------------------------------------------------
 
 valid_project() { [[ "$1" =~ $PROJECT_RE ]] || die "invalid project name '$1' (expected ${PROJECT_RE})."; }
 valid_component() { [[ "$1" =~ $COMPONENT_RE ]] || die "invalid component name '$1' (expected ${COMPONENT_RE})."; }
 
-project_dir() { printf '%s/projects/%s' "$KIT_ROOT" "$1"; }
-secrets_dir() { printf '%s/secrets/%s' "$KIT_SRV" "$1"; }
-state_dir() { printf '%s/state/%s' "$KIT_SRV" "$1"; }
+project_dir() { printf '%s/projects/%s' "$KATAP_ROOT" "$1"; }
+secrets_dir() { printf '%s/secrets/%s' "$KATAP_SRV" "$1"; }
+state_dir() { printf '%s/state/%s' "$KATAP_SRV" "$1"; }
 images_file() { printf '%s/images.env' "$(state_dir "$1")"; }
 conf_file() { printf '%s/%s.conf' "$(project_dir "$1")" "$2"; }
 
@@ -95,7 +95,7 @@ file_get() {
 }
 
 conf_get() { file_get "$(conf_file "$1" "$2")" "$3"; }
-edge_get() { file_get "$KIT_ROOT/edge/edge.env" "$1"; }
+edge_get() { file_get "$KATAP_ROOT/edge/edge.env" "$1"; }
 
 components_of() {
     local f
@@ -106,7 +106,7 @@ components_of() {
 
 all_projects() {
     local d
-    for d in "$KIT_ROOT"/projects/*/; do
+    for d in "$KATAP_ROOT"/projects/*/; do
         basename "$d"
     done
 }
@@ -124,8 +124,8 @@ compose_with() {
     done
     [ "${#files[@]}" -gt 0 ] || die "project '$project' has no components."
 
-    KIT_ROOT="$KIT_ROOT" KIT_PROJECT="$project" KIT_SECRETS="$(secrets_dir "$project")" \
-        "$KIT_DOCKER" compose --project-name "$project" --project-directory "$(project_dir "$project")" \
+    KATAP_ROOT="$KATAP_ROOT" KATAP_PROJECT="$project" KATAP_SECRETS="$(secrets_dir "$project")" \
+        "$KATAP_DOCKER" compose --project-name "$project" --project-directory "$(project_dir "$project")" \
         --env-file "$env_file" "${files[@]}" "$@"
 }
 
@@ -146,14 +146,14 @@ compose() {
 # --- add ------------------------------------------------------------------------
 
 cmd_add() {
-    [ "$#" -ge 3 ] || die "usage: kit add <project> <type> <component> [domain...]"
+    [ "$#" -ge 3 ] || die "usage: katap add <project> <type> <component> [domain...]"
     local project="$1" type="$2" component="$3"
     shift 3
     valid_project "$project"
     valid_component "$component"
-    if [ ! -f "$KIT_ROOT/templates/$type.yml" ]; then
+    if [ ! -f "$KATAP_ROOT/templates/$type.yml" ]; then
         local known=() template
-        for template in "$KIT_ROOT"/templates/*.yml; do
+        for template in "$KATAP_ROOT"/templates/*.yml; do
             known+=("$(basename "$template" .yml)")
         done
         die "unknown type '$type'. Types: ${known[*]}"
@@ -172,10 +172,10 @@ cmd_add() {
         || die "component '$component' already exists in project '$project'."
 
     # Names are validated above to [a-z0-9-], so they are safe sed replacements.
-    sed -e "s/__C__/$component/g" -e "s/__CU__/$cu/g" "$KIT_ROOT/templates/$type.yml" > "$dir/$component.yml"
-    sed -e "s/__C__/$component/g" -e "s/__CU__/$cu/g" -e "s/__DOMAINS__/$*/" "$KIT_ROOT/templates/$type.conf" > "$dir/$component.conf"
+    sed -e "s/__C__/$component/g" -e "s/__CU__/$cu/g" "$KATAP_ROOT/templates/$type.yml" > "$dir/$component.yml"
+    sed -e "s/__C__/$component/g" -e "s/__CU__/$cu/g" -e "s/__DOMAINS__/$*/" "$KATAP_ROOT/templates/$type.conf" > "$dir/$component.conf"
 
-    if [ "$#" -gt 0 ] && [ -f "$KIT_ROOT/templates/$type.site" ]; then
+    if [ "$#" -gt 0 ] && [ -f "$KATAP_ROOT/templates/$type.site" ]; then
         local port domains
         port="$(conf_get "$project" "$component" port)"
         domains="$(printf '%s, ' "$@")"
@@ -185,7 +185,7 @@ cmd_add() {
         {
             printf '%s' "$separator"
             sed -e "s/__C__/$component/g" -e "s/__DOMAINS__/$domains/" \
-                -e "s/__UPSTREAM__/$project-$component:$port/" "$KIT_ROOT/templates/$type.site"
+                -e "s/__UPSTREAM__/$project-$component:$port/" "$KATAP_ROOT/templates/$type.site"
         } >> "$dir/site.caddy"
     fi
 
@@ -194,7 +194,7 @@ Added $type component '$component' to project '$project' (projects/$project/).
 Next:
   1. Set image= and source_repo= in projects/$project/$component.conf (and image_migrate= if present).
   2. Commit projects/$project, and pull it on the host.
-  3. On the host: kit secrets $project $component, then fill every empty required value.
+  3. On the host: katap secrets $project $component, then fill every empty required value.
 EOF
 }
 
@@ -203,13 +203,13 @@ EOF
 pem_one_line() { awk 'BEGIN { ORS = "" } { if (NR > 1) printf "\\n"; printf "%s", $0 }' "$1"; }
 
 cmd_secrets() {
-    [ "$#" -eq 2 ] || die "usage: kit secrets <project> <component>"
+    [ "$#" -eq 2 ] || die "usage: katap secrets <project> <component>"
     local project="$1" component="$2"
     require_component "$project" "$component"
 
     local type spec dir tls_dir
     type="$(conf_get "$project" "$component" type)"
-    spec="$KIT_ROOT/templates/$type.env.spec"
+    spec="$KATAP_ROOT/templates/$type.env.spec"
     [ -f "$spec" ] || die "no secret spec for type '$type'."
     dir="$(secrets_dir "$project")"
     tls_dir="$dir/$component-db-tls"
@@ -299,7 +299,7 @@ cmd_secrets() {
                 done
                 ;;
             required)
-                printf '# kit:required\n%s=\n' "$key" >> "$work/$section"
+                printf '# katap:required\n%s=\n' "$key" >> "$work/$section"
                 value[$key]=''
                 continue
                 ;;
@@ -312,7 +312,7 @@ cmd_secrets() {
         printf '%s=%s\n' "$key" "$out" >> "$work/$section"
     done < "$spec"
 
-    if grep -qF "\${KIT_SECRETS}/$component-db-tls" "$(project_dir "$project")/$component.yml"; then
+    if grep -qF "\${KATAP_SECRETS}/$component-db-tls" "$(project_dir "$project")/$component.yml"; then
         mkdir -p "$tls_dir"
         openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -subj "/CN=$component-db" \
             -keyout "$tls_dir/server.key" -out "$tls_dir/server.crt" 2>/dev/null
@@ -324,19 +324,19 @@ cmd_secrets() {
         chmod 600 "${section_file[$name]}"
     done
 
-    echo "Wrote ${section_file[app]} and its database and Redis files (mode 0600). Fill every empty value marked '# kit:required' before the first deploy."
+    echo "Wrote ${section_file[app]} and its database and Redis files (mode 0600). Fill every empty value marked '# katap:required' before the first deploy."
 }
 
 # Refuses a deploy while a required value is still empty.
 require_filled_secrets() {
     local project="$1" component="$2" file
     file="$(secrets_dir "$project")/$component.env"
-    [ -f "$file" ] || die "no secrets for '$project/$component'; run 'kit secrets $project $component' on this host first."
+    [ -f "$file" ] || die "no secrets for '$project/$component'; run 'katap secrets $project $component' on this host first."
     local missing
     local files=("$file")
     [ ! -f "${file%.env}.db.env" ] || files+=("${file%.env}.db.env")
     [ ! -f "${file%.env}.redis.env" ] || files+=("${file%.env}.redis.env")
-    missing="$(awk '/^# kit:required$/ { getline; if ($0 ~ /^[A-Z0-9_]+=$/) print substr($0, 1, length($0) - 1) }' "${files[@]}")"
+    missing="$(awk '/^# katap:required$/ { getline; if ($0 ~ /^[A-Z0-9_]+=$/) print substr($0, 1, length($0) - 1) }' "${files[@]}")"
     [ -z "$missing" ] || die "required values are empty in $file: $(echo "$missing" | tr '\n' ' ')"
 }
 
@@ -356,7 +356,7 @@ check_project() {
     mkdir -p "$fixture/secrets"
     for component in $(components_of "$project"); do
         cu="$(upper "$component")"
-        printf 'IMAGE_%s=registry.invalid/kit/check@sha256:%064d\nIMAGE_%s_MIGRATE=registry.invalid/kit/check@sha256:%064d\n' \
+        printf 'IMAGE_%s=registry.invalid/katap/check@sha256:%064d\nIMAGE_%s_MIGRATE=registry.invalid/katap/check@sha256:%064d\n' \
             "$cu" 0 "$cu" 0 >> "$fixture/images.env"
         : > "$fixture/secrets/$component.env"
         : > "$fixture/secrets/$component.db.env"
@@ -368,8 +368,8 @@ check_project() {
     for f in "$(project_dir "$project")"/*.yml; do
         files+=(-f "$f")
     done
-    config="$(KIT_ROOT="$KIT_ROOT" KIT_PROJECT="$project" KIT_SECRETS="$fixture/secrets" \
-        "$KIT_DOCKER" compose --project-name "$project" --project-directory "$(project_dir "$project")" \
+    config="$(KATAP_ROOT="$KATAP_ROOT" KATAP_PROJECT="$project" KATAP_SECRETS="$fixture/secrets" \
+        "$KATAP_DOCKER" compose --project-name "$project" --project-directory "$(project_dir "$project")" \
         --env-file "$fixture/images.env" --profile '*' "${files[@]}" config --format json)" \
         || die "project '$project': the compose files do not render."
 
@@ -399,13 +399,13 @@ check_project() {
     # network is another project's data services.
     problems+=$'\n'"$(jq -r '
         .networks // {} | to_entries[]
-        | select(.value.external == true and .value.name != "kit-edge")
-        | "network \(.value.name): an external network other than kit-edge"
+        | select(.value.external == true and .value.name != "katap-edge")
+        | "network \(.value.name): an external network other than katap-edge"
     ' <<<"$config")"
     local site
     site="$(project_dir "$project")/site.caddy"
     if [ -f "$site" ] && grep -nE '^[[:space:]]*reverse_proxy' "$site" >/dev/null; then
-        problems+=$'\n'"site.caddy: a bare reverse_proxy; proxy through 'import kit_proxy', which sets the client address"
+        problems+=$'\n'"site.caddy: a bare reverse_proxy; proxy through 'import katap_proxy', which sets the client address"
     fi
 
     local key name services line
@@ -433,7 +433,7 @@ check_project() {
 
     problems="$(sed '/^$/d' <<<"$problems")"
     if [ -n "$problems" ]; then
-        echo "kit: project '$project' breaks the project contract:" >&2
+        echo "katap: project '$project' breaks the project contract:" >&2
         while IFS= read -r line; do
             echo "  - $line" >&2
         done <<<"$problems"
@@ -446,7 +446,7 @@ cmd_check() {
     [ "${#projects[@]}" -gt 0 ] || mapfile -t projects < <(all_projects)
     for project in "${projects[@]}"; do
         if check_project "$project"; then
-            echo "kit: project '$project' meets the project contract."
+            echo "katap: project '$project' meets the project contract."
         else
             failed=1
         fi
@@ -457,16 +457,16 @@ cmd_check() {
 # --- edge -----------------------------------------------------------------------
 
 edge_compose() {
-    KIT_SRV="$KIT_SRV" "$KIT_DOCKER" compose --project-directory "$KIT_ROOT/edge" \
-        --env-file "$KIT_ROOT/edge/edge.env" -f "$KIT_ROOT/edge/compose.yml" "$@"
+    KATAP_SRV="$KATAP_SRV" "$KATAP_DOCKER" compose --project-directory "$KATAP_ROOT/edge" \
+        --env-file "$KATAP_ROOT/edge/edge.env" -f "$KATAP_ROOT/edge/compose.yml" "$@"
 }
 
 edge_reload() {
-    mkdir -p "$KIT_SRV/state"
-    exec 8>"$KIT_SRV/state/.edge.lock"
+    mkdir -p "$KATAP_SRV/state"
+    exec 8>"$KATAP_SRV/state/.edge.lock"
     flock -w 120 8 || { log "another edge reload is still running."; return 1; }
     if [ -z "$(edge_compose ps -q caddy 2>/dev/null)" ]; then
-        log "the edge is not running; start it with 'kit edge up'."
+        log "the edge is not running; start it with 'katap edge up'."
         exec 8>&-
         return 0
     fi
@@ -480,14 +480,14 @@ edge_reload() {
 cmd_edge() {
     case "${1:-}" in
         up)
-            mkdir -p "$KIT_SRV/edge/certs"
+            mkdir -p "$KATAP_SRV/edge/certs"
             edge_compose up -d --wait
             ;;
         reload)
             edge_reload || die "the edge rejected its configuration; the previous one keeps serving."
             ;;
         *)
-            die "usage: kit edge up|reload"
+            die "usage: katap edge up|reload"
             ;;
     esac
 }
@@ -537,10 +537,10 @@ smoke() {
     body="$(conf_get "$project" "$component" smoke_body)"
     [ -n "$service" ] || return 0
 
-    "$KIT_DOCKER" run --rm --network "${project}_default" --entrypoint sh \
+    "$KATAP_DOCKER" run --rm --network "${project}_default" --entrypoint sh \
         -e SMOKE_ATTEMPTS -e SMOKE_INTERVAL_SECONDS \
-        -v "$KIT_ROOT/lib/smoke-check.sh:/kit/smoke-check.sh:ro" \
-        "$CURL_IMAGE" /kit/smoke-check.sh "http://$service:$port$path" "$body"
+        -v "$KATAP_ROOT/lib/smoke-check.sh:/katap/smoke-check.sh:ro" \
+        "$CURL_IMAGE" /katap/smoke-check.sh "http://$service:$port$path" "$body"
 }
 
 rollout() {
@@ -576,7 +576,7 @@ release() {
     require_component "$project" "$component"
     require_filled_secrets "$project" "$component"
 
-    # kit=<commit>: the Deploy workflow's view of this repository. Refused when the
+    # katap=<commit>: the Deploy workflow's view of this repository. Refused when the
     # host checkout differs, so a host never deploys a .conf or compose file other
     # than the one the request was resolved against. Not pulled automatically:
     # what this host runs changes only when its operator pulls.
@@ -589,14 +589,14 @@ release() {
                 [ "${arg#env=}" = "$(conf_get "$project" "$component" environment)" ] \
                     || die "'$project/$component' is a $(conf_get "$project" "$component" environment) component; this key deploys ${arg#env=} only."
                 ;;
-            kit=*)
-                [[ "${arg#kit=}" =~ ^[0-9a-f]{40}$ ]] || die "invalid kit= commit."
+            katap=*)
+                [[ "${arg#katap=}" =~ ^[0-9a-f]{40}$ ]] || die "invalid katap= commit."
                 local head
-                head="$(git -C "$KIT_ROOT" rev-parse HEAD 2>/dev/null || true)"
-                [ "$head" = "${arg#kit=}" ] \
-                    || die "this host runs kit ${head:-(not a git checkout)}, the request was resolved against ${arg#kit=}; pull /srv/kit first."
-                [ -z "$(git -C "$KIT_ROOT" status --porcelain -- projects templates lib edge bin 2>/dev/null)" ] \
-                    || die "/srv/kit has uncommitted changes; the request was resolved against committed files only."
+                head="$(git -C "$KATAP_ROOT" rev-parse HEAD 2>/dev/null || true)"
+                [ "$head" = "${arg#katap=}" ] \
+                    || die "this host runs katap ${head:-(not a git checkout)}, the request was resolved against ${arg#katap=}; pull /srv/katap first."
+                [ -z "$(git -C "$KATAP_ROOT" status --porcelain -- projects templates lib edge bin 2>/dev/null)" ] \
+                    || die "/srv/katap has uncommitted changes; the request was resolved against committed files only."
                 ;;
             *) images+=("$arg") ;;
         esac
@@ -634,7 +634,7 @@ release() {
     while IFS= read -r ref; do
         ref="${ref#*=}"
         log "pulling $ref."
-        "$KIT_DOCKER" pull --quiet "$ref" >/dev/null || die "could not pull $ref; nothing was changed."
+        "$KATAP_DOCKER" pull --quiet "$ref" >/dev/null || die "could not pull $ref; nothing was changed."
     done <<<"$lines"
 
     if [ "$mode" = deploy ]; then
@@ -665,25 +665,25 @@ release() {
     # The release is serving whatever happens here; a site file that does not load
     # leaves the edge on its previous configuration.
     if [ -n "$(conf_get "$project" "$component" domains)" ] && ! edge_reload; then
-        log "WARNING: the edge did not reload; it keeps its previous configuration. Fix the site file, then 'kit edge reload'."
+        log "WARNING: the edge did not reload; it keeps its previous configuration. Fix the site file, then 'katap edge reload'."
     fi
 }
 
 cmd_deploy() {
-    [ "$#" -ge 3 ] || die "usage: kit deploy <project> <component> <image@sha256:…> [migrate=<image@sha256:…>]"
+    [ "$#" -ge 3 ] || die "usage: katap deploy <project> <component> <image@sha256:…> [migrate=<image@sha256:…>]"
     release deploy "$@"
 }
 
 cmd_rollback() {
-    [ "$#" -ge 2 ] || die "usage: kit rollback <project> <component> [<image@sha256:…> [migrate=<image@sha256:…>]]"
+    [ "$#" -ge 2 ] || die "usage: katap rollback <project> <component> [<image@sha256:…> [migrate=<image@sha256:…>]]"
     local project="$1" component="$2"
     shift 2
     require_component "$project" "$component"
 
-    # env=/kit= words (from ssh-dispatch) travel through to release; the rest name images.
+    # env=/katap= words (from ssh-dispatch) travel through to release; the rest name images.
     local passthrough=() images=() arg
     for arg in "$@"; do
-        case "$arg" in env=*|kit=*) passthrough+=("$arg") ;; *) images+=("$arg") ;; esac
+        case "$arg" in env=*|katap=*) passthrough+=("$arg") ;; *) images+=("$arg") ;; esac
     done
     set -- "${images[@]}"
 
@@ -719,7 +719,7 @@ cmd_rollback() {
 # --- run / cron -----------------------------------------------------------------
 
 cmd_run() {
-    [ "$#" -ge 2 ] || die "usage: kit run <project> <service> [args...]"
+    [ "$#" -ge 2 ] || die "usage: katap run <project> <service> [args...]"
     local project="$1" service="$2"
     shift 2
     require_project "$project"
@@ -750,8 +750,8 @@ cron_project() {
             # depends on; if that is down, this minute fails and the next one retries.
             # Bounded below the 15 minutes a deploy waits for the project lock: work
             # longer than that belongs on the queue, not in the scheduler's foreground.
-            timeout --kill-after=30s "${KIT_CRON_TIMEOUT:-10m}" \
-                "$KIT_SELF" run "$project" "$service" --no-deps-run || log "$project/$service failed."
+            timeout --kill-after=30s "${KATAP_CRON_TIMEOUT:-10m}" \
+                "$KATAP_SELF" run "$project" "$service" --no-deps-run || log "$project/$service failed."
         done
     done
     exec 9>&-
@@ -761,13 +761,13 @@ cmd_cron() {
     local project
     if [ "${1:-}" = --all ]; then
         # One process per project, started and not waited for: a slow job in one
-        # project must not hold back another's minute. kit-cron.service sets
+        # project must not hold back another's minute. katap-cron.service sets
         # KillMode=process so systemd leaves them running.
         for project in $(all_projects); do
-            setsid "$KIT_SELF" cron "$project" </dev/null &
+            setsid "$KATAP_SELF" cron "$project" </dev/null &
         done
     else
-        [ "$#" -eq 1 ] || die "usage: kit cron --all | <project>"
+        [ "$#" -eq 1 ] || die "usage: katap cron --all | <project>"
         require_project "$1"
         cron_project "$1"
     fi
@@ -790,7 +790,7 @@ backup_component() {
         return 1
     fi
 
-    dir="$KIT_SRV/backups/$project"
+    dir="$KATAP_SRV/backups/$project"
     mkdir -p "$dir"
     chmod 700 "$dir"
     file="$dir/$component-$(date -u +%Y%m%dT%H%M%SZ)-$reason.dump"
@@ -815,20 +815,20 @@ backup_component() {
         return 1
     fi
 
-    # Keep the newest KIT_BACKUP_KEEP dumps of each kind, so a run of deploys never
+    # Keep the newest KATAP_BACKUP_KEEP dumps of each kind, so a run of deploys never
     # rotates out the nightly ones. Names are <component>-<UTC time>-<reason>.dump
     # and sort by time.
     local dumps=()
     dumps=("$dir/$component-"*"-$reason.dump")
-    while [ "${#dumps[@]}" -gt "$KIT_BACKUP_KEEP" ]; do
+    while [ "${#dumps[@]}" -gt "$KATAP_BACKUP_KEEP" ]; do
         # Never the dump a restore is reading from.
         [ "$(readlink -f "${dumps[0]}")" = "$keep" ] || rm -f "${dumps[0]}" "${dumps[0]}.images"
         dumps=("${dumps[@]:1}")
     done
 
-    if [ -n "${KIT_RCLONE_REMOTE:-}" ]; then
-        if ! command -v rclone >/dev/null || ! rclone copy "$file" "$KIT_RCLONE_REMOTE/$project/" \
-            || ! rclone copy "$file.images" "$KIT_RCLONE_REMOTE/$project/"; then
+    if [ -n "${KATAP_RCLONE_REMOTE:-}" ]; then
+        if ! command -v rclone >/dev/null || ! rclone copy "$file" "$KATAP_RCLONE_REMOTE/$project/" \
+            || ! rclone copy "$file.images" "$KATAP_RCLONE_REMOTE/$project/"; then
             log "$project/$component: the off-host copy failed; $file is on this host only."
             # A deploy is not held hostage by the backup remote; the nightly run is.
             [ "$reason" = predeploy ] || return 1
@@ -841,7 +841,7 @@ cmd_backup() {
     if [ "${1:-}" = --all ]; then
         mapfile -t projects < <(all_projects)
     else
-        [ "$#" -eq 1 ] || die "usage: kit backup --all | <project>"
+        [ "$#" -eq 1 ] || die "usage: katap backup --all | <project>"
         require_project "$1"
         projects=("$1")
     fi
@@ -869,7 +869,7 @@ cmd_backup() {
 # complete: a failed restore leaves the current data untouched, and a successful one
 # leaves nothing of the current schema behind.
 cmd_restore() {
-    [ "$#" -eq 5 ] && [ "$4" = --confirm ] || die "usage: kit restore <project> <component> <dump> --confirm <project>"
+    [ "$#" -eq 5 ] && [ "$4" = --confirm ] || die "usage: katap restore <project> <component> <dump> --confirm <project>"
     local project="$1" component="$2" dump="$3"
     require_component "$project" "$component"
     [ "$5" = "$project" ] || die "--confirm must repeat the project name."
@@ -892,7 +892,7 @@ cmd_restore() {
 
     local ref
     while IFS= read -r ref; do
-        "$KIT_DOCKER" pull --quiet "${ref#*=}" >/dev/null || die "could not pull ${ref#*=}; nothing was changed."
+        "$KATAP_DOCKER" pull --quiet "${ref#*=}" >/dev/null || die "could not pull ${ref#*=}; nothing was changed."
     done <<<"$lines"
 
     psql_admin() { compose "$project" exec -T "$service" psql -X -q -v ON_ERROR_STOP=1 -U postgres -d postgres "$@"; }
@@ -912,11 +912,11 @@ cmd_restore() {
     }
     backup_component "$project" "$component" prerestore "$dump" || abandon "the safety dump failed"
     psql_admin -c 'DROP DATABASE IF EXISTS app_restore WITH (FORCE)' >/dev/null || abandon "could not prepare the restore"
-    psql_admin -v db=app_restore < "$KIT_ROOT/lib/app-database.sql" >/dev/null || abandon "could not create the restore database"
+    psql_admin -v db=app_restore < "$KATAP_ROOT/lib/app-database.sql" >/dev/null || abandon "could not create the restore database"
     compose "$project" exec -T "$service" pg_restore -U postgres -d app_restore --single-transaction --exit-on-error <&6 \
         || abandon "the restore failed"
     psql_admin -c 'DROP DATABASE app WITH (FORCE)' -c 'ALTER DATABASE app_restore RENAME TO app' >/dev/null \
-        || die "the swap failed: the restored data is in database app_restore; rename it to app by hand, then 'kit rollback'."
+        || die "the swap failed: the restored data is in database app_restore; rename it to app by hand, then 'katap rollback'."
 
     # From here the data is the dump's, so the state records the dump's release
     # whatever happens next.
@@ -944,15 +944,15 @@ cmd_restore() {
 
 # --- ssh-dispatch ---------------------------------------------------------------
 
-# The CI deploy key's forced command (authorized_keys: command="…/kit ssh-dispatch",restrict).
+# The CI deploy key's forced command (authorized_keys: command="…/katap ssh-dispatch",restrict).
 # It admits exactly `deploy` and `rollback`; every argument is validated again by them.
 cmd_ssh_dispatch() {
     # The environment this key serves comes from its forced command
-    # (command="…/kit ssh-dispatch production"), never from the request.
+    # (command="…/katap ssh-dispatch production"), never from the request.
     local environment="${1:-}"
     case "$environment" in
         production|staging) ;;
-        *) die "refused: this key has no environment (authorized_keys: command=\"…/kit ssh-dispatch <production|staging>\")." ;;
+        *) die "refused: this key has no environment (authorized_keys: command=\"…/katap ssh-dispatch <production|staging>\")." ;;
     esac
     local request="${SSH_ORIGINAL_COMMAND:-}"
     [[ "$request" =~ ^[A-Za-z0-9\ ._:/@=-]+$ ]] || die "refused: the request contains characters outside the allowed set."
@@ -962,22 +962,22 @@ cmd_ssh_dispatch() {
         deploy|rollback) ;;
         *) die "refused: only 'deploy' and 'rollback' are allowed over SSH." ;;
     esac
-    local word kit_words=0
+    local word katap_words=0
     for word in "${words[@]}"; do
         case "$word" in
-            kit=*) kit_words=$((kit_words + 1)) ;;
+            katap=*) katap_words=$((katap_words + 1)) ;;
             env=*) die "refused: the environment is the key's, not the request's." ;;
         esac
     done
-    [ "${words[0]}" != deploy ] || [ "$kit_words" -eq 1 ] || die "refused: a deploy names the kit commit it was resolved against (kit=<commit>)."
+    [ "${words[0]}" != deploy ] || [ "$katap_words" -eq 1 ] || die "refused: a deploy names the Katap commit it was resolved against (katap=<commit>)."
     words+=("env=$environment")
-    command -v logger >/dev/null && logger -t kit "ssh-dispatch: $request" || true
+    command -v logger >/dev/null && logger -t katap "ssh-dispatch: $request" || true
 
     # The work outlives the SSH session: a cancelled workflow or a dropped
     # connection must never stop a deploy between its steps. It runs with HUP and
     # PIPE ignored and its output in a log, which the session follows while it lasts.
     local dir log
-    dir="$KIT_SRV/state/dispatch"
+    dir="$KATAP_SRV/state/dispatch"
     umask 077
     mkdir -p "$dir"
     log="$dir/$(date -u +%Y%m%dT%H%M%SZ)-$$.log"
@@ -985,7 +985,7 @@ cmd_ssh_dispatch() {
     (
         trap '' HUP PIPE
         status=0
-        "$KIT_SELF" "${words[@]}" >"$log" 2>&1 || status=$?
+        "$KATAP_SELF" "${words[@]}" >"$log" 2>&1 || status=$?
         echo "$status" > "$log.status"
     ) </dev/null &
     local worker=$!
@@ -1005,7 +1005,7 @@ cmd_ssh_dispatch() {
 
 # One deploy setting, for the Deploy workflow: the single reader of .conf files.
 cmd_conf() {
-    [ "$#" -eq 3 ] || die "usage: kit conf <project> <component> <key>"
+    [ "$#" -eq 3 ] || die "usage: katap conf <project> <component> <key>"
     require_component "$1" "$2"
     [[ "$3" =~ ^[a-z_]+$ ]] || die "invalid key '$3'."
     conf_get "$1" "$2" "$3"
@@ -1030,8 +1030,8 @@ main() {
         check) cmd_check "$@" ;;
         conf) cmd_conf "$@" ;;
         ssh-dispatch) cmd_ssh_dispatch "$@" ;;
-        help|-h|--help) sed -n '3,30p' "$KIT_ROOT/bin/kit" | sed 's/^# \{0,1\}//' ;;
-        *) die "unknown command '$command'; see 'kit help'." ;;
+        help|-h|--help) sed -n '3,30p' "$KATAP_ROOT/bin/katap" | sed 's/^# \{0,1\}//' ;;
+        *) die "unknown command '$command'; see 'katap help'." ;;
     esac
 }
 

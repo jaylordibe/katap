@@ -1,13 +1,13 @@
 # __C__ (spa)
 __DOMAINS__ {
-	import kit_site
-	import kit_proxy __UPSTREAM__
+	import katap_site
+	import katap_proxy __UPSTREAM__
 }
 
 # A canonical-host redirect, if the SPA declares www as canonical (sitemap, og:url):
 # list only www above, and add
 #
 # example.com {
-# 	import kit_site
+# 	import katap_site
 # 	redir https://www.example.com{uri} permanent
 # }

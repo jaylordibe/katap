@@ -49,7 +49,7 @@ on:
         type: string
         required: false
 
-# One deploy per host, project and component at a time; another queues. `kit
+# One deploy per host, project and component at a time; another queues. `katap
 # deploy` also holds a per-project lock on the host.
 concurrency:
   group: deploy-${{ inputs.environment }}-${{ inputs.project }}-${{ inputs.component }}
@@ -114,7 +114,7 @@ jobs:
           # the deploy to whoever intercepts the first packet.
           printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > "$ssh_dir/known_hosts"
           ssh-keygen -l -f "$ssh_dir/known_hosts" >/dev/null || { echo "::error::DEPLOY_KNOWN_HOSTS is empty or malformed."; exit 1; }
-          # The host's authorized_keys runs `kit ssh-dispatch <this environment>`
+          # The host's authorized_keys runs `katap ssh-dispatch <this environment>`
           # whatever is sent; the request below is what it reads as
           # SSH_ORIGINAL_COMMAND, and the key's environment, not the request,
           # decides which components it may touch. The deploy itself

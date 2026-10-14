@@ -1,11 +1,11 @@
 # The shared edge: the ONLY container on this host that publishes ports.
 #
-# Every project's public components join the `kit-edge` network under the alias
+# Every project's public components join the `katap-edge` network under the alias
 # `<project>-<component>`, and their site blocks (projects/*/site.caddy) are
 # imported by the Caddyfile. Data services never join this network.
 #
-# Managed by `kit edge up` / `kit edge reload`; settings live in edge.env.
-name: kit-edge
+# Managed by `katap edge up` / `katap edge reload`; settings live in edge.env.
+name: katap-edge
 
 services:
   caddy:
@@ -26,7 +26,7 @@ services:
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - ../projects:/etc/caddy/projects:ro
-      - ${KIT_SRV:-/srv}/edge/certs:/etc/caddy/certs:ro
+      - ${KATAP_SRV:-/srv}/edge/certs:/etc/caddy/certs:ro
       # Holds issued certificates and ACME account keys. Losing it means
       # re-issuing every certificate, which runs into the CA's rate limits.
       - caddy_data:/data
@@ -44,7 +44,7 @@ services:
 
 networks:
   edge:
-    name: kit-edge
+    name: katap-edge
     ipam:
       config:
         - subnet: ${EDGE_SUBNET:?set EDGE_SUBNET in edge/edge.env}

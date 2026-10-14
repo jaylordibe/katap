@@ -1,5 +1,5 @@
 [Unit]
-Description=kit: run per-minute jobs every minute
+Description=katap: run per-minute jobs every minute
 
 [Timer]
 OnCalendar=*-*-* *:*:00

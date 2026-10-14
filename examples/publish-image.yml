@@ -1,6 +1,6 @@
 # Reference publish workflow for an application repository (an SPA, a Next.js
 # app, any service). Copy it to .github/workflows/publish-image.yml in the app
-# repository: the Deploy workflow of the kit verifies that an image was attested
+# repository: the Deploy workflow of Katap verifies that an image was attested
 # by exactly that file path.
 #
 # It builds, scans and publishes; it never deploys and holds no server
@@ -10,15 +10,15 @@
 #
 # Order matters: the image is pushed under its immutable sha-<commit> tag, scanned
 # by digest, and only then given the provenance attestation and the moving branch
-# tag. An image that fails the scan therefore has no attestation, and the kit
+# tag. An image that fails the scan therefore has no attestation, and Katap
 # refuses to deploy it.
 #
 # Settings (repository variables):
 #   PUBLISH_ENABLED=true          publish at all (a fresh copy runs the build only)
-#   DEPLOY_DISPATCH_REPO          optional: owner/cicd, to ask for a staging deploy
+#   DEPLOY_DISPATCH_REPO          optional: owner/katap, to ask for a staging deploy
 #   DEPLOY_DISPATCH_PROJECT / DEPLOY_DISPATCH_COMPONENT   that deploy's target
 # and secret DEPLOY_DISPATCH_TOKEN: a fine-grained token with ONLY Actions: write on
-# the kit repository (it can start the Deploy workflow, not change a file there).
+# the Katap repository (it can start the Deploy workflow, not change a file there).
 
 name: Publish image
 

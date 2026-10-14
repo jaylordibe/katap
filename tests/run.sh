@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 #
-# The kit's test suite.
+# Katap's test suite.
 #
 #   tests/run.sh             static checks and unit tests (no containers started)
 #   E2E=1 tests/run.sh       plus an end-to-end deploy on the local Docker daemon
 #
 # Everything runs inside tests/runner.Dockerfile (bash 5, flock, jq, the Docker
-# CLI), the same tools the kit has on a server. The Docker socket is shared, so
+# CLI), the same tools Katap has on a server. The Docker socket is shared, so
 # the end-to-end run uses this machine's daemon. It creates and removes only
-# resources named kit-e2e* / e2e* and the kit-edge network.
+# resources named katap-e2e* / e2e* and the katap-edge network.
 #
 # E2E settings:
 #   E2E_LARAVEL_API   path of a laravel-api checkout to build (default ../laravel-api)
@@ -18,16 +18,16 @@ set -euo pipefail
 shopt -s nullglob
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-RUNNER_IMAGE='kit-test-runner:local'
+RUNNER_IMAGE='katap-test-runner:local'
 
-if [ "${KIT_TEST_IN_RUNNER:-}" != 1 ]; then
+if [ "${KATAP_TEST_IN_RUNNER:-}" != 1 ]; then
     docker build --quiet -t "$RUNNER_IMAGE" -f "$REPO/tests/runner.Dockerfile" "$REPO/tests" >/dev/null
     # This part runs on the developer's own bash, which may be 3.2 (macOS).
     tty=''
     [ ! -t 1 ] || tty='-t'
     # shellcheck disable=SC2086 # $tty is empty or one flag.
     exec docker run --rm $tty \
-        -e KIT_TEST_IN_RUNNER=1 -e E2E -e E2E_LARAVEL_API -e E2E_BASE_IMAGE -e E2E_KEEP \
+        -e KATAP_TEST_IN_RUNNER=1 -e E2E -e E2E_LARAVEL_API -e E2E_BASE_IMAGE -e E2E_KEEP \
         -v /var/run/docker.sock:/var/run/docker.sock \
         -v "$REPO:$REPO" -w "$REPO" \
         -v "$(cd "$REPO/.." && pwd):$(cd "$REPO/.." && pwd):ro" \
@@ -75,23 +75,23 @@ refuses() {
 
 section() { echo; echo "== $1"; }
 
-# A throwaway copy of the kit, so tests never write into this repository's
-# projects/, with its own KIT_SRV.
-new_kit() {
+# A throwaway copy of Katap, so tests never write into this repository's
+# projects/, with its own KATAP_SRV.
+new_katap() {
     local dir
-    dir="$(mktemp -d "$WORK/kit.XXXXXX")"
+    dir="$(mktemp -d "$WORK/katap.XXXXXX")"
     cp -R "$REPO/bin" "$REPO/lib" "$REPO/templates" "$REPO/edge" "$REPO/.github" "$dir/"
     mkdir -p "$dir/projects" "$dir/srv"
     echo "$dir"
 }
 
-kit() { KIT_SRV="$K/srv" "$K/bin/kit" "$@"; }
+katap() { KATAP_SRV="$K/srv" "$K/bin/katap" "$@"; }
 
 set_conf() { sed -i "s|^$3=.*|$3=$4|" "$K/projects/$1/$2.conf"; }
 
 fill_required() {
     # $1 project, $2 component: give every required value a placeholder.
-    sed -i '/^# kit:required$/{n;s/=$/=filled-by-test/}' "$K/srv/secrets/$1/$2.env"
+    sed -i '/^# katap:required$/{n;s/=$/=filled-by-test/}' "$K/srv/secrets/$1/$2.env"
 }
 
 digest() { printf 'sha256:%064d' "$1"; }
@@ -117,7 +117,7 @@ rendered() {
     done
     local files=() f
     for f in "$K/projects/$project"/*.yml; do files+=(-f "$f"); done
-    KIT_ROOT="$K" KIT_PROJECT="$project" KIT_SECRETS="$fixture" \
+    KATAP_ROOT="$K" KATAP_PROJECT="$project" KATAP_SECRETS="$fixture" \
         docker compose --project-name "$project" --project-directory "$K/projects/$project" \
         --env-file /dev/null --profile '*' "${files[@]}" config --format json
 }
@@ -126,14 +126,14 @@ rendered() {
 
 section "static"
 
-check "shellcheck: every script" shellcheck -x "$REPO/bin/kit" "$REPO"/lib/*.sh "$REPO"/host/*.sh "$REPO"/.github/scripts/*.sh "$REPO/tests/run.sh" "$REPO/tests/e2e.sh"
+check "shellcheck: every script" shellcheck -x "$REPO/bin/katap" "$REPO"/lib/*.sh "$REPO"/host/*.sh "$REPO"/.github/scripts/*.sh "$REPO/tests/run.sh" "$REPO/tests/e2e.sh"
 
 no_match() {
     local pattern="$1"
     shift
     ! grep -rnE -- "$pattern" "$@"
 }
-check "no destructive data command anywhere in the kit" \
+check "no destructive data command anywhere in Katap" \
     no_match 'migrate:fresh|key:generate|passport:keys|down -v|--volumes|volume rm|docker exec ' \
     "$REPO/bin" "$REPO/lib" "$REPO/host" "$REPO/templates" "$REPO/edge"
 check "the only seeder a template runs is the permission sync" \
@@ -146,41 +146,41 @@ check "every fixed image in the edge and templates is pinned by digest" \
 # Moved from nestjs-api test/external-exposure.e2e-spec.ts: the edge, not the
 # application, now owns these, so they are asserted where the edge lives.
 caddyfile="$(cat "$REPO/edge/Caddyfile")"
-check "the edge has exactly one reverse_proxy, inside kit_proxy" \
+check "the edge has exactly one reverse_proxy, inside katap_proxy" \
     bash -c "[ \"\$(grep -cE '^[[:space:]]*reverse_proxy ' '$REPO/edge/Caddyfile')\" = 1 ] && grep -qE '^[[:space:]]reverse_proxy \{args\[0\]\} \{' '$REPO/edge/Caddyfile'"
-check "no site template proxies around kit_proxy" \
+check "no site template proxies around katap_proxy" \
     no_match 'reverse_proxy' "$REPO"/templates/*.site
-check "every site template imports kit_site and proxies through kit_proxy" \
-    bash -c "for f in '$REPO'/templates/*.site; do grep -qE '^\simport kit_site$' \"\$f\" && grep -qE '^\simport kit_proxy __UPSTREAM__$' \"\$f\" || exit 1; done"
+check "every site template imports katap_site and proxies through katap_proxy" \
+    bash -c "for f in '$REPO'/templates/*.site; do grep -qE '^\simport katap_site$' \"\$f\" && grep -qE '^\simport katap_proxy __UPSTREAM__$' \"\$f\" || exit 1; done"
 check "behind Cloudflare the client address comes from CF-Connecting-IP" \
     grep -qF 'header_up X-Forwarded-For {http.request.header.CF-Connecting-IP}' <<<"$caddyfile"
 check "Cloudflare mode requires the origin-pull client certificate and Cloudflare's ranges" \
-    bash -c "grep -qF 'mode require_and_verify' '$REPO/edge/Caddyfile' && grep -qF '@kit_not_cloudflare not remote_ip 173.245.48.0/20' '$REPO/edge/Caddyfile'"
+    bash -c "grep -qF 'mode require_and_verify' '$REPO/edge/Caddyfile' && grep -qF '@katap_not_cloudflare not remote_ip 173.245.48.0/20' '$REPO/edge/Caddyfile'"
 check "the nestjs-api site matches exactly the Swagger subtree" \
     grep -qxF $'\t@docs path /api/docs /api/docs/*' "$REPO/templates/nestjs-api.site"
 
 # --- add and check --------------------------------------------------------------
 
-section "kit add / kit check"
+section "katap add / katap check"
 
-K="$(new_kit)"
-check "add laravel-api" kit add shop laravel-api api api.shop.test
-check "add spa" kit add shop spa web shop.test www.shop.test
-check "add nestjs-api" kit add blog nestjs-api api api.blog.test
-check "add spa to a second project" kit add blog spa web blog.test
-check "add node-ssr" kit add blog node-ssr ssr ssr.blog.test
-check "add an internal-only component (no domain)" kit add tools spa docs
-refuses "a component cannot be added twice" "already exists" kit add shop spa web other.test
-refuses "a project name is validated" "invalid project name" kit add Shop spa web x.test
-refuses "a component name is validated (no hyphen)" "invalid component name" kit add shop spa my-web x.test
-refuses "a domain is validated" "invalid domain" kit add shop spa web 'x.test;rm'
-refuses "an unknown type is refused" "unknown type" kit add shop rails api x.test
+K="$(new_katap)"
+check "add laravel-api" katap add shop laravel-api api api.shop.test
+check "add spa" katap add shop spa web shop.test www.shop.test
+check "add nestjs-api" katap add blog nestjs-api api api.blog.test
+check "add spa to a second project" katap add blog spa web blog.test
+check "add node-ssr" katap add blog node-ssr ssr ssr.blog.test
+check "add an internal-only component (no domain)" katap add tools spa docs
+refuses "a component cannot be added twice" "already exists" katap add shop spa web other.test
+refuses "a project name is validated" "invalid project name" katap add Shop spa web x.test
+refuses "a component name is validated (no hyphen)" "invalid component name" katap add shop spa my-web x.test
+refuses "a domain is validated" "invalid domain" katap add shop spa web 'x.test;rm'
+refuses "an unknown type is refused" "unknown type" katap add shop rails api x.test
 check "site.caddy routes each domain to its component" \
-    bash -c "grep -qxF 'api.shop.test {' '$K/projects/shop/site.caddy' && grep -qxF $'\timport kit_proxy shop-api:80' '$K/projects/shop/site.caddy' && grep -qxF 'shop.test, www.shop.test {' '$K/projects/shop/site.caddy' && grep -qxF $'\timport kit_proxy blog-api:3000' '$K/projects/blog/site.caddy'"
+    bash -c "grep -qxF 'api.shop.test {' '$K/projects/shop/site.caddy' && grep -qxF $'\timport katap_proxy shop-api:80' '$K/projects/shop/site.caddy' && grep -qxF 'shop.test, www.shop.test {' '$K/projects/shop/site.caddy' && grep -qxF $'\timport katap_proxy blog-api:3000' '$K/projects/blog/site.caddy'"
 check "an internal-only component gets no site" test ! -e "$K/projects/tools/site.caddy"
 
-check "laravel-api + spa meet the project contract" kit check shop
-check "nestjs-api + spa + node-ssr meet the project contract" kit check blog
+check "laravel-api + spa meet the project contract" katap check shop
+check "nestjs-api + spa + node-ssr meet the project contract" katap check blog
 
 shop_config="$(rendered shop)"
 check "laravel worker stop grace period >= 75s (HORIZON_TIMEOUT + 15s)" \
@@ -202,7 +202,7 @@ mutate() {
     rm -rf "$K/projects/bad"
     cp -R "$K/projects/shop" "$K/projects/bad"
     python3 - "$K/projects/bad" <<<"$script"
-    refuses "kit check refuses: $name" "$message" kit check bad
+    refuses "katap check refuses: $name" "$message" katap check bad
 }
 mutate "a published port" "publishes ports" '
 import sys; p = sys.argv[1] + "/api.yml"; s = open(p).read()
@@ -232,7 +232,7 @@ rm -rf "$K/projects/bad"
 
 # --- secrets --------------------------------------------------------------------
 
-section "kit secrets"
+section "katap secrets"
 
 env_get() { grep -E "^$2=" "$1" | head -n1 | cut -d= -f2-; }
 unescape_pem() { printf '%b\n' "$1"; }
@@ -271,13 +271,13 @@ laravel_runs=20
 laravel_failures=''
 for _ in $(seq 1 "$laravel_runs"); do
     rm -rf "$K/srv/secrets/shop"
-    out="$(kit secrets shop api 2>&1)" || { laravel_failures+="$out"$'\n'; continue; }
+    out="$(katap secrets shop api 2>&1)" || { laravel_failures+="$out"$'\n'; continue; }
     out="$(secrets_laravel_ok 2>&1)" || laravel_failures+="$out"$'\n'
 done
 if [ -z "$laravel_failures" ]; then ok "laravel-api secrets are well-formed in $laravel_runs fresh runs"; else not_ok "laravel-api secrets are well-formed in $laravel_runs fresh runs" "$laravel_failures"; fi
 
 before="$(sha256sum "$K/srv/secrets/shop/api.env" "$K/srv/secrets/shop/api.db.env" "$K/srv/secrets/shop/api.redis.env" "$K/srv/secrets/shop/api-db-tls/server.key")"
-refuses "secrets are never regenerated" "refusing to overwrite" kit secrets shop api
+refuses "secrets are never regenerated" "refusing to overwrite" katap secrets shop api
 check "a refused run leaves every secret byte-identical" \
     test "$before" = "$(sha256sum "$K/srv/secrets/shop/api.env" "$K/srv/secrets/shop/api.db.env" "$K/srv/secrets/shop/api.redis.env" "$K/srv/secrets/shop/api-db-tls/server.key")"
 
@@ -285,7 +285,7 @@ nest_runs=100
 nest_failures=''
 for _ in $(seq 1 "$nest_runs"); do
     rm -rf "$K/srv/secrets/blog"
-    kit secrets blog api >/dev/null 2>&1 || { nest_failures+="secrets failed"$'\n'; continue; }
+    katap secrets blog api >/dev/null 2>&1 || { nest_failures+="secrets failed"$'\n'; continue; }
     app="$K/srv/secrets/blog/api.env"
     [[ "$(env_get "$app" DATABASE_URL)" == "postgresql://app:$(env_get "$K/srv/secrets/blog/api.db.env" APP_DB_PASSWORD)@api-db:5432/app?schema=public" ]] || nest_failures+="DATABASE_URL"$'\n'
     [[ "$(env_get "$app" REDIS_URL)" == "redis://default:$(env_get "$K/srv/secrets/blog/api.redis.env" REDIS_PASSWORD)@api-redis:6379" ]] || nest_failures+="REDIS_URL"$'\n'
@@ -298,14 +298,14 @@ check "nestjs-api does not trust Cloudflare headers outside Cloudflare mode" \
     test "$(env_get "$K/srv/secrets/blog/api.env" TRUST_CLOUDFLARE_HEADERS)" = false
 sed -i 's/^TLS_MODE=.*/TLS_MODE=cloudflare/' "$K/edge/edge.env"
 rm -rf "$K/srv/secrets/blog"
-kit secrets blog api >/dev/null
+katap secrets blog api >/dev/null
 check "nestjs-api trusts Cloudflare headers in Cloudflare mode" \
     test "$(env_get "$K/srv/secrets/blog/api.env" TRUST_CLOUDFLARE_HEADERS)" = true
 sed -i 's/^TLS_MODE=.*/TLS_MODE=acme/' "$K/edge/edge.env"
 
 # --- deploy refusals (before anything is pulled) --------------------------------
 
-section "kit deploy refusals"
+section "katap deploy refusals"
 
 # A docker wrapper that records every pull and refuses it, so a test can prove a
 # refusal happened before the deploy touched anything.
@@ -316,7 +316,7 @@ exec docker "\$@"
 EOF
 chmod +x "$WORK/docker-recorder"
 : > "$WORK/pulls"
-deploy() { KIT_DOCKER="$WORK/docker-recorder" kit deploy "$@"; }
+deploy() { KATAP_DOCKER="$WORK/docker-recorder" katap deploy "$@"; }
 
 D64="ghcr.io/acme/shop-api@$(digest 1)"
 SHA40="$(printf 'a%.0s' $(seq 1 40))"
@@ -338,7 +338,7 @@ check "no refused deploy pulled anything" test ! -s "$WORK/pulls"
 
 # --- ssh-dispatch ---------------------------------------------------------------
 
-section "kit ssh-dispatch"
+section "katap ssh-dispatch"
 
 cat > "$WORK/self-recorder" <<EOF
 #!/usr/bin/env bash
@@ -346,10 +346,10 @@ printf '%s\n' "\$@" > "$WORK/dispatched"
 EOF
 chmod +x "$WORK/self-recorder"
 # dispatch <request> [environment]: the environment is the key's forced command.
-dispatch() { rm -f "$WORK/dispatched"; SSH_ORIGINAL_COMMAND="$1" KIT_SELF="$WORK/self-recorder" kit ssh-dispatch "${2-production}"; }
+dispatch() { rm -f "$WORK/dispatched"; SSH_ORIGINAL_COMMAND="$1" KATAP_SELF="$WORK/self-recorder" katap ssh-dispatch "${2-production}"; }
 
-if dispatch "deploy shop api $D64 migrate=$D64 kit=$SHA40" \
-    && [ "$(cat "$WORK/dispatched")" = "$(printf '%s\n' deploy shop api "$D64" "migrate=$D64" "kit=$SHA40" env=production)" ]; then
+if dispatch "deploy shop api $D64 migrate=$D64 katap=$SHA40" \
+    && [ "$(cat "$WORK/dispatched")" = "$(printf '%s\n' deploy shop api "$D64" "migrate=$D64" "katap=$SHA40" env=production)" ]; then
     ok "deploy is handed over word by word, with the key's environment appended"
 else
     not_ok "deploy is handed over word by word" "$(cat "$WORK/dispatched" 2>/dev/null)"
@@ -367,9 +367,9 @@ done
 for request in 'run shop api-artisan tinker' 'restore shop api /tmp/x --confirm shop' 'secrets shop api' 'edge up' 'bash' ''; do
     refuses "ssh-dispatch refuses the verb in '$request'" "refused" dispatch "$request"
 done
-refuses "a key without an environment is refused" "this key has no environment" dispatch "deploy shop api $D64 kit=$SHA40" ''
-refuses "a deploy must name the kit commit it was resolved against" "names the kit commit" dispatch "deploy shop api $D64"
-refuses "a request cannot choose its environment" "the environment is the key's" dispatch "deploy shop api $D64 kit=$SHA40 env=staging"
+refuses "a key without an environment is refused" "this key has no environment" dispatch "deploy shop api $D64 katap=$SHA40" ''
+refuses "a deploy must name the Katap commit it was resolved against" "names the Katap commit" dispatch "deploy shop api $D64"
+refuses "a request cannot choose its environment" "the environment is the key's" dispatch "deploy shop api $D64 katap=$SHA40 env=staging"
 check "nothing refused was handed over" test ! -e "$WORK/dispatched"
 
 # --- smoke check ----------------------------------------------------------------
@@ -405,12 +405,12 @@ kill "$stub_pid" 2>/dev/null || true
 
 # --- contract rules added after review ------------------------------------------
 
-section "kit check: more of the contract"
+section "katap check: more of the contract"
 
 mutate "an added Linux capability" "adds Linux capabilities" '
 import sys; p = sys.argv[1] + "/web.yml"; s = open(p).read()
 open(p, "w").write(s.replace("    mem_limit: 128m\n", "    mem_limit: 128m\n    cap_add: [NET_ADMIN]\n", 1))'
-mutate "another external network" "an external network other than kit-edge" '
+mutate "another external network" "an external network other than katap-edge" '
 import sys; p = sys.argv[1] + "/web.yml"; s = open(p).read()
 s = s.replace("      default: {}\n", "      default: {}\n      blog_default: {}\n", 1)
 open(p, "w").write(s + "  blog_default:\n    external: true\n    name: blog_default\n")'
@@ -445,18 +445,18 @@ check "the SSH key exists only inside the SSH step, removed on exit" \
 check "no step after the SSH step can read a key file" \
     bash -c "! awk '/- name: Public smoke check/,0' '$deploy_yml' | grep -qE 'deploy_key|ssh_dir|SSH_KEY'"
 # shellcheck disable=SC2016 # the literal workflow text is what is matched
-check "the public smoke check runs the kit's smoke check on the resolved URL" \
+check "the public smoke check runs Katap's smoke check on the resolved URL" \
     grep -qF 'run: sh lib/smoke-check.sh "$SMOKE_URL" "$SMOKE_BODY"' "$deploy_yml"
 
 # --- resolve-release.sh -----------------------------------------------------------
 
 section ".github/scripts/resolve-release.sh (stub gh and docker)"
 
-R="$(new_kit)"
-KIT_SRV="$R/srv" "$R/bin/kit" add shop laravel-api api api.shop.test >/dev/null
-KIT_SRV="$R/srv" "$R/bin/kit" add blog nestjs-api api api.blog.test >/dev/null
-KIT_SRV="$R/srv" "$R/bin/kit" add priv spa web priv.test >/dev/null
-KIT_SRV="$R/srv" "$R/bin/kit" add stg laravel-api api api.stg.shop.test >/dev/null
+R="$(new_katap)"
+KATAP_SRV="$R/srv" "$R/bin/katap" add shop laravel-api api api.shop.test >/dev/null
+KATAP_SRV="$R/srv" "$R/bin/katap" add blog nestjs-api api api.blog.test >/dev/null
+KATAP_SRV="$R/srv" "$R/bin/katap" add priv spa web priv.test >/dev/null
+KATAP_SRV="$R/srv" "$R/bin/katap" add stg laravel-api api api.stg.shop.test >/dev/null
 sed -i -e 's|^image=.*|image=ghcr.io/acme/shop-api|' -e 's|^source_repo=.*|source_repo=acme/shop-api|' \
     -e 's|^environment=.*|environment=staging|' "$R/projects/stg/api.conf"
 sed -i -e 's|^image=.*|image=ghcr.io/acme/shop-api|' -e 's|^source_repo=.*|source_repo=acme/shop-api|' "$R/projects/shop/api.conf"
@@ -508,7 +508,7 @@ D8='sha256:8888888888888888888888888888888888888888888888888888888888888888'
 check "a tag is resolved to its digest and the request names it" bash -c "
     $(declare -f resolve); R='$R' STUBS='$STUBS' WORK='$WORK' SHA40='$SHA40'
     resolve production shop api ghcr.io/acme/shop-api:main >/dev/null
-    grep -qxF 'request=deploy shop api ghcr.io/acme/shop-api@$D7 kit=$SHA40' '$WORK/out'"
+    grep -qxF 'request=deploy shop api ghcr.io/acme/shop-api@$D7 katap=$SHA40' '$WORK/out'"
 check "the smoke URL and body come from the component's .conf" \
     bash -c "grep -qxF 'smoke_url=https://api.shop.test/api/health/ready' '$WORK/out' && grep -qxF 'smoke_body=\"status\":\"ready\"' '$WORK/out'"
 refuses "production accepts only a build of main" "no build-provenance attestation" \
@@ -539,7 +539,7 @@ refuses "a migrate image for a component without one is refused" "has no migrate
 check "a nestjs-api tag also names its migrate image" bash -c "
     $(declare -f resolve); R='$R' STUBS='$STUBS' WORK='$WORK' SHA40='$SHA40'
     resolve production blog api ghcr.io/acme/blog-api:main >/dev/null
-    grep -qxF 'request=deploy blog api ghcr.io/acme/blog-api@$D7 migrate=ghcr.io/acme/blog-api-migrate@$D8 kit=$SHA40' '$WORK/out'"
+    grep -qxF 'request=deploy blog api ghcr.io/acme/blog-api@$D7 migrate=ghcr.io/acme/blog-api-migrate@$D8 katap=$SHA40' '$WORK/out'"
 refuses "a nestjs-api digest needs its migrate digest" "also needs migrate_image" \
     resolve production blog api "ghcr.io/acme/blog-api@$D7"
 refuses "runtime and migrate images from different commits are refused" "built from different commits" \
@@ -552,10 +552,10 @@ check "provenance=none deploys without verification, and says so" bash -c "
 
 # --- deploy refusals that need no image ------------------------------------------
 
-section "kit deploy / rollback / cron / backup with a fake docker"
+section "katap deploy / rollback / cron / backup with a fake docker"
 
-refuses "a request resolved against another kit commit is refused" "pull /srv/kit first" \
-    deploy shop api "$D64" "kit=$SHA40"
+refuses "a request resolved against another katap commit is refused" "pull /srv/katap first" \
+    deploy shop api "$D64" "katap=$SHA40"
 refuses "a staging key cannot deploy a production component" "this key deploys staging only" \
     deploy shop api "$D64" env=staging
 
@@ -565,11 +565,11 @@ git -C "$K" -c user.email=t@t -c user.name=t add -A >/dev/null
 git -C "$K" -c user.email=t@t -c user.name=t commit -qm fixture
 HEAD_SHA="$(git -C "$K" rev-parse HEAD)"
 : > "$WORK/pulls"
-deploy shop api "$D64" "kit=$HEAD_SHA" env=production >/dev/null 2>&1 || true
+deploy shop api "$D64" "katap=$HEAD_SHA" env=production >/dev/null 2>&1 || true
 check "a request resolved against this exact, clean checkout is accepted (it reaches the pull)" test -s "$WORK/pulls"
 touch "$K/projects/shop/uncommitted.yml.bak"
 refuses "a checkout with uncommitted project changes is refused" "has uncommitted changes" \
-    deploy shop api "$D64" "kit=$HEAD_SHA"
+    deploy shop api "$D64" "katap=$HEAD_SHA"
 rm -f "$K/projects/shop/uncommitted.yml.bak"
 : > "$WORK/pulls"
 
@@ -596,7 +596,7 @@ esac
 exit 0
 STUB
 chmod +x "$WORK/fake-docker"
-fake() { : > "$WORK/fake.log"; KIT_DOCKER="$WORK/fake-docker" kit "$@"; }
+fake() { : > "$WORK/fake.log"; KATAP_DOCKER="$WORK/fake-docker" katap "$@"; }
 
 # History: A, B and C deployed; rolled back to B, which is serving.
 rel() { printf 'ghcr.io/acme/shop-api@sha256:%064d' "$1"; }
@@ -609,24 +609,24 @@ mkdir -p "$K/srv/state/shop"
 } > "$K/srv/state/shop/history"
 echo "IMAGE_API=$(rel 11)" > "$K/srv/state/shop/images.env"
 refuses "a second rollback goes further back, never forward to what was rolled away from" "could not pull $(rel 10)" \
-    env FAKE_PULL_FAIL=1 KIT_DOCKER="$WORK/fake-docker" KIT_SRV="$K/srv" "$K/bin/kit" rollback shop api
+    env FAKE_PULL_FAIL=1 KATAP_DOCKER="$WORK/fake-docker" KATAP_SRV="$K/srv" "$K/bin/katap" rollback shop api
 refuses "a rollback names only a release this host has deployed" "was never deployed here" \
     fake rollback shop api "$(rel 99)"
 echo "IMAGE_API=$(rel 10)" > "$K/srv/state/shop/images.env"
 refuses "the first release has nothing before it" "no earlier release" fake rollback shop api
 
-check "kit run finds a service whatever line compose prints it on" \
+check "katap run finds a service whatever line compose prints it on" \
     env FAKE_SLOW_SERVICES="api-scheduler api-redis api-db api-artisan api-migrate api-permissions api-worker api" \
-        KIT_DOCKER="$WORK/fake-docker" KIT_SRV="$K/srv" "$K/bin/kit" run shop api-scheduler
+        KATAP_DOCKER="$WORK/fake-docker" KATAP_SRV="$K/srv" "$K/bin/katap" run shop api-scheduler
 : > "$WORK/fake.log"
 refuses "a released component whose database is down is not deployed without a dump" "the pre-deploy dump failed" \
-    env FAKE_DB_DOWN=1 KIT_DOCKER="$WORK/fake-docker" KIT_SRV="$K/srv" "$K/bin/kit" deploy shop api "$D64"
+    env FAKE_DB_DOWN=1 KATAP_DOCKER="$WORK/fake-docker" KATAP_SRV="$K/srv" "$K/bin/katap" deploy shop api "$D64"
 check "…and no migration ran" bash -c "! grep -q 'run --rm api-migrate' '$WORK/fake.log'"
-check "kit cron runs each scheduler without starting its dependencies" fake cron shop
+check "katap cron runs each scheduler without starting its dependencies" fake cron shop
 check "…as 'run --rm --no-deps api-scheduler'" grep -q 'run --rm --no-deps api-scheduler' "$WORK/fake.log"
 exec 5>"$K/srv/state/shop/.lock"
 flock 5
-check "kit cron skips a minute while the project is busy" fake cron shop
+check "katap cron skips a minute while the project is busy" fake cron shop
 check "…and runs nothing" bash -c "! grep -q ' run ' '$WORK/fake.log'"
 exec 5>&-
 
@@ -634,7 +634,7 @@ cp -R "$K/projects/shop" "$K/projects/shop2"
 mkdir -p "$K/srv/state/shop2"
 echo "IMAGE_API=$(rel 10)" > "$K/srv/state/shop2/images.env"
 refuses "one project's failed dump fails the nightly run" "the backup of 'shop' failed" \
-    env FAKE_DUMP_FAIL=shop KIT_DOCKER="$WORK/fake-docker" KIT_SRV="$K/srv" "$K/bin/kit" backup --all
+    env FAKE_DUMP_FAIL=shop KATAP_DOCKER="$WORK/fake-docker" KATAP_SRV="$K/srv" "$K/bin/katap" backup --all
 check "…but every other project is still dumped" test -n "$(find "$K/srv/backups/shop2" -name 'api-*-scheduled.dump')"
 check "…with the release it was taken from beside it" \
     bash -c "grep -qxF 'IMAGE_API=$(rel 10)' \"\$(find '$K/srv/backups/shop2' -name 'api-*-scheduled.dump.images')\""
@@ -643,8 +643,8 @@ check "…with the release it was taken from beside it" \
 for t in 1 2 3; do
     touch "$K/srv/backups/shop2/api-29990101T00000${t}Z-predeploy.dump" "$K/srv/backups/shop2/api-29990101T00000${t}Z-predeploy.dump.images"
 done
-for _ in $(seq 1 3); do KIT_DOCKER="$WORK/fake-docker" KIT_BACKUP_KEEP=2 kit backup shop2 >/dev/null 2>&1; sleep 1; done
-check "retention keeps KIT_BACKUP_KEEP nightly dumps however many deploys came after them" \
+for _ in $(seq 1 3); do KATAP_DOCKER="$WORK/fake-docker" KATAP_BACKUP_KEEP=2 katap backup shop2 >/dev/null 2>&1; sleep 1; done
+check "retention keeps KATAP_BACKUP_KEEP nightly dumps however many deploys came after them" \
     test "$(find "$K/srv/backups/shop2" -name 'api-*-scheduled.dump' | wc -l)" -eq 2
 check "…and leaves the other kinds alone" \
     test "$(find "$K/srv/backups/shop2" -name 'api-29990101*-predeploy.dump' | wc -l)" -eq 3
@@ -652,7 +652,7 @@ rm -rf "$K/projects/shop2" "$K/srv/state/shop2"
 
 # --- ssh-dispatch detaches from the session --------------------------------------
 
-section "kit ssh-dispatch outlives its SSH session"
+section "katap ssh-dispatch outlives its SSH session"
 
 cat > "$WORK/slow-self" <<STUB
 #!/usr/bin/env bash
@@ -664,11 +664,11 @@ STUB
 chmod +x "$WORK/slow-self"
 rm -f "$WORK/detached-done"
 # `head -n 1` closes the pipe after the first line: the session is gone.
-(SSH_ORIGINAL_COMMAND="deploy shop api $D64 kit=$SHA40" KIT_SELF="$WORK/slow-self" KIT_SRV="$K/srv" "$K/bin/kit" ssh-dispatch production | head -n 1 >/dev/null) || true
+(SSH_ORIGINAL_COMMAND="deploy shop api $D64 katap=$SHA40" KATAP_SELF="$WORK/slow-self" KATAP_SRV="$K/srv" "$K/bin/katap" ssh-dispatch production | head -n 1 >/dev/null) || true
 for _ in $(seq 1 100); do [ -e "$WORK/detached-done" ] && break; sleep 0.1; done
 check "the deploy finishes after the session is closed" test -e "$WORK/detached-done"
 check "the session receives the deploy's exit status" \
-    bash -c "SSH_ORIGINAL_COMMAND='deploy shop api $D64 kit=$SHA40' KIT_SELF='$WORK/slow-self' SLOW_EXIT=3 KIT_SRV='$K/srv' '$K/bin/kit' ssh-dispatch production >/dev/null 2>&1; [ \$? = 3 ]"
+    bash -c "SSH_ORIGINAL_COMMAND='deploy shop api $D64 katap=$SHA40' KATAP_SELF='$WORK/slow-self' SLOW_EXIT=3 KATAP_SRV='$K/srv' '$K/bin/katap' ssh-dispatch production >/dev/null 2>&1; [ \$? = 3 ]"
 check "each dispatch leaves its log, readable by the deploy user only" \
     test "$(stat -c %a "$(find "$K/srv/state/dispatch" -name '*.log' -size +0 | head -n1)")" = 600
 

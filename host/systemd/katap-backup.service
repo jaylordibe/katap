@@ -1,18 +1,18 @@
 [Unit]
-Description=kit: dump every project database
+Description=katap: dump every project database
 After=docker.service
 Requires=docker.service
 
 [Service]
 Type=oneshot
 User=deploy
-# KIT_BACKUP_KEEP (dumps kept per component, default 14) and KIT_RCLONE_REMOTE (an
+# KATAP_BACKUP_KEEP (dumps kept per component, default 14) and KATAP_RCLONE_REMOTE (an
 # rclone remote for an off-host copy, e.g. b2:my-bucket/backups) go here.
-EnvironmentFile=-/etc/kit/kit.env
+EnvironmentFile=-/etc/katap/katap.env
 # Every project is attempted even when one fails; the unit then fails, which
 # `systemctl --failed` and the journal show. Bounded, so a stuck dump cannot keep
 # the unit active and silently skip the following nights.
 TimeoutStartSec=4h
-ExecStart=/srv/kit/bin/kit backup --all
+ExecStart=/srv/katap/bin/katap backup --all
 # Release images no longer serving: a rollback pulls its image again by digest.
 ExecStartPost=-/usr/bin/docker image prune --all --force --filter until=336h

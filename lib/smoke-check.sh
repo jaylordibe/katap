@@ -5,7 +5,7 @@
 #
 #   lib/smoke-check.sh <url> [<body>]
 #
-# The single definition both checks use: `kit deploy` runs it inside a pinned curl
+# The single definition both checks use: `katap deploy` runs it inside a pinned curl
 # container on the project network, and the Deploy workflow runs it on the runner
 # against the public URL. POSIX sh, so it runs in both. tests/run.sh exercises it
 # against a stub server.

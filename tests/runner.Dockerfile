@@ -1,4 +1,4 @@
-# The environment tests/run.sh runs in: the tools the kit needs on a host (bash 5,
+# The environment tests/run.sh runs in: the tools Katap needs on a host (bash 5,
 # flock, jq, openssl, the Docker CLI and Compose) plus shellcheck and python3 for the
 # stub server. Running every test in it means a developer's macOS bash 3.2 or
 # missing flock can never make a test pass or fail differently from the server.

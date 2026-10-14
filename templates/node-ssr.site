@@ -1,5 +1,5 @@
 # __C__ (node-ssr)
 __DOMAINS__ {
-	import kit_site
-	import kit_proxy __UPSTREAM__
+	import katap_site
+	import katap_proxy __UPSTREAM__
 }
