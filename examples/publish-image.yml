@@ -4,8 +4,9 @@
 # by exactly that file path.
 #
 # It builds, scans and publishes; it never deploys and holds no server
-# credential. jaylordibe/laravel-api and jaylordibe/nestjs-api carry their own
-# adapted copy (their test and security gates in front of it).
+# credential. jaylordibe/laravel-api and jaylordibe/nestjs-api ship their own
+# publish workflow, deployer-neutral: add the staging-dispatch step below to it
+# if you want a staging push to start a deploy here.
 #
 # Order matters: the image is pushed under its immutable sha-<commit> tag, scanned
 # by digest, and only then given the provenance attestation and the moving branch

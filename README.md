@@ -124,7 +124,7 @@ DNS at the server; Caddy obtains certificates on the first request.
 
 **In each application repository:**
 
-- `laravel-api` and `nestjs-api` ship `.github/workflows/publish-image.yml`.
+- `laravel-api` and `nestjs-api` ship `.github/workflows/publish-image.yml`. It does not know about this kit; to have a staging push start a deploy here, add the dispatch step from `examples/publish-image.yml`.
 - For anything else, copy `examples/publish-image.yml` to that path. The path matters: the deploy verifies the attestation came from it.
 
 Set the repository variable `PUBLISH_ENABLED=true`. Every push to `main` or `staging` then:
@@ -161,7 +161,7 @@ Get `DEPLOY_KNOWN_HOSTS` once, from the server itself:
 **Deploy:** Actions → Deploy → Run workflow → environment, project, component, image
 (`ghcr.io/you/shop-api:main`, resolved to its digest before anything runs; for a
 nestjs-api the same tag names its migrate image). A `staging` push can also start
-its own staging deploy (`DEPLOY_DISPATCH_*` in the publish workflows); production
+its own staging deploy (`DEPLOY_DISPATCH_*` in `examples/publish-image.yml`); production
 always waits for its reviewers. The host refuses a request resolved against a
 different commit of this repository than its own checkout, so `git pull` on the
 server after merging project changes.
