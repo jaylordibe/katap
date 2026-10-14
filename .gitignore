@@ -1,3 +1,5 @@
 .idea
 .DS_Store
 tests/.work
+# Project definitions live on the server (/srv/projects), never in the tool.
+/projects/

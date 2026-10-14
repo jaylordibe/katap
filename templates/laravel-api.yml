@@ -11,7 +11,7 @@
 #   __C__-db           PostgreSQL with TLS (app:check-config refuses sslmode disable)
 #   __C__-redis        cache, queue, locks, rate limits
 #
-# Copied into projects/<project>/ by `katap add`; edit it there per project.
+# Copied into /srv/projects/<project>/ by `katap add`; edit it there per project.
 
 x-__C__-logging: &__C__-logging
   driver: json-file

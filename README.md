@@ -44,13 +44,14 @@ properly.
 | `git pull` and rebuild on the server | **Images built and scanned in CI**, deployed by immutable digest |
 | A failed migration leaves a half-deployed app | **Dump → migrate → roll out → smoke check**, rolling back automatically on failure |
 | Backups are a cron line someone meant to add | **Nightly and pre-deploy dumps**, with a restore that puts the matching release back too |
-| A CI key that can do anything on the box | **A forced-command SSH key** that can only deploy its own environment's components |
+| A CI key that can do anything on the box | **One SSH key per app**, able to deploy only that app's component, and only images the server verified were built by that app's own CI |
 
-**Not a platform.** No dashboard, no daemon, no database of its own: one Bash
-CLI, Docker Compose, Caddy and systemd timers. Your projects are plain files in
-this repository, reviewed like any other code. If you'd rather operate a
-platform with a UI, Coolify and Dokku do this job too; Katap is for people who want
-to read every line that runs on their server.
+**A tool, not a platform.** You clone it onto a server as-is and update it by
+checking out a newer release; nothing about your projects lives in it. No
+dashboard, no daemon, no database of its own: one Bash CLI, Docker Compose, Caddy
+and systemd timers. If you'd rather operate a platform with a UI, Coolify and
+Dokku do this job too; Katap is for people who want to read every line that runs
+on their server.
 
 ## How it works
 
@@ -58,12 +59,11 @@ to read every line that runs on their server.
 flowchart LR
     subgraph app["Each app repository"]
         P["publish-image.yml<br/>test · build · scan · attest"]
+        D["deploy.yml<br/>uses: jaylordibe/katap"]
     end
     REG[("Container registry<br/>(GHCR)")]
-    subgraph katap["Your copy of Katap"]
-        D["Deploy workflow<br/>verify provenance"]
-    end
     subgraph server["Your server"]
+        K["katap<br/>verifies provenance"]
         E["Caddy edge<br/>:80 :443"]
         subgraph A["project: shop"]
             A1["api"] --- A2[("postgres")]
@@ -78,17 +78,19 @@ flowchart LR
     U(("Users")) --> E
     E --> A1 & A4 & B1
     P -- "push :sha-commit" --> REG
-    D -- "SSH: deploy by digest" --> server
-    REG -. "pull by digest" .-> server
+    D -- "SSH: deploy by digest" --> K
+    REG -. "pull by digest" .-> K
+    K -- "rolls out" --> A1 & B1
 ```
-
-Three parties, three different credentials:
 
 | | Does | Holds |
 |---|---|---|
-| **Application repository** | Tests, builds, scans and publishes its image with a build-provenance attestation. Never deploys. | Push access to its own image |
-| **Your copy of Katap** | Defines your projects (`projects/`) and deploys: the Deploy workflow resolves a tag to a digest, verifies it was attested by that app's own publish workflow, then asks the server to run it. | The SSH key for each environment |
-| **The server** | Pulls by digest and runs `katap deploy`. | Read access to images |
+| **Each application repository** | Tests, builds, scans and publishes its image with a build-provenance attestation (`publish-image.yml`), then asks the server to deploy it (`deploy.yml`, using the Katap action) | Push access to its own image; its own deploy key, in its own GitHub environments |
+| **The server** | Holds every project's definition (`/srv/projects`) and secrets, verifies each image's provenance against those definitions, then pulls it by digest and deploys it | A read-only GitHub token; read access to images |
+
+The server decides what may run. Each app's key can only name its own
+component, and the server deploys nothing it cannot trace to that app's own
+publish workflow, whoever holds the key.
 
 A **project** is a set of **components**, and a component is a container image.
 Katap doesn't care what built it. It ships templates for:
@@ -100,8 +102,8 @@ Katap doesn't care what built it. It ships templates for:
 | `spa` | Angular, React, Vue, … built to static files | — |
 | `node-ssr` | Next.js, Nuxt, SvelteKit, Remix, … | — |
 
-The templates are copied into your project, not referenced, so each project can
-change memory limits or add a worker without affecting the others.
+`katap add` copies a template into the project, so each project can change memory
+limits or add a worker without affecting the others.
 
 ### What a deploy does
 
@@ -109,27 +111,30 @@ Every step either succeeds or leaves the current release serving.
 
 | Step | What happens | If it fails |
 |---|---|---|
+| **Admit** | The key's forced command allows only its own component; one dispatch of a component at a time, and not again within a minute of the last | Refused; nothing changed |
 | **Validate** | The digest belongs to the component's `image=`; no required secret is blank | Refused; nothing changed |
+| **Verify** | `gh attestation verify`: built by the component's `source_repo`'s `publish-image.yml`, from `main` for production; runtime and migrate images from one commit | Refused; nothing changed |
 | **Pull** | `docker pull` by digest | Nothing changed |
 | **Dump** | `pg_dump` of the component's database, kept with the nightly dumps | Refused; nothing changed |
 | **Migrate** | One-shots in order — Laravel: `migrate`, then `permissions`; Nest: the migrate image (Prisma deploy + RBAC sync) | The current release keeps serving |
 | **Roll out** | Services recreated in order (Laravel: worker, then API), waiting for each healthcheck; Caddy holds requests across the swap | **Automatic rollback** to the previous release |
 | **Smoke check** | An HTTP check from inside the project network: 200, the expected body, no redirects followed | **Automatic rollback** |
-| **Record** | The release joins the history; the edge reloads | A bad site file is a warning; the release is serving |
+| **Record** | The release joins the project's history | — |
 
-The workflow then checks the public URL with the same smoke check. The deploy
-runs detached on the server, so a cancelled workflow or a dropped connection
-never stops it halfway; its log is in `/srv/state/dispatch/`.
+The action then checks the public URL with the same smoke check. The deploy runs
+detached on the server, so a cancelled workflow or a dropped connection never
+stops it halfway; its log is in `/srv/state/.dispatch/<project>/`.
 
 <details>
 <summary><b>What a deploy looks like</b> — illustrative shape, not captured output</summary>
 
 ```text
-Actions → Deploy → production · shop · api · ghcr.io/you/shop-api:main
+Actions → Deploy → production · tag main          (in the shop-api repository)
 
   ── waits for a production reviewer ──
   resolve     ghcr.io/you/shop-api:main → sha256:9f2c…
-  verify      attested by you/shop-api/.github/workflows/publish-image.yml @ main
+  ssh         deploy shop api ghcr.io/you/shop-api@sha256:9f2c…
+  verify      built by you/shop-api at 1a2b3c4d5e6f (publish-image.yml @ main)
   pull        ghcr.io/you/shop-api@sha256:9f2c…
   dump        /srv/backups/shop/api-20261014T091005Z-predeploy.dump
   migrate     migrate ✓  permissions ✓
@@ -164,11 +169,8 @@ costs:
 
 ## Quick start
 
-Katap is not a service you sign up for: you run **your own copy** of this
-repository. Your copy holds your project definitions, and its GitHub
-environments hold the keys that deploy to your server, so each person or team
-keeps their own. In the commands below, `<you>` is your GitHub account or
-organisation, and `<server>` is your server's address.
+In the commands below, `<you>` is your GitHub account or organisation, and
+`<server>` is your server's address.
 
 ### What you need
 
@@ -176,129 +178,116 @@ organisation, and `<server>` is your server's address.
   and your SSH key, sized with the [memory table](#is-one-server-right-for-you)
   above.
 - **A domain** whose DNS you can edit.
-- **On your machine:** git, Docker, `jq`, and **bash 4 or newer**. macOS ships
-  bash 3.2, so install a newer one first: `brew install bash jq`.
+- **Each application** in a GitHub repository that can publish its image to a
+  registry (GHCR by default).
 
-### 1. Make your copy
-
-Create an **empty** repository named `katap` under your account on GitHub
-(public or private; no README, licence or `.gitignore`), then:
-
-```bash
-git clone https://github.com/jaylordibe/katap.git && cd katap
-git remote rename origin upstream
-git remote add origin git@github.com:<you>/katap.git
-git push -u origin main
-```
-
-Keeping `upstream` lets you [pull in Katap updates](#updating-katap) later. Your
-copy holds no secrets, but it does name your domains and image repositories, so
-make it private if you'd rather not publish those.
-
-### 2. Prepare the server
-
-On the server:
+### 1. Install Katap on the server
 
 ```bash
 sudo apt-get update && sudo apt-get install -y git
+sudo git clone --branch v1.0.0 https://github.com/jaylordibe/katap.git /srv/katap
+sudo /srv/katap/host/provision.sh --harden-ssh
 ```
 
-**If your copy is public**, clone it:
+Use the [latest release](https://github.com/jaylordibe/katap/releases) in place of
+`v1.0.0`; never run a server from `main`.
+
+`provision.sh` installs Docker with log rotation, the GitHub CLI, a firewall (22, 80,
+443), unattended security upgrades, a swap file, the `deploy` user and the timers,
+writes this server's edge settings to `/srv/edge/edge.env`, then starts the edge. It is safe to run again: it never touches project data,
+secrets or running containers. `--harden-ssh` turns off password login; it refuses
+unless an authorised SSH key already exists for you or root, so it cannot lock you
+out.
+
+Then give the server a GitHub token to verify images with. Create a
+[fine-grained token](https://github.com/settings/personal-access-tokens/new) with
+**read-only access to public repositories** (or **Attestations: read** on private
+ones), and put it in `/etc/katap/katap.env`:
 
 ```bash
-sudo git clone https://github.com/<you>/katap.git /srv/katap
+sudo nano /etc/katap/katap.env      # KATAP_GH_TOKEN=github_pat_…
 ```
 
-**If your copy is private**, give the server its own read-only key instead.
-`provision.sh` reuses a `deploy` user that already exists:
-
-```bash
-sudo useradd --create-home --shell /bin/bash deploy
-sudo -u deploy ssh-keygen -t ed25519 -N '' -f /home/deploy/.ssh/id_ed25519
-sudo cat /home/deploy/.ssh/id_ed25519.pub
-# add that key to your copy: Settings → Deploy keys → Add deploy key (leave write access off)
-sudo install -d -o deploy -g deploy /srv/katap
-sudo -u deploy git clone git@github.com:<you>/katap.git /srv/katap
-```
-
-Then, **on your machine**, create one CI key per environment this server will
-host:
-
-```bash
-ssh-keygen -t ed25519 -N '' -f ci_production
-ssh-keygen -t ed25519 -N '' -f ci_staging
-```
-
-and, **on the server**, provision it with their public halves (paste the
-contents of each `.pub` file):
-
-```bash
-sudo /srv/katap/host/provision.sh --ci-key "ssh-ed25519 AAAA… ci_production" --ci-env production --harden-ssh
-sudo /srv/katap/host/provision.sh --ci-key "ssh-ed25519 AAAA… ci_staging" --ci-env staging
-```
-
-`provision.sh` installs Docker with log rotation, a firewall (22, 80, 443),
-unattended security upgrades, a swap file, the `deploy` user and the timers, then
-starts the edge. It is safe to run again: it never touches project data, secrets
-or running containers. `--harden-ssh` turns off password login; it refuses unless
-an authorised SSH key already exists for you or root, so it cannot lock you out. If your images are private, log the
-deploy user in to the registry with a token that can only read packages:
+If your images are private, also log the deploy user in to the registry with a
+token that can only read packages:
 `sudo -u deploy docker login ghcr.io -u <you> --password-stdin`.
 
-### 3. Connect GitHub to the server
+### 2. Define a project
 
-In your copy on GitHub, follow [Securing the deploy path](#securing-the-deploy-path):
-protect `main`, create the `production` and `staging` environments, and add
-their secrets. **Do this before the first deploy.** Your copy's Deploy workflow
-holds the keys to your server.
-
-### 4. Define a project
-
-On your machine, in your copy:
+On the server, as the deploy user:
 
 ```bash
+sudo -iu deploy
+cd /srv/katap
 bin/katap add shop laravel-api api api.shop.com
 bin/katap add shop spa web shop.com www.shop.com
 ```
 
-In `projects/shop/api.conf` and `web.conf`, set `image=` (`ghcr.io/<you>/shop-api`)
-and `source_repo=` (`<you>/shop-api`); a `nestjs-api` also needs `image_migrate=`.
-Components are `environment=production` by default; a staging copy is its own
-project (`shop-staging`) with `environment=staging`. Run `bin/katap check shop`,
-then commit and push to `main`.
+This writes `/srv/projects/shop/`. In each component's `.conf` there, set:
 
-### 5. Generate the project's secrets
+| Key | Value |
+|---|---|
+| `image=` | The image repository, e.g. `ghcr.io/<you>/shop-api` |
+| `source_repo=` | The GitHub repository that builds it, e.g. `<you>/shop-api` |
+| `image_migrate=` | nestjs-api only: `ghcr.io/<you>/shop-api-migrate` |
+| `environment=` | `production` (default) or `staging`. A staging copy is its own project, e.g. `shop-staging` |
 
-On the server, as the deploy user, once per component:
+Then generate its secrets, once per component, and fill in what only you know:
 
 ```bash
-sudo -iu deploy
-cd /srv/katap && git pull
 bin/katap secrets shop api     # APP_KEY, Passport keys, database and Redis passwords
 bin/katap secrets shop web
-nano /srv/secrets/shop/api.env # fill every value marked '# katap:required'
+nano /srv/secrets/shop/api.env # every value marked '# katap:required': frontend URL, CORS, mail…
+bin/katap check shop
+bin/katap edge reload          # serve the new domains
 ```
 
-The required values are the ones only you know, such as the frontend URL, CORS
-origins and mail settings. `katap secrets` never overwrites existing files, and
-a deploy refuses while a required value is empty.
+`katap secrets` never overwrites existing files, and a deploy refuses while a
+required value is empty. Point each domain's **A record** at the server (no AAAA
+record: the edge is IPv4 only); Caddy obtains the certificate on the first request.
 
-### 6. Publish your images
+### 3. Give each application its deploy key
 
-In each application repository: `laravel-api` and `nestjs-api` already ship
-`.github/workflows/publish-image.yml`. For anything else, copy
-[`examples/publish-image.yml`](examples/publish-image.yml) to that exact path
-(the deploy checks the attestation came from it). Set the repository variable
-`PUBLISH_ENABLED=true`. Every push to `main` or `staging` then pushes
-`:sha-<commit>`, scans that digest, attests it, and only then moves `:<branch>`.
+For each application repository and environment, create a key **on your machine**:
 
-### 7. Deploy
+```bash
+ssh-keygen -t ed25519 -N '' -f shop-api-production
+```
 
-Point each domain's **A record** at the server (no AAAA record: the edge is
-IPv4 only). Then, in your copy on GitHub: **Actions → Deploy → Run workflow**,
-choosing the environment, project, component and image
-(`ghcr.io/<you>/shop-api:main`). Caddy obtains the certificate on the first
-request.
+and authorise its public half **on the server**, bound to that one component:
+
+```bash
+sudo /srv/katap/host/provision.sh --ci-key "ssh-ed25519 AAAA… shop-api-production" \
+    --ci-env production --ci-project shop --ci-component api
+```
+
+That key can now deploy or roll back `shop/api` in production, and nothing else.
+
+### 4. Publish and deploy from the application repository
+
+In the application repository:
+
+1. **Publish.** `laravel-api` and `nestjs-api` already ship
+   `.github/workflows/publish-image.yml`. For anything else, copy
+   [`examples/publish-image.yml`](examples/publish-image.yml) to that exact path:
+   the server checks the attestation came from it. Set the repository variable
+   `PUBLISH_ENABLED=true`.
+2. **Deploy.** Copy [`examples/deploy.yml`](examples/deploy.yml) to
+   `.github/workflows/deploy.yml`, and replace the all-zero commit with the commit
+   of the Katap release you run (see [Securing the deploy path](#securing-the-deploy-path)).
+3. **Configure** the `production` and `staging` environments as that file's header
+   lists: the secrets `KATAP_HOST`, `KATAP_SSH_KEY` (the whole private key file from
+   step 3) and `KATAP_KNOWN_HOSTS`, and the variables `KATAP_PROJECT`,
+   `KATAP_COMPONENT` and `KATAP_IMAGE`; a nestjs-api also needs
+   `KATAP_MIGRATE_IMAGE`, and `KATAP_URL` adds a public check after each deploy. Get `KATAP_KNOWN_HOSTS` on the server itself:
+   `ssh-keyscan -t ed25519 localhost | sed "s/^localhost/<server>/"`. Then delete
+   the private key from your machine.
+
+A push to `staging` now publishes and deploys to staging: the example's
+`workflow_run` trigger must list your publish workflow's exact `name:`, and
+`deploy.yml` must be on the default branch, where GitHub reads `workflow_run`
+triggers. For production:
+**Actions → Deploy → Run workflow → production**, and a reviewer approves.
 
 **First deploy only:**
 
@@ -313,39 +302,25 @@ request.
 
 ## Securing the deploy path
 
-Your copy holds the deploy keys, so whoever can change its `main` can deploy
-anything to your server. In your copy's settings on GitHub:
+The server already refuses anything an app's key is not bound to, and any image it
+cannot trace to that app's own publish workflow. What it cannot see is who
+approved a deploy, so each application repository protects its own:
 
-1. **A ruleset on `main`** (Settings → Rules): require a pull request, block force
-   pushes and deletion, and allow **no bypass** — not even for yourself.
-2. **Environments** `production` and `staging` (Settings → Environments), each
-   accepting deployments from `main` only.
-3. **Required reviewers on production**, so every production deploy is a person
-   approving it.
-4. **Each environment's secrets:**
+1. **Pin the Katap action by commit**, never by a tag:
+   `uses: jaylordibe/katap@<40-character commit> # v1.0.0`. The action receives the
+   deploy key, and a tag can be moved. It runs no other action, so that commit is
+   all the code it runs. Dependabot can propose newer commits; merge one only
+   after your server runs that release (see [Updating Katap](#updating-katap)).
+2. **Required reviewers on `production`**, with "Prevent self-review" on, and
+   deployment branches limited to `main`.
+3. **A ruleset on `main`**: require a pull request, block force pushes, no bypass.
+   Whoever can change the deploy workflow on `main` can use the key.
 
-   | Secret | Value |
-   |---|---|
-   | `DEPLOY_HOST` | The server's address |
-   | `DEPLOY_USER` | `deploy` |
-   | `DEPLOY_SSH_KEY` | The **private** CI key for that environment: the whole contents of `ci_production` or `ci_staging` |
-   | `DEPLOY_KNOWN_HOSTS` | The server's host key, taken on the server itself: `ssh-keyscan -t ed25519 localhost \| sed "s/^localhost/<server>/"` |
-   | `REGISTRY_READ_TOKEN` | Optional: a token that can read your images, if they are private |
-   | `ATTESTATION_READ_TOKEN` | Optional: a token that can read your app repositories' attestations, if those are private |
-
-   Then delete the CI private keys from your machine; GitHub now holds them.
-
-**Optional staging auto-deploy.** An app repository can start a staging deploy
-after it publishes: add the dispatch step from
-[`examples/publish-image.yml`](examples/publish-image.yml), with a fine-grained
-token holding **only Actions: write** on your copy. That token can start the
-Deploy workflow but cannot change a file there, and production still waits for
-its reviewers.
-
-**Private app repositories.** Attestations need a public repository or a GitHub
-plan that offers them on private ones (set `ATTEST_PROVENANCE=true`). Without
-them, set `provenance=none` in the component's `.conf`: the Deploy workflow then
-trusts anything pushed to that image repository, and says so on every run.
+**Private application repositories.** Attestations need a public repository or a
+GitHub plan that offers them on private ones (set `ATTEST_PROVENANCE=true` in the
+publish workflow). Without them, set `provenance=none` in the component's `.conf`:
+the server then deploys anything pushed to that image repository, and logs a
+warning on every deploy.
 
 ## Day to day
 
@@ -359,13 +334,13 @@ Run on the server as the deploy user (`sudo -iu deploy`), from `/srv/katap`.
 | Back up now | `bin/katap backup shop` — nightly by timer; keeps 14 of each kind per component (`KATAP_BACKUP_KEEP`) |
 | Off-server copies | Install rclone and set `KATAP_RCLONE_REMOTE=remote:bucket/path` in `/etc/katap/katap.env`; use an rclone `crypt` remote, because dumps hold personal data |
 | Restore | `bin/katap restore shop api /srv/backups/shop/<file>.dump --confirm shop` |
-| Add a domain / change a site | In your copy: edit `projects/<project>/site.caddy`, commit, push. On the server: `git pull`, `bin/katap edge reload` |
-| Change the TLS mode | In your copy: edit `edge/edge.env`, commit, push. On the server: `git pull`, `bin/katap edge up` |
+| Add a domain / change a site | Edit `/srv/projects/<project>/site.caddy`, then `bin/katap edge reload` |
+| Change the TLS mode or edge address | Set it in `/srv/edge/edge.env` (it overrides `edge/edge.env` key by key), then `bin/katap edge up` |
 | Scheduled work | Each project's per-minute run is cut off after 10 minutes (`KATAP_CRON_TIMEOUT`); put long work on the queue |
 
-Never edit files in `/srv/katap` on the server: change your copy, push, and
-`git pull` on the server. A deploy refuses to run when the server's checkout has
-local changes or differs from the commit the workflow ran from.
+Your projects live in `/srv/projects`, outside the tool: back that directory up
+with `/srv/secrets`, or keep it in a repository of your own. Never edit files in
+`/srv/katap`: a deploy refuses to run while the tool has local modifications.
 
 ### Restoring
 
@@ -387,7 +362,7 @@ Never with the application serving in between:
 
 1. `docker compose -p <project> stop <component> <component>-worker`;
 2. `bin/katap backup <project>`;
-3. change the image in `projects/<project>/<component>.yml`, commit, pull;
+3. change the image in `/srv/projects/<project>/<component>.yml`;
 4. `docker volume rm <project>_<component>-db`;
 5. `docker compose -p <project> up -d <component>-db` (the database alone);
 6. `bin/katap restore <project> <component> <that dump> --confirm <project>`, which
@@ -404,12 +379,21 @@ step stops the database rather than serving an empty one.
 |---|---|
 | **Exposure** | Only 22, 80 and 443 are open, and only Caddy publishes. Each project's database and Redis sit on that project's private network; another project cannot even resolve their names |
 | **Secrets** | Generated once on the server, mode 0600, never in git, never regenerated. The database superuser password is readable only by the database container; the app connects as a non-superuser role that owns its database |
-| **Supply chain** | Images are scanned in CI, deployed by digest, and their build provenance is verified before deploy. Caddy, PostgreSQL, Redis and the smoke-check image are pinned by digest |
-| **CI access** | Each CI key is `restrict,command="katap ssh-dispatch <environment>"`: it can deploy, or roll back to a release this server has served, only components of its own environment, with validated arguments, and nothing else |
+| **Supply chain** | Images are scanned in CI and deployed by digest. **The server verifies each image's build provenance itself**, against its own project settings, before pulling anything. Caddy, PostgreSQL, Redis and the smoke-check image are pinned by digest |
+| **Deploy keys** | One per application and environment: `restrict,command="katap ssh-dispatch <environment> <project> <component>"`. It can deploy its own component, or roll it back to a release this server has served, with validated arguments, one at a time, and nothing else. Each dispatch is logged with the key's binding and the client address |
 | **Destructive operations** | None are automated. Nothing drops a volume, regenerates a key or runs a fresh migration. `restore` is human-only, needs `--confirm`, and dumps first |
 
 **Known limits** — accepted as residual risk:
 
+- **Approval lives in each application repository.** The server bounds *what* can
+  deploy (that app's attested builds, `main` for production), not *who approved it*.
+  Any attested build of `main` qualifies, including an older one: a key holder can
+  move a component back to an earlier `main` build, migrations included.
+- **Components of one project share its lock.** A deploy key can delay the other
+  components of its own project (by at most one deploy at a time, a minute apart,
+  however many components it is bound to), never another project's. Keep staging
+  in its own project.
+- **The server holds a GitHub token.** Keep it read-only and fine-grained.
 - **IPv4 only.** The edge publishes no IPv6 port; publish no AAAA record.
 - **The `deploy` user is root-equivalent** through the `docker` group. Protect its keys.
 - **Public components share the edge network**, so one project's public service
@@ -422,17 +406,24 @@ step stops the database rather than serving an empty one.
 
 ## Updating Katap
 
-Your copy keeps this repository as `upstream`. To take a new version:
+**Upgrade the server first, then the applications.** The action and the server
+speak through one request (`deploy <project> <component> <digest> [migrate=<digest>]`);
+a server accepts requests from actions of its own release and earlier releases of
+the same major version, and refuses anything it does not recognise, loudly. On the
+server:
 
 ```bash
-git pull upstream main     # your projects/ never conflict: upstream ships it empty
-git push origin main       # through a pull request, if main is protected
+cd /srv/katap
+sudo -u deploy git fetch --tags
+sudo -u deploy git checkout v1.1.0       # the release you are moving to
+sudo /srv/katap/host/provision.sh        # if the release notes say so
 ```
 
-Then `git pull` on the server, because a deploy refuses to run when the server's
-checkout differs from the commit the workflow ran from. Read the commit log before
-updating: a change to `edge/`, `host/` or a template you copied may need you to
-re-run `provision.sh`, `bin/katap edge up`, or edit your project's compose files.
+Your projects, secrets and data are outside the tool, so a release replaces only
+Katap itself. Read the release notes first: a change to a template affects only
+projects added after it, and a change to `edge/` takes effect at
+`bin/katap edge up`. Then update the action's pinned commit in each application
+repository to the same release.
 
 ## Contributing
 
@@ -447,19 +438,19 @@ changes a deploy.
 
 ```text
 bin/katap                      the CLI (bash 5; runs on the server)
-edge/                          the shared Caddy: compose.yml, Caddyfile, edge.env
+action.yml, action/            the deploy action applications use
+edge/                          the shared Caddy: compose.yml, Caddyfile, edge.env (defaults)
 templates/<type>.*             compose file, deploy settings, secret spec and site block per type
-projects/<project>/            YOUR projects: <component>.yml, <component>.conf, site.caddy (no secrets)
 host/provision.sh              prepares a server; host/systemd/ holds its timers
 lib/                           smoke check, PostgreSQL entrypoint, TLS and app role
-.github/workflows/deploy.yml   the Deploy workflow
-examples/publish-image.yml     the publish workflow an application repository copies
+examples/                      publish-image.yml and deploy.yml for application repositories
 tests/                         static, unit and end-to-end tests
 ```
 
-On the server, under `/srv`: `katap/` (this repository), `secrets/<project>/` (0700,
-never in git), `state/<project>/` (what is serving, and the history),
-`backups/<project>/`, and `edge/certs/` (Cloudflare mode only).
+On the server: `/srv/katap` (the tool), `/srv/projects/<project>/` (your project
+definitions), `/srv/secrets/<project>/` (0700), `/srv/state/<project>/` (what is
+serving, and the history), `/srv/backups/<project>/`, `/srv/edge/` (this host's
+`edge.env` and Cloudflare certificates), and `/etc/katap/katap.env` (host settings).
 
 ### The project contract
 
@@ -489,7 +480,7 @@ never in git), `state/<project>/` (what is serving, and the history),
 - **laravel-api / nestjs-api** — their own `Dockerfile` and `publish-image.yml`, as
   shipped.
 
-### TLS modes — `edge/edge.env`
+### TLS modes — `TLS_MODE` in `/srv/edge/edge.env`
 
 | Mode | Use | Needs |
 |---|---|---|
@@ -518,6 +509,16 @@ address it actually saw.
 | Symptom | Likely cause | Check |
 |---|---|---|
 | Deploy refused: required values are empty | A `# katap:required` value is blank | `/srv/secrets/<project>/<component>.env` |
+| Deploy refused: could not verify that … was built by … | Not built by `source_repo`'s `publish-image.yml`, not from an allowed branch, or the repository publishes no attestations; the `gh said:` part tells which | `source_repo=` in the `.conf`; the publish run; `provenance=none` for private repos without attestations |
+| Deploy refused: set `KATAP_GH_TOKEN` | The server has no GitHub token | `/etc/katap/katap.env` |
+| Deploy refused: this key deploys … only | The app's key is bound to another project or component | `provision.sh --ci-project/--ci-component`; the workflow's `KATAP_PROJECT`/`KATAP_COMPONENT` |
+| Deploy refused: this key names no project and component | The key was authorised before keys were bound to a component | Run `provision.sh --ci-key … --ci-project … --ci-component …` again for it |
+| Deploy refused: already running, or dispatched less than 60s ago | Another deploy by that key or of that component is in progress, or one just finished | Wait, then re-run; its log is in `/srv/state/.dispatch/<project>/` |
+| Deploy refused: … gh said: HTTP 401 (or another gh error) | The server's `KATAP_GH_TOKEN` expired or lacks access | A new token in `/etc/katap/katap.env` |
+| Deploy refused: GitHub did not answer | GitHub's API was unreachable within 60s (`KATAP_GH_TIMEOUT`) | Retry; check the server's outbound network |
+| Deploy refused: built from different commits | The runtime and migrate images come from different publish runs | Deploy one tag that names both |
+| Deploy refused: has local modifications | Files under `/srv/katap` were edited | `git -C /srv/katap status`; check out the release again |
+| Action fails: is not on ghcr.io / known-hosts is empty | The image is on another registry, or the `KATAP_KNOWN_HOSTS` secret is missing | Set the action's `registry` input; add the secret |
 | Deploy fails and rolls back | The new release never became healthy, or failed its smoke check | `docker compose -p <project> logs --tail=200 <service>` |
 | `502` from the edge | The upstream container is down or unhealthy | `docker compose -p <project> ps` |
 | No certificate (acme) | DNS not pointing at the server yet, or 80/443 blocked upstream | `docker compose -p katap-edge logs caddy` |
@@ -529,7 +530,7 @@ address it actually saw.
 ### Testing Katap
 
 ```bash
-tests/run.sh          # shellcheck, the contract, secrets, refusals, ssh-dispatch, smoke check, edge config
+tests/run.sh          # shellcheck, the contract, secrets, provenance, ssh-dispatch, the action, provisioning, smoke check, edge
 E2E=1 tests/run.sh    # plus a real deploy on local Docker: build laravel-api, deploy, roll back, back up, restore
 ```
 

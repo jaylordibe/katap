@@ -1,0 +1,76 @@
+name: Katap deploy
+description: Deploy a published container image to a Katap server, through that application's restricted SSH key.
+author: jaylordibe
+
+# Used from an application repository's own workflow, inside the GitHub
+# environment that holds that application's deploy key:
+#
+#   - uses: jaylordibe/katap@<commit of a release> # v1.x.y
+#
+# Pin it by commit, never by a tag: this action receives the deploy key, and a
+# tag can be moved. It runs no other action, so that commit is all the code it
+# runs. The server, not this action, decides what may deploy: it checks the
+# digest against its own project settings and verifies the image's build
+# provenance before anything is pulled.
+
+inputs:
+  host:
+    description: The server's address.
+    required: true
+  user:
+    description: The deploy user provision.sh created.
+    default: deploy
+  ssh-key:
+    description: The private half of this application's deploy key (authorised with provision.sh --ci-key).
+    required: true
+  known-hosts:
+    description: The server's known_hosts line(s), taken once from the server itself. Never scanned at deploy time.
+    required: true
+  project:
+    description: The project on the server (/srv/projects/<project>).
+    required: true
+  component:
+    description: The component to deploy (/srv/projects/<project>/<component>.conf).
+    required: true
+  image:
+    description: The image to deploy, as <repository>:<tag> or <repository>@sha256:<digest>.
+    required: true
+  migrate-image:
+    description: For a component with a migrate image (nestjs-api), its repository, <repository>:<tag> or digest. A bare repository takes the tag of `image`; when `image` is a digest, give the migrate digest too.
+    default: ''
+  registry:
+    description: The only registry this action will contact to resolve a tag.
+    default: ghcr.io
+  registry-user:
+    description: User for that registry.
+    default: ${{ github.actor }}
+  registry-token:
+    description: Token that can read the images (packages read).
+    default: ${{ github.token }}
+  url:
+    description: Optional public URL to check after the deploy (HTTP 200, no redirects followed).
+    default: ''
+  smoke-body:
+    description: Optional text the public URL's body must contain.
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    - name: Deploy
+      shell: bash
+      env:
+        KATAP_HOST: ${{ inputs.host }}
+        KATAP_USER: ${{ inputs.user }}
+        KATAP_SSH_KEY: ${{ inputs.ssh-key }}
+        KATAP_KNOWN_HOSTS: ${{ inputs.known-hosts }}
+        KATAP_PROJECT: ${{ inputs.project }}
+        KATAP_COMPONENT: ${{ inputs.component }}
+        KATAP_IMAGE: ${{ inputs.image }}
+        KATAP_MIGRATE_IMAGE: ${{ inputs.migrate-image }}
+        KATAP_REGISTRY: ${{ inputs.registry }}
+        KATAP_REGISTRY_USER: ${{ inputs.registry-user }}
+        KATAP_REGISTRY_TOKEN: ${{ inputs.registry-token }}
+        KATAP_URL: ${{ inputs.url }}
+        KATAP_SMOKE_BODY: ${{ inputs.smoke-body }}
+      run: '"$GITHUB_ACTION_PATH/action/deploy.sh"'

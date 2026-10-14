@@ -1,12 +1,10 @@
 # Reference publish workflow for an application repository (an SPA, a Next.js
 # app, any service). Copy it to .github/workflows/publish-image.yml in the app
-# repository: the Deploy workflow of Katap verifies that an image was attested
-# by exactly that file path.
+# repository: a Katap server verifies that an image was attested by exactly that
+# file path before deploying it.
 #
 # It builds, scans and publishes; it never deploys and holds no server
-# credential. jaylordibe/laravel-api and jaylordibe/nestjs-api ship their own
-# publish workflow, deployer-neutral: add the staging-dispatch step below to it
-# if you want a staging push to start a deploy here.
+# credential. Deploying is examples/deploy.yml, a separate workflow.
 #
 # Order matters: the image is pushed under its immutable sha-<commit> tag, scanned
 # by digest, and only then given the provenance attestation and the moving branch
@@ -15,10 +13,6 @@
 #
 # Settings (repository variables):
 #   PUBLISH_ENABLED=true          publish at all (a fresh copy runs the build only)
-#   DEPLOY_DISPATCH_REPO          optional: owner/katap, to ask for a staging deploy
-#   DEPLOY_DISPATCH_PROJECT / DEPLOY_DISPATCH_COMPONENT   that deploy's target
-# and secret DEPLOY_DISPATCH_TOKEN: a fine-grained token with ONLY Actions: write on
-# the Katap repository (it can start the Deploy workflow, not change a file there).
 
 name: Publish image
 
@@ -99,7 +93,7 @@ jobs:
       - name: Attest build provenance
         # Attestations need a public repository, or a GitHub plan that supports them for
         # private ones; set ATTEST_PROVENANCE=true on such a plan. Without one, the
-        # deployer's component must say provenance=none.
+        # component's .conf on the server must say provenance=none.
         if: ${{ github.event.repository.visibility == 'public' || vars.ATTEST_PROVENANCE == 'true' }}
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
@@ -118,22 +112,3 @@ jobs:
           IMAGE: ${{ steps.name.outputs.image }}
           DIGEST: ${{ steps.build.outputs.digest }}
         run: echo "Published \`$IMAGE@$DIGEST\` (\`$IMAGE:$GITHUB_REF_NAME\`)." >> "$GITHUB_STEP_SUMMARY"
-
-      # Optional: ask the deployer for a STAGING deploy of what was just published.
-      # Production is always started by a person, in the deployer. Set the variables
-      # DEPLOY_DISPATCH_REPO (owner/repo), DEPLOY_DISPATCH_PROJECT and
-      # DEPLOY_DISPATCH_COMPONENT, and the secret DEPLOY_DISPATCH_TOKEN: a fine-grained
-      # token with ONLY Actions: write on that repository. It can start the
-      # deployer's Deploy workflow; it cannot change a file there.
-      - name: Ask for a staging deploy
-        if: ${{ github.ref == 'refs/heads/staging' && vars.DEPLOY_DISPATCH_REPO != '' }}
-        env:
-          GH_TOKEN: ${{ secrets.DEPLOY_DISPATCH_TOKEN }}
-          REPO: ${{ vars.DEPLOY_DISPATCH_REPO }}
-          PROJECT: ${{ vars.DEPLOY_DISPATCH_PROJECT }}
-          COMPONENT: ${{ vars.DEPLOY_DISPATCH_COMPONENT }}
-          IMAGE: ${{ steps.name.outputs.image }}@${{ steps.build.outputs.digest }}
-        run: |
-          gh workflow run deploy.yml --repo "$REPO" --ref main \
-            -f environment=staging -f project="$PROJECT" -f component="$COMPONENT" \
-            -f image="$IMAGE"

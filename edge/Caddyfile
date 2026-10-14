@@ -1,5 +1,5 @@
 # The shared edge configuration. Site blocks live with their project, in
-# projects/<project>/site.caddy, and every one of them is written as:
+# /srv/projects/<project>/site.caddy, and every one of them is written as:
 #
 #     <domains> {
 #         import katap_site
@@ -7,7 +7,7 @@
 #     }
 #
 # so TLS, headers and the client address are decided here, once, for every site.
-# TLS_MODE comes from edge/edge.env.
+# TLS_MODE comes from edge/edge.env, or this host's /srv/edge/edge.env.
 
 # No certificate for a site until its project is added, and no Caddy admin
 # endpoint beyond the container's loopback (the default).

@@ -1,10 +1,11 @@
 # The shared edge: the ONLY container on this host that publishes ports.
 #
 # Every project's public components join the `katap-edge` network under the alias
-# `<project>-<component>`, and their site blocks (projects/*/site.caddy) are
+# `<project>-<component>`, and their site blocks (/srv/projects/*/site.caddy) are
 # imported by the Caddyfile. Data services never join this network.
 #
-# Managed by `katap edge up` / `katap edge reload`; settings live in edge.env.
+# Managed by `katap edge up` / `katap edge reload`. Settings: edge.env holds the
+# defaults, and this host's /srv/edge/edge.env overrides them.
 name: katap-edge
 
 services:
@@ -22,10 +23,10 @@ services:
       - '0.0.0.0:${EDGE_HTTPS_PORT:-443}:443'
       - '0.0.0.0:${EDGE_HTTPS_PORT:-443}:443/udp'
     environment:
-      TLS_MODE: ${TLS_MODE:?set TLS_MODE in edge/edge.env}
+      TLS_MODE: ${TLS_MODE:?set TLS_MODE in /srv/edge/edge.env}
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      - ../projects:/etc/caddy/projects:ro
+      - ${KATAP_PROJECTS:-/srv/projects}:/etc/caddy/projects:ro
       - ${KATAP_SRV:-/srv}/edge/certs:/etc/caddy/certs:ro
       # Holds issued certificates and ACME account keys. Losing it means
       # re-issuing every certificate, which runs into the CA's rate limits.
@@ -33,7 +34,7 @@ services:
       - caddy_config:/config
     networks:
       edge:
-        ipv4_address: ${CADDY_IP:?set CADDY_IP in edge/edge.env}
+        ipv4_address: ${CADDY_IP:?set CADDY_IP in /srv/edge/edge.env}
     security_opt:
       - no-new-privileges:true
     logging:
@@ -47,8 +48,8 @@ networks:
     name: katap-edge
     ipam:
       config:
-        - subnet: ${EDGE_SUBNET:?set EDGE_SUBNET in edge/edge.env}
-          ip_range: ${EDGE_IP_RANGE:?set EDGE_IP_RANGE in edge/edge.env}
+        - subnet: ${EDGE_SUBNET:?set EDGE_SUBNET in /srv/edge/edge.env}
+          ip_range: ${EDGE_IP_RANGE:?set EDGE_IP_RANGE in /srv/edge/edge.env}
 
 volumes:
   caddy_data:

@@ -80,11 +80,16 @@ e2e() {
 
     # --- The project, defined and provisioned the way the README says ----------
     K="$(new_katap)"
-    sed -i 's/^TLS_MODE=.*/TLS_MODE=internal/' "$K/edge/edge.env"
+    # This host's edge settings, overriding the tool's defaults.
+    mkdir -p "$K/srv/edge"
+    echo TLS_MODE=internal > "$K/srv/edge/edge.env"
     katap add e2e laravel-api api api.e2e.test >/dev/null
     katap add e2e spa web www.e2e.test >/dev/null
     set_conf e2e api image "$REG/katap-e2e/laravel-api"
     set_conf e2e web image "$REG/katap-e2e/spa"
+    # Built locally, so no GitHub attestation exists for them: the host is told so.
+    set_conf e2e api provenance none
+    set_conf e2e web provenance none
     katap secrets e2e api >/dev/null
     katap secrets e2e web >/dev/null
     local env="$K/srv/secrets/e2e/api.env"
@@ -130,7 +135,7 @@ e2e() {
         test -n "$(docker port katap-edge-caddy-1 443/tcp 2>/dev/null || true)"
 
     # --- The client address: Caddy overwrites a forged X-Forwarded-For ----------
-    mkdir -p "$K/projects/e2eecho"
+    mkdir -p "$K/srv/projects/e2eecho"
     cat > "$WORK/echo.yml" <<EOF
 services:
   echo:
@@ -143,7 +148,7 @@ networks:
     name: katap-edge
     external: true
 EOF
-    printf 'echo.e2e.test {\n\timport katap_site\n\timport katap_proxy e2eecho-echo:80\n}\n' > "$K/projects/e2eecho/site.caddy"
+    printf 'echo.e2e.test {\n\timport katap_site\n\timport katap_proxy e2eecho-echo:80\n}\n' > "$K/srv/projects/e2eecho/site.caddy"
     docker compose -p e2eecho -f "$WORK/echo.yml" up -d --wait >/dev/null 2>&1
     katap edge reload >/dev/null 2>&1
     local echoed client_ip

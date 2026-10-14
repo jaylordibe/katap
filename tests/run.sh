@@ -75,19 +75,21 @@ refuses() {
 
 section() { echo; echo "== $1"; }
 
-# A throwaway copy of Katap, so tests never write into this repository's
-# projects/, with its own KATAP_SRV.
+# A throwaway copy of the tool with its own host directory, $K/srv, standing in
+# for /srv: projects, secrets, state and the edge override live there, never in
+# the tool. KATAP_SETTINGS points at a file that does not exist unless a test
+# writes it, so the runner's /etc is never read.
 new_katap() {
     local dir
     dir="$(mktemp -d "$WORK/katap.XXXXXX")"
-    cp -R "$REPO/bin" "$REPO/lib" "$REPO/templates" "$REPO/edge" "$REPO/.github" "$dir/"
-    mkdir -p "$dir/projects" "$dir/srv"
+    cp -R "$REPO/bin" "$REPO/lib" "$REPO/templates" "$REPO/edge" "$REPO/action" "$REPO/action.yml" "$dir/"
+    mkdir -p "$dir/srv/projects"
     echo "$dir"
 }
 
-katap() { KATAP_SRV="$K/srv" "$K/bin/katap" "$@"; }
+katap() { KATAP_SRV="$K/srv" KATAP_SETTINGS="$K/katap.env" KATAP_DISPATCH_COOLDOWN="${KATAP_DISPATCH_COOLDOWN:-0}" "$K/bin/katap" "$@"; }
 
-set_conf() { sed -i "s|^$3=.*|$3=$4|" "$K/projects/$1/$2.conf"; }
+set_conf() { sed -i "s|^$3=.*|$3=$4|" "$K/srv/projects/$1/$2.conf"; }
 
 fill_required() {
     # $1 project, $2 component: give every required value a placeholder.
@@ -109,16 +111,16 @@ rendered() {
     local project="$1" fixture="$WORK/render-$1"
     mkdir -p "$fixture"
     local c
-    for c in "$K/projects/$project"/*.conf; do
+    for c in "$K/srv/projects/$project"/*.conf; do
         c="$(basename "$c" .conf)"
         : > "$fixture/$c.env"
         : > "$fixture/$c.db.env"
         : > "$fixture/$c.redis.env"
     done
     local files=() f
-    for f in "$K/projects/$project"/*.yml; do files+=(-f "$f"); done
+    for f in "$K/srv/projects/$project"/*.yml; do files+=(-f "$f"); done
     KATAP_ROOT="$K" KATAP_PROJECT="$project" KATAP_SECRETS="$fixture" \
-        docker compose --project-name "$project" --project-directory "$K/projects/$project" \
+        docker compose --project-name "$project" --project-directory "$K/srv/projects/$project" \
         --env-file /dev/null --profile '*' "${files[@]}" config --format json
 }
 
@@ -126,7 +128,7 @@ rendered() {
 
 section "static"
 
-check "shellcheck: every script" shellcheck -x "$REPO/bin/katap" "$REPO"/lib/*.sh "$REPO"/host/*.sh "$REPO"/.github/scripts/*.sh "$REPO/tests/run.sh" "$REPO/tests/e2e.sh"
+check "shellcheck: every script" shellcheck -x "$REPO/bin/katap" "$REPO"/lib/*.sh "$REPO"/host/*.sh "$REPO"/action/*.sh "$REPO/tests/run.sh" "$REPO/tests/e2e.sh"
 
 no_match() {
     local pattern="$1"
@@ -176,8 +178,10 @@ refuses "a component name is validated (no hyphen)" "invalid component name" kat
 refuses "a domain is validated" "invalid domain" katap add shop spa web 'x.test;rm'
 refuses "an unknown type is refused" "unknown type" katap add shop rails api x.test
 check "site.caddy routes each domain to its component" \
-    bash -c "grep -qxF 'api.shop.test {' '$K/projects/shop/site.caddy' && grep -qxF $'\timport katap_proxy shop-api:80' '$K/projects/shop/site.caddy' && grep -qxF 'shop.test, www.shop.test {' '$K/projects/shop/site.caddy' && grep -qxF $'\timport katap_proxy blog-api:3000' '$K/projects/blog/site.caddy'"
-check "an internal-only component gets no site" test ! -e "$K/projects/tools/site.caddy"
+    bash -c "grep -qxF 'api.shop.test {' '$K/srv/projects/shop/site.caddy' && grep -qxF $'\timport katap_proxy shop-api:80' '$K/srv/projects/shop/site.caddy' && grep -qxF 'shop.test, www.shop.test {' '$K/srv/projects/shop/site.caddy' && grep -qxF $'\timport katap_proxy blog-api:3000' '$K/srv/projects/blog/site.caddy'"
+check "an internal-only component gets no site" test ! -e "$K/srv/projects/tools/site.caddy"
+check "katap add writes the project under the host directory, nothing into the tool" \
+    bash -c "[ -f '$K/srv/projects/shop/api.conf' ] && [ ! -e '$K/projects' ] && [ -z \"\$(find '$K/bin' '$K/templates' '$K/edge' '$K/lib' -newer '$K/srv/projects/shop/api.conf' -type f)\" ]"
 
 check "laravel-api + spa meet the project contract" katap check shop
 check "nestjs-api + spa + node-ssr meet the project contract" katap check blog
@@ -199,9 +203,9 @@ check "the permission sync is the declared PermissionsSeeder one-shot" \
 # Each negative fixture breaks one rule of the contract in a copy of `shop`.
 mutate() {
     local name="$1" message="$2" script="$3"
-    rm -rf "$K/projects/bad"
-    cp -R "$K/projects/shop" "$K/projects/bad"
-    python3 - "$K/projects/bad" <<<"$script"
+    rm -rf "$K/srv/projects/bad"
+    cp -R "$K/srv/projects/shop" "$K/srv/projects/bad"
+    python3 - "$K/srv/projects/bad" <<<"$script"
     refuses "katap check refuses: $name" "$message" katap check bad
 }
 mutate "a published port" "publishes ports" '
@@ -228,7 +232,7 @@ open(p, "w").write(s.replace("rollout=api-worker api", "rollout=api-worker api-n
 mutate "the Docker socket mounted" "mounts the Docker socket" '
 import sys; p = sys.argv[1] + "/web.yml"; s = open(p).read()
 open(p, "w").write(s.replace("    mem_limit: 128m\n", "    mem_limit: 128m\n    volumes:\n      - /var/run/docker.sock:/var/run/docker.sock\n", 1))'
-rm -rf "$K/projects/bad"
+rm -rf "$K/srv/projects/bad"
 
 # --- secrets --------------------------------------------------------------------
 
@@ -296,12 +300,37 @@ check "nestjs-api trusts exactly the edge's fixed address" \
     test "$(env_get "$K/srv/secrets/blog/api.env" TRUST_PROXY)" = "$(grep '^CADDY_IP=' "$K/edge/edge.env" | cut -d= -f2)"
 check "nestjs-api does not trust Cloudflare headers outside Cloudflare mode" \
     test "$(env_get "$K/srv/secrets/blog/api.env" TRUST_CLOUDFLARE_HEADERS)" = false
-sed -i 's/^TLS_MODE=.*/TLS_MODE=cloudflare/' "$K/edge/edge.env"
+# This host's /srv/edge/edge.env overrides the tool's defaults, key by key.
+mkdir -p "$K/srv/edge"
+printf 'TLS_MODE=cloudflare\nCADDY_IP=10.254.0.9\n' > "$K/srv/edge/edge.env"
 rm -rf "$K/srv/secrets/blog"
 katap secrets blog api >/dev/null
-check "nestjs-api trusts Cloudflare headers in Cloudflare mode" \
+check "nestjs-api trusts Cloudflare headers in Cloudflare mode (set in the host's edge.env)" \
     test "$(env_get "$K/srv/secrets/blog/api.env" TRUST_CLOUDFLARE_HEADERS)" = true
-sed -i 's/^TLS_MODE=.*/TLS_MODE=acme/' "$K/edge/edge.env"
+check "…and the overridden edge address" test "$(env_get "$K/srv/secrets/blog/api.env" TRUST_PROXY)" = 10.254.0.9
+cat > "$WORK/edge-recorder" <<EOF
+#!/usr/bin/env bash
+echo "\$*" >> "$WORK/edge.log"
+EOF
+chmod +x "$WORK/edge-recorder"
+: > "$WORK/edge.log"
+KATAP_DOCKER="$WORK/edge-recorder" katap edge reload >/dev/null 2>&1 || true
+check "the edge's compose reads the same files, defaults first, then the host's" \
+    grep -qF -- "--env-file $K/edge/edge.env --env-file $K/srv/edge/edge.env" "$WORK/edge.log"
+check "…and mounts the host's projects directory" bash -c "grep -q 'KATAP_PROJECTS' '$REPO/edge/compose.yml' && ! grep -q '\.\./projects' '$REPO/edge/compose.yml'"
+echo TLS_MODE=cloudflare > "$K/srv/edge/edge.env"
+rm -rf "$K/srv/secrets/blog"
+katap secrets blog api >/dev/null
+check "an override of one key keeps every other default (key by key, not the whole file)" \
+    test "$(env_get "$K/srv/secrets/blog/api.env" TRUST_PROXY)" = "$(grep '^CADDY_IP=' "$K/edge/edge.env" | cut -d= -f2)"
+rm -f "$K/srv/edge/edge.env"
+check "provision pins the defaults into the host's edge.env once, and never rewrites it" bash -c "
+    . '$REPO/host/provision.sh'
+    pin_edge_settings '$K/edge/edge.env' '$WORK/pinned.env'
+    grep -qxF \"\$(grep '^CADDY_IP=' '$K/edge/edge.env')\" '$WORK/pinned.env' || exit 1
+    echo CADDY_IP=10.254.0.77 > '$WORK/pinned.env'
+    pin_edge_settings '$K/edge/edge.env' '$WORK/pinned.env'
+    grep -qxF CADDY_IP=10.254.0.77 '$WORK/pinned.env'"
 
 # --- deploy refusals (before anything is pulled) --------------------------------
 
@@ -322,7 +351,7 @@ D64="ghcr.io/acme/shop-api@$(digest 1)"
 SHA40="$(printf 'a%.0s' $(seq 1 40))"
 refuses "a required secret is still empty" "required values are empty" deploy shop api "$D64"
 fill_required shop api
-refuses "no image repository configured" "set image=" deploy shop api "$D64"
+refuses "no image repository configured, naming the file to fix" "set image= in $K/srv/projects/shop/api.conf" deploy shop api "$D64"
 set_conf shop api image ghcr.io/acme/shop-api
 refuses "a tag instead of a digest" "is not pinned by digest" deploy shop api ghcr.io/acme/shop-api:latest
 refuses "a different repository" "is not this component's repository" deploy shop api "ghcr.io/evil/shop-api@$(digest 1)"
@@ -336,6 +365,108 @@ fill_required blog api
 refuses "a nestjs-api deploy without its migrate image" "also needs migrate=" deploy blog api "ghcr.io/acme/blog-api@$(digest 2)"
 check "no refused deploy pulled anything" test ! -s "$WORK/pulls"
 
+# --- provenance, verified by the host ----------------------------------------------
+
+section "katap deploy verifies build provenance itself (stub gh)"
+
+STUBS="$WORK/stubs"
+mkdir -p "$STUBS"
+cat > "$STUBS/gh" <<'STUB'
+#!/usr/bin/env bash
+# `gh attestation verify oci://<subject> … --source-ref <ref> …`: records the call and
+# the token; accepts only GH_ACCEPT_REF, and reports GH_COMMIT (GH_MIGRATE_COMMIT
+# for a -migrate image).
+echo "token=$GH_TOKEN $*" >> "$GH_LOG"
+[ -z "${GH_SLEEP:-}" ] || sleep "$GH_SLEEP"
+ref=''
+prev=''
+for arg in "$@"; do [ "$prev" = --source-ref ] && ref="$arg"; prev="$arg"; done
+[ "$ref" = "${GH_ACCEPT_REF:-refs/heads/main}" ] || { echo "${GH_STDERR:-no attestations found}" >&2; exit 1; }
+commit="${GH_COMMIT:-cccccccccccccccccccccccccccccccccccccccc}"
+[[ "$3" != *-migrate@* ]] || commit="${GH_MIGRATE_COMMIT:-$commit}"
+[ -n "${GH_NO_COMMIT:-}" ] && { echo '[{"verificationResult":{}}]'; exit 0; }
+printf '[{"verificationResult":{"signature":{"certificate":{"sourceRepositoryDigest":"%s"}}}}]\n' "$commit"
+STUB
+chmod +x "$STUBS/gh"
+GH_LOG="$WORK/gh.log"
+# vdeploy [VAR=value...] -- <katap deploy args>: a deploy with the stub gh.
+vdeploy() {
+    local vars=()
+    while [ "$1" != -- ]; do vars+=("$1"); shift; done
+    shift
+    : > "$GH_LOG"
+    : > "$WORK/pulls"
+    env KATAP_GH="$STUBS/gh" GH_LOG="$GH_LOG" KATAP_GH_TOKEN=test-token KATAP_DOCKER="$WORK/docker-recorder" \
+        KATAP_SRV="$K/srv" KATAP_SETTINGS="$K/katap.env" "${vars[@]}" "$K/bin/katap" deploy "$@"
+}
+refuses "no source repository configured" "set source_repo=" vdeploy -- shop api "$D64"
+set_conf shop api source_repo acme/shop-api
+set_conf blog api source_repo acme/blog-api
+refuses "no GitHub token on the host" "set KATAP_GH_TOKEN" vdeploy KATAP_GH_TOKEN= -- shop api "$D64"
+refuses "an image without an attestation is refused" "could not verify that" \
+    vdeploy GH_ACCEPT_REF=none -- shop api "$D64"
+check "…before anything is pulled" test ! -s "$WORK/pulls"
+refuses "production accepts only a build of main" "could not verify that" \
+    vdeploy GH_ACCEPT_REF=refs/heads/staging -- shop api "$D64"
+check "…and asks for refs/heads/main and nothing else" \
+    bash -c "grep -q -- '--source-ref refs/heads/main' '$GH_LOG' && ! grep -q 'refs/heads/staging' '$GH_LOG'"
+check "every verification names the repository and signer workflow, refuses self-hosted runners and uses the host's token" \
+    bash -c "grep -q -- '--repo acme/shop-api ' '$GH_LOG' && grep -q -- '--signer-workflow acme/shop-api/.github/workflows/publish-image.yml' '$GH_LOG' && grep -q -- '--deny-self-hosted-runners' '$GH_LOG' && grep -q '^token=test-token ' '$GH_LOG'"
+sed -i '/^provenance=/d' "$K/srv/projects/shop/api.conf"
+refuses "a .conf without provenance= is verified (attested is the default)" "could not verify that" \
+    vdeploy GH_ACCEPT_REF=none -- shop api "$D64"
+echo provenance=attested >> "$K/srv/projects/shop/api.conf"
+refuses "a gh failure is reported with gh's own words" "gh said: main: HTTP 401: Bad credentials" \
+    vdeploy GH_ACCEPT_REF=none GH_STDERR='HTTP 401: Bad credentials' -- shop api "$D64"
+refuses "a timeout that is not whole seconds is refused, never ignored" "KATAP_GH_TIMEOUT must be whole seconds" \
+    vdeploy KATAP_GH_TIMEOUT=1m -- shop api "$D64"
+started=$SECONDS
+refuses "a GitHub that does not answer is cut off" "GitHub did not answer" \
+    vdeploy GH_SLEEP=30 KATAP_GH_TIMEOUT=1 -- shop api "$D64"
+check "…well before it would have answered" test $((SECONDS - started)) -lt 20
+printf 'KATAP_GH_TIMEOUT=1\n' > "$K/katap.env"
+refuses "the timeout can be set in the host's settings file" "GitHub did not answer" vdeploy GH_SLEEP=30 -- shop api "$D64"
+rm -f "$K/katap.env"
+vdeploy -- shop api "$D64" >/dev/null 2>&1 || true
+check "an attested build of main goes on to the pull" test -s "$WORK/pulls"
+cp -R "$K/srv/projects/shop" "$K/srv/projects/stg"
+set_conf stg api environment staging
+fill_required_dir() { mkdir -p "$K/srv/secrets/$2"; cp -R "$K/srv/secrets/$1/." "$K/srv/secrets/$2/"; }
+fill_required_dir shop stg
+vdeploy GH_ACCEPT_REF=refs/heads/staging -- stg api "$D64" env=staging >/dev/null 2>&1 || true
+check "a staging component accepts a build of the staging branch" test -s "$WORK/pulls"
+refuses "a staging refusal names what gh said for each branch it tried" "gh said: main: HTTP 503; staging: HTTP 503" \
+    vdeploy GH_ACCEPT_REF=none GH_STDERR='HTTP 503' -- stg api "$D64" env=staging
+rm -rf "$K/srv/projects/stg" "$K/srv/secrets/stg" "$K/srv/state/stg"
+refuses "runtime and migrate images from different commits are refused" "built from different commits" \
+    vdeploy GH_MIGRATE_COMMIT=dddddddddddddddddddddddddddddddddddddddd -- blog api "ghcr.io/acme/blog-api@$(digest 2)" "migrate=ghcr.io/acme/blog-api-migrate@$(digest 3)"
+refuses "a release whose source commit cannot be read is refused (fails closed)" "could not read the source commit" \
+    vdeploy GH_NO_COMMIT=1 -- shop api "$D64"
+check "no refused deploy pulled anything" test ! -s "$WORK/pulls"
+printf 'KATAP_GH_TOKEN="from-settings-file"\r\n' > "$K/katap.env"
+vdeploy KATAP_GH_TOKEN= -- shop api "$D64" >/dev/null 2>&1 || true
+check "the token is read from the host's settings file, its quotes removed as systemd does" grep -q '^token=from-settings-file ' "$GH_LOG"
+vdeploy KATAP_GH_TOKEN=from-environment -- shop api "$D64" >/dev/null 2>&1 || true
+check "…and the environment wins over the file" grep -q '^token=from-environment ' "$GH_LOG"
+printf 'KATAP_GH_TOKEN=first\nKATAP_GH_TOKEN=  last-one  \n' > "$K/katap.env"
+vdeploy KATAP_GH_TOKEN= -- shop api "$D64" >/dev/null 2>&1 || true
+check "the last line for a key wins, its surrounding whitespace removed" grep -q '^token=last-one ' "$GH_LOG"
+check "the systemd units do not load the settings file (the token stays out of their environment)" \
+    bash -c "! grep -q 'EnvironmentFile' '$REPO'/host/systemd/*.service"
+# shellcheck disable=SC2016 # the literal text is what must never run
+printf 'KATAP_GH_TOKEN=$(touch %s/executed)\nKATAP_GH=/bin/false\n' "$WORK" > "$K/katap.env"
+vdeploy KATAP_GH_TOKEN= -- shop api "$D64" >/dev/null 2>&1 || true
+check "the settings file is read as data, never run" test ! -e "$WORK/executed"
+# shellcheck disable=SC2016 # the literal text is what must have been passed on
+check "…and only its own keys are taken from it (gh was still the stub)" grep -qF 'token=$(touch' "$GH_LOG"
+rm -f "$K/katap.env"
+set_conf shop api provenance none
+out="$(vdeploy -- shop api "$D64" 2>&1 || true)"
+check "provenance=none deploys without verification, and says so" \
+    bash -c "[ ! -s '$GH_LOG' ] && [ -s '$WORK/pulls' ] && grep -q 'provenance=none' <<<'$out'"
+set_conf shop api provenance attested
+: > "$WORK/pulls"
+
 # --- ssh-dispatch ---------------------------------------------------------------
 
 section "katap ssh-dispatch"
@@ -345,19 +476,37 @@ cat > "$WORK/self-recorder" <<EOF
 printf '%s\n' "\$@" > "$WORK/dispatched"
 EOF
 chmod +x "$WORK/self-recorder"
-# dispatch <request> [environment]: the environment is the key's forced command.
-dispatch() { rm -f "$WORK/dispatched"; SSH_ORIGINAL_COMMAND="$1" KATAP_SELF="$WORK/self-recorder" katap ssh-dispatch "${2-production}"; }
+cat > "$STUBS/logger" <<EOF
+#!/usr/bin/env bash
+echo "\$*" >> "$WORK/syslog"
+EOF
+chmod +x "$STUBS/logger"
+# dispatch <request> [environment] [project] [components]: the last three are the
+# key's forced command.
+dispatch() {
+    rm -f "$WORK/dispatched"
+    SSH_ORIGINAL_COMMAND="$1" SSH_CONNECTION='203.0.113.7 50000 10.0.0.1 22' PATH="$STUBS:$PATH" \
+        KATAP_SELF="$WORK/self-recorder" katap ssh-dispatch "${2-production}" "${3-shop}" "${4-api}"
+}
 
-if dispatch "deploy shop api $D64 migrate=$D64 katap=$SHA40" \
-    && [ "$(cat "$WORK/dispatched")" = "$(printf '%s\n' deploy shop api "$D64" "migrate=$D64" "katap=$SHA40" env=production)" ]; then
+: > "$WORK/syslog"
+if dispatch "deploy shop api $D64 migrate=$D64" \
+    && [ "$(cat "$WORK/dispatched")" = "$(printf '%s\n' deploy shop api "$D64" "migrate=$D64" env=production)" ]; then
     ok "deploy is handed over word by word, with the key's environment appended"
 else
     not_ok "deploy is handed over word by word" "$(cat "$WORK/dispatched" 2>/dev/null)"
 fi
+check "the audit line names the key's binding and the client" \
+    grep -qF "ssh-dispatch env=production key=shop/api client=203.0.113.7: deploy shop api" "$WORK/syslog"
 if dispatch 'rollback shop api' && [ "$(head -n1 "$WORK/dispatched")" = rollback ]; then
     ok "rollback is handed over"
 else
     not_ok "rollback is handed over"
+fi
+if dispatch "deploy shop web $D64" production shop api,web && [ "$(sed -n 3p "$WORK/dispatched")" = web ]; then
+    ok "a key bound to several components deploys each of them"
+else
+    not_ok "a key bound to several components deploys each of them"
 fi
 rm -f "$WORK/dispatched"
 # shellcheck disable=SC2016 # literal shell syntax is the input under test
@@ -367,9 +516,31 @@ done
 for request in 'run shop api-artisan tinker' 'restore shop api /tmp/x --confirm shop' 'secrets shop api' 'edge up' 'bash' ''; do
     refuses "ssh-dispatch refuses the verb in '$request'" "refused" dispatch "$request"
 done
-refuses "a key without an environment is refused" "this key has no environment" dispatch "deploy shop api $D64 katap=$SHA40" ''
-refuses "a deploy must name the Katap commit it was resolved against" "names the Katap commit" dispatch "deploy shop api $D64"
-refuses "a request cannot choose its environment" "the environment is the key's" dispatch "deploy shop api $D64 katap=$SHA40 env=staging"
+refuses "a key without an environment is refused" "this key has no environment" dispatch "deploy shop api $D64" ''
+refuses "a key without a project is refused (an old environment-only line)" "names no project and component" dispatch "deploy shop api $D64" production '' ''
+refuses "a key without a component is refused" "names no project and component" dispatch "deploy shop api $D64" production shop ''
+refuses "a key for one project cannot deploy another" "deploys project 'shop' only" dispatch "deploy blog api $D64"
+refuses "…nor roll another back" "deploys project 'shop' only" dispatch "rollback blog api"
+refuses "a key for one component cannot deploy another in its project" "deploys shop/{api} only" dispatch "deploy shop web $D64"
+refuses "…nor a component whose name is part of its binding" "deploys shop/{api,web} only" dispatch "deploy shop ap $D64" production shop api,web
+refuses "…nor the binding's list itself" "characters outside the allowed set" dispatch "deploy shop api,web $D64" production shop api,web
+refuses "a project whose name begins the key's is another project" "deploys project 'shop' only" dispatch "deploy sho api $D64"
+refuses "…nor roll it back" "deploys shop/{api} only" dispatch "rollback shop web"
+refuses "a request cannot choose its environment" "the environment is the key's" dispatch "deploy shop api $D64 env=staging"
+refuses "a request cannot carry anything else" "unexpected word" dispatch "deploy shop api $D64 project=blog"
+refuses "the old katap=<commit> word is refused with its cause" "no longer part of a request" dispatch "deploy shop api $D64 katap=$SHA40"
+mkdir -p "$K/srv/state/.dispatch/shop"
+exec 6>"$K/srv/state/.dispatch/shop/.api.lock"
+flock 6
+refuses "a second dispatch for the same component while one runs is refused" "already running" dispatch "deploy shop api $D64"
+exec 6>&-
+dispatch "deploy shop api $D64" >/dev/null 2>&1
+refuses "a dispatch within the cooldown after the last one is refused" "less than 60s ago" \
+    env KATAP_DISPATCH_COOLDOWN=60 bash -c "$(declare -f dispatch katap); K='$K' WORK='$WORK' STUBS='$STUBS'; dispatch 'deploy shop api $D64'"
+refuses "a cooldown that is not whole seconds is refused, never ignored" "must be whole seconds" \
+    env KATAP_DISPATCH_COOLDOWN=1m bash -c "$(declare -f dispatch katap); K='$K' WORK='$WORK' STUBS='$STUBS'; dispatch 'deploy shop api $D64'"
+refuses "…nor one too large to compare" "must be whole seconds" \
+    env KATAP_DISPATCH_COOLDOWN=99999999999999999999 bash -c "$(declare -f dispatch katap); K='$K' WORK='$WORK' STUBS='$STUBS'; dispatch 'deploy shop api $D64'"
 check "nothing refused was handed over" test ! -e "$WORK/dispatched"
 
 # --- smoke check ----------------------------------------------------------------
@@ -423,154 +594,128 @@ open(p, "w").write(s.replace("    mem_limit: 128m\n", "    mem_limit: 128m\n    
 mutate "an unknown environment" "environment= must be production or staging" '
 import sys; p = sys.argv[1] + "/api.conf"; s = open(p).read()
 open(p, "w").write(s.replace("environment=production", "environment=qa"))'
-rm -rf "$K/projects/bad"
+rm -rf "$K/srv/projects/bad"
 redis_env_files() { awk '/^  __C__-redis:/{on=1; next} on && /^  [^ ]/{on=0} on && /env/' "$1" | grep -oE '__C__\.[a-z.]*env'; }
 check "the Redis services read only their own secrets file" \
     test "$(redis_env_files "$REPO/templates/laravel-api.yml") $(redis_env_files "$REPO/templates/nestjs-api.yml")" = "__C__.redis.env __C__.redis.env"
 check "the database health check uses TCP" \
     bash -c "jq -r '.services[\"api-db\"].healthcheck.test | join(\" \")' <<<'$(jq -c . <<<"$shop_config")' | grep -q -- '-h 127.0.0.1'"
 
-# --- the Deploy workflow ----------------------------------------------------------
+# --- the Katap action ---------------------------------------------------------------
 
-section "the Deploy workflow's shape"
+section "the Katap action (action/deploy.sh, stub docker and ssh)"
 
-deploy_yml="$REPO/.github/workflows/deploy.yml"
-check "it is started by hand or by workflow_dispatch only (no repository_dispatch)" \
-    bash -c "! grep -q 'repository_dispatch' '$deploy_yml'"
-# shellcheck disable=SC2016 # the literal workflow text is what is matched
-check "one deploy per environment, project and component at a time" \
-    grep -qF 'group: deploy-${{ inputs.environment }}-${{ inputs.project }}-${{ inputs.component }}' "$deploy_yml"
-check "the SSH key exists only inside the SSH step, removed on exit" \
-    bash -c "awk '/- name: Deploy over SSH/,/- name: Public smoke check/' '$deploy_yml' | grep -qF \"trap 'rm -rf \\\"\\\$ssh_dir\\\"' EXIT\""
-check "no step after the SSH step can read a key file" \
-    bash -c "! awk '/- name: Public smoke check/,0' '$deploy_yml' | grep -qE 'deploy_key|ssh_dir|SSH_KEY'"
-# shellcheck disable=SC2016 # the literal workflow text is what is matched
-check "the public smoke check runs Katap's smoke check on the resolved URL" \
-    grep -qF 'run: sh lib/smoke-check.sh "$SMOKE_URL" "$SMOKE_BODY"' "$deploy_yml"
-
-# --- resolve-release.sh -----------------------------------------------------------
-
-section ".github/scripts/resolve-release.sh (stub gh and docker)"
-
-R="$(new_katap)"
-KATAP_SRV="$R/srv" "$R/bin/katap" add shop laravel-api api api.shop.test >/dev/null
-KATAP_SRV="$R/srv" "$R/bin/katap" add blog nestjs-api api api.blog.test >/dev/null
-KATAP_SRV="$R/srv" "$R/bin/katap" add priv spa web priv.test >/dev/null
-KATAP_SRV="$R/srv" "$R/bin/katap" add stg laravel-api api api.stg.shop.test >/dev/null
-sed -i -e 's|^image=.*|image=ghcr.io/acme/shop-api|' -e 's|^source_repo=.*|source_repo=acme/shop-api|' \
-    -e 's|^environment=.*|environment=staging|' "$R/projects/stg/api.conf"
-sed -i -e 's|^image=.*|image=ghcr.io/acme/shop-api|' -e 's|^source_repo=.*|source_repo=acme/shop-api|' "$R/projects/shop/api.conf"
-sed -i -e 's|^image=.*|image=ghcr.io/acme/blog-api|' -e 's|^image_migrate=.*|image_migrate=ghcr.io/acme/blog-api-migrate|' \
-    -e 's|^source_repo=.*|source_repo=acme/blog-api|' "$R/projects/blog/api.conf"
-sed -i -e 's|^image=.*|image=ghcr.io/acme/priv-web|' -e 's|^provenance=.*|provenance=none|' -e 's|^environment=.*|environment=staging|' "$R/projects/priv/web.conf"
-
-STUBS="$WORK/stubs"
-mkdir -p "$STUBS"
+check "the action runs no other action (nothing to pin but itself)" bash -c "! grep -qE '^\s*uses:' '$REPO/action.yml'"
+check "the example pins the Katap action by commit, never by tag" \
+    grep -qE '^\s+uses: jaylordibe/katap@[0-9a-f]{40} ' "$REPO/examples/deploy.yml"
 cat > "$STUBS/docker" <<'STUB'
 #!/usr/bin/env bash
-# `docker buildx imagetools inspect <ref> --format …`: a fixed digest per repository.
-echo "$*" >> "${STUB_DOCKER_LOG:-/dev/null}"
+# `docker login …` and `docker buildx imagetools inspect <ref> --format …`.
+echo "$*" >> "$STUB_DOCKER_LOG"
+case "$1" in login) cat >/dev/null; exit 0 ;; esac
 [ "$1 $2 $3" = "buildx imagetools inspect" ] || exit 1
 case "$4" in
     *-migrate:*) echo '{"digest":"sha256:8888888888888888888888888888888888888888888888888888888888888888"}' ;;
     *) echo '{"digest":"sha256:7777777777777777777777777777777777777777777777777777777777777777"}' ;;
 esac
 STUB
-cat > "$STUBS/gh" <<'STUB'
+cat > "$STUBS/ssh" <<'STUB'
 #!/usr/bin/env bash
-# `gh attestation verify oci://<subject> … --source-ref <ref> …`: records the call;
-# accepts only GH_ACCEPT_REF, and reports GH_COMMIT (GH_MIGRATE_COMMIT for -migrate).
-echo "$*" >> "$GH_LOG"
-ref=''
+# Records the request (the last argument) and the key file it was given.
+key=''
 prev=''
-for arg in "$@"; do [ "$prev" = --source-ref ] && ref="$arg"; prev="$arg"; done
-[ "$ref" = "${GH_ACCEPT_REF:-refs/heads/main}" ] || exit 1
-commit="${GH_COMMIT:-c0ffee}"
-[[ "$3" != *-migrate@* ]] || commit="${GH_MIGRATE_COMMIT:-$commit}"
-[ -n "${GH_NO_COMMIT:-}" ] && { echo '[{"verificationResult":{}}]'; exit 0; }
-printf '[{"verificationResult":{"signature":{"certificate":{"sourceRepositoryDigest":"%s"}}}}]\n' "$commit"
+for arg in "$@"; do [ "$prev" = -i ] && key="$arg"; prev="$arg"; done
+{ echo "key=$key exists=$([ -s "$key" ] && echo yes || echo no)"; echo "request=${*: -1}"; echo "$*"; } > "$SSH_LOG"
 STUB
-chmod +x "$STUBS/docker" "$STUBS/gh"
-
-# resolve <environment> <project> <component> <image> [migrate image] [VAR=value...]
-resolve() {
-    local environment="$1" project="$2" component="$3" image="$4" migrate="${5:-}"
-    shift 5 2>/dev/null || shift $#
-    : > "$WORK/gh.log"
-    : > "$WORK/out"
-    (cd "$R" && env PATH="$STUBS:$PATH" GH_LOG="$WORK/gh.log" STUB_DOCKER_LOG="$WORK/stub-docker.log" GITHUB_OUTPUT="$WORK/out" GITHUB_SHA="$SHA40" \
-        ENVIRONMENT="$environment" PROJECT="$project" COMPONENT="$component" IMAGE="$image" MIGRATE_IMAGE="$migrate" "$@" \
-        bash .github/scripts/resolve-release.sh)
-}
+chmod +x "$STUBS/docker" "$STUBS/ssh"
+ssh-keygen -q -t ed25519 -N '' -f "$WORK/hostkey" -C '' >/dev/null
+KNOWN="server.test $(cut -d' ' -f1-2 "$WORK/hostkey.pub")"
 D7='sha256:7777777777777777777777777777777777777777777777777777777777777777'
 D8='sha256:8888888888888888888888888888888888888888888888888888888888888888'
+# act [VAR=value...]: runs the action with sensible inputs, overridable.
+act() {
+    : > "$WORK/stub-docker.log"
+    rm -f "$WORK/ssh.log"
+    env KATAP_DOCKER="$STUBS/docker" KATAP_SSH="$STUBS/ssh" STUB_DOCKER_LOG="$WORK/stub-docker.log" SSH_LOG="$WORK/ssh.log" \
+        KATAP_HOST=server.test KATAP_SSH_KEY="$(cat "$WORK/hostkey")" KATAP_KNOWN_HOSTS="$KNOWN" \
+        KATAP_PROJECT=shop KATAP_COMPONENT=api KATAP_IMAGE=ghcr.io/acme/shop-api:main KATAP_REGISTRY_TOKEN=t \
+        "$@" bash "$REPO/action/deploy.sh"
+}
+act >/dev/null 2>&1 || true
+check "a tag is resolved to its digest and the request names only that" \
+    grep -qxF "request=deploy shop api ghcr.io/acme/shop-api@$D7" "$WORK/ssh.log"
+check "the host key is pinned, never accepted on first use" \
+    bash -c "grep -q 'StrictHostKeyChecking=yes' '$WORK/ssh.log' && grep -q 'UserKnownHostsFile=' '$WORK/ssh.log' && grep -q 'IdentitiesOnly=yes' '$WORK/ssh.log' && grep -q 'ForwardAgent=no' '$WORK/ssh.log'"
+check "the registry token goes in on stdin, never on a command line" \
+    bash -c "grep -q -- 'login ghcr.io -u .* --password-stdin' '$WORK/stub-docker.log' && ! grep -qw 't' <(grep -v -- '--password-stdin' '$WORK/stub-docker.log' | tr ' ' '\n')"
+check "the key existed for the SSH call and is gone afterwards" \
+    bash -c "grep -q 'exists=yes' '$WORK/ssh.log' && [ ! -e \"\$(sed -n 's/^key=\([^ ]*\) .*/\1/p' '$WORK/ssh.log')\" ]"
+act KATAP_IMAGE=ghcr.io/acme/blog-api:main KATAP_PROJECT=blog KATAP_MIGRATE_IMAGE=ghcr.io/acme/blog-api-migrate >/dev/null 2>&1 || true
+check "a bare migrate repository takes the runtime's tag" \
+    grep -qxF "request=deploy blog api ghcr.io/acme/blog-api@$D7 migrate=ghcr.io/acme/blog-api-migrate@$D8" "$WORK/ssh.log"
+check "…with one registry login for both" test "$(grep -c '^login ' "$WORK/stub-docker.log")" = 1
+check "a digest is passed through without contacting the registry" \
+    bash -c "$(declare -f act); STUBS='$STUBS' WORK='$WORK' REPO='$REPO' KNOWN='$KNOWN'
+        act KATAP_IMAGE=ghcr.io/acme/shop-api@$D7 >/dev/null && [ ! -s '$WORK/stub-docker.log' ] && grep -qxF 'request=deploy shop api ghcr.io/acme/shop-api@$D7' '$WORK/ssh.log'"
+refuses "a foreign registry is refused before it is contacted" "is not on ghcr.io" act KATAP_IMAGE=evil.example/shop-api:main
+check "…without a call to that registry, or a login anywhere" test ! -s "$WORK/stub-docker.log"
+refuses "a registry that only starts like ghcr.io is refused" "is not on ghcr.io" act KATAP_IMAGE=ghcr.io.evil.example/acme/x:main
+check "…without a login anywhere" test ! -s "$WORK/stub-docker.log"
+refuses "a foreign migrate registry is refused before any login" "is not on ghcr.io" act KATAP_MIGRATE_IMAGE=evil.example/x-migrate:main
+check "…not even to the expected registry" test ! -s "$WORK/stub-docker.log"
+refuses "empty known-hosts fails before any connection" "known-hosts is empty or malformed" act KATAP_KNOWN_HOSTS=
+check "…and nothing was sent" test ! -e "$WORK/ssh.log"
+refuses "a project name with shell syntax is refused" "expected a Katap project name" act 'KATAP_PROJECT=shop;id'
+refuses "a migrate tag cannot be derived from a digest" "pass a digest when image is a digest" \
+    act KATAP_IMAGE="ghcr.io/acme/blog-api@$D7" KATAP_MIGRATE_IMAGE=ghcr.io/acme/blog-api-migrate
 
-check "a tag is resolved to its digest and the request names it" bash -c "
-    $(declare -f resolve); R='$R' STUBS='$STUBS' WORK='$WORK' SHA40='$SHA40'
-    resolve production shop api ghcr.io/acme/shop-api:main >/dev/null
-    grep -qxF 'request=deploy shop api ghcr.io/acme/shop-api@$D7 katap=$SHA40' '$WORK/out'"
-check "the smoke URL and body come from the component's .conf" \
-    bash -c "grep -qxF 'smoke_url=https://api.shop.test/api/health/ready' '$WORK/out' && grep -qxF 'smoke_body=\"status\":\"ready\"' '$WORK/out'"
-refuses "production accepts only a build of main" "no build-provenance attestation" \
-    resolve production shop api ghcr.io/acme/shop-api:main '' GH_ACCEPT_REF=refs/heads/staging
-check "…and verifies with --source-ref refs/heads/main and nothing else" \
-    bash -c "grep -q -- '--source-ref refs/heads/main' '$WORK/gh.log' && ! grep -q 'refs/heads/staging' '$WORK/gh.log'"
-check "staging accepts a build of the staging branch" \
-    resolve staging stg api ghcr.io/acme/shop-api:staging '' GH_ACCEPT_REF=refs/heads/staging
-check "every verification pins the signer workflow and refuses self-hosted runners" \
-    bash -c "grep -q -- '--signer-workflow acme/shop-api/.github/workflows/publish-image.yml' '$WORK/gh.log' && grep -q -- '--deny-self-hosted-runners' '$WORK/gh.log'"
-refuses "a production component is never deployed to staging" "is a production component; refusing to deploy it to staging" \
-    resolve staging shop api ghcr.io/acme/shop-api:main
-refuses "a staging component is never deployed to production" "is a staging component; refusing to deploy it to production" \
-    resolve production stg api ghcr.io/acme/shop-api:main
-refuses "an image without an attestation is refused" "no build-provenance attestation" \
-    resolve production shop api ghcr.io/acme/shop-api:main '' GH_ACCEPT_REF=none
-refuses "another repository is refused" "is not this component's repository" \
-    resolve production shop api "ghcr.io/evil/shop-api@$D7"
-refuses "a repository that only starts the same is refused" "is not this component's repository" \
-    resolve production shop api "ghcr.io/acme/shop-api-evil@$D7"
-: > "$WORK/stub-docker.log"
-refuses "a foreign registry is refused before it is contacted" "is not this component's repository" \
-    resolve production shop api "evil.example/shop-api:main"
-check "…without a call to that registry" bash -c "! grep -q 'evil.example' '$WORK/stub-docker.log'"
-refuses "an unknown environment is refused" "unknown environment" resolve qa shop api ghcr.io/acme/shop-api:main
-refuses "a migrate image for a component without one is refused" "has no migrate image" \
-    resolve production shop api ghcr.io/acme/shop-api:main "ghcr.io/acme/shop-api@$D7"
-check "a nestjs-api tag also names its migrate image" bash -c "
-    $(declare -f resolve); R='$R' STUBS='$STUBS' WORK='$WORK' SHA40='$SHA40'
-    resolve production blog api ghcr.io/acme/blog-api:main >/dev/null
-    grep -qxF 'request=deploy blog api ghcr.io/acme/blog-api@$D7 migrate=ghcr.io/acme/blog-api-migrate@$D8 katap=$SHA40' '$WORK/out'"
-refuses "a nestjs-api digest needs its migrate digest" "also needs migrate_image" \
-    resolve production blog api "ghcr.io/acme/blog-api@$D7"
-refuses "runtime and migrate images from different commits are refused" "built from different commits" \
-    resolve production blog api ghcr.io/acme/blog-api:main '' GH_MIGRATE_COMMIT=0ther
-refuses "a pair that cannot be compared is refused (fails closed)" "cannot be shown to match" \
-    resolve production blog api ghcr.io/acme/blog-api:main '' GH_NO_COMMIT=1
-check "provenance=none deploys without verification, and says so" bash -c "
-    $(declare -f resolve); R='$R' STUBS='$STUBS' WORK='$WORK' SHA40='$SHA40'
-    out=\"\$(resolve staging priv web ghcr.io/acme/priv-web:main 2>&1)\" && [ ! -s '$WORK/gh.log' ] && grep -q 'provenance=none' <<<\"\$out\""
+# --- host/provision.sh: the deploy key's line ------------------------------------
+
+section "host/provision.sh authorises a deploy key for one binding"
+
+KEY="$(cat "$WORK/hostkey.pub")"
+authorize() { bash -c '. "$1"; KATAP_ROOT=/srv/katap; shift; authorize_ci_key "$@"' _ "$REPO/host/provision.sh" "$@"; }
+AK="$WORK/authorized_keys"
+rm -f "$AK"
+check "a key is written with its forced command and restrict" authorize "$AK" production shop api "$KEY"
+check "…exactly once, and bound to environment, project and component" \
+    test "$(cat "$AK")" = "restrict,command=\"/srv/katap/bin/katap ssh-dispatch production shop api\" $KEY"
+check "provisioning again changes nothing" bash -c "REPO='$REPO'; $(declare -f authorize); authorize '$AK' production shop api '$KEY' >/dev/null && [ \$(wc -l < '$AK') = 1 ]"
+refuses "the same key for another binding is refused" "with another restriction or none" authorize "$AK" production blog api "$KEY"
+refuses "a project carrying quoting is refused" "--ci-project" authorize "$AK" production 'a" ,no-restrict' api "$KEY"
+refuses "a component with a hyphen is refused" "--ci-component" authorize "$AK" production shop my-api "$KEY"
+refuses "an unknown environment is refused" "--ci-env production|staging" authorize "$AK" qa shop api "$KEY"
+refuses "a key spanning two lines is refused" "single line" authorize "$AK" production shop api "$KEY"$'\n'"$KEY"
+refuses "a value that is not a public key is refused" "not an SSH public key" authorize "$AK" production shop api 'command="sh" ssh-ed25519 AAAA'
+check "nothing refused was written" test "$(wc -l < "$AK")" = 1
 
 # --- deploy refusals that need no image ------------------------------------------
 
 section "katap deploy / rollback / cron / backup with a fake docker"
 
-refuses "a request resolved against another katap commit is refused" "pull /srv/katap first" \
-    deploy shop api "$D64" "katap=$SHA40"
 refuses "a staging key cannot deploy a production component" "this key deploys staging only" \
-    deploy shop api "$D64" env=staging
+    vdeploy -- shop api "$D64" env=staging
 
-# The accept path: a clean checkout at exactly the resolved commit goes on to pull.
+# The tool must be the release it was cloned at. The fixture's host directory sits
+# inside it here, so it is kept out of the repository, as /srv is on a host.
 git -C "$K" init -q
+echo /srv/ > "$K/.git/info/exclude"
 git -C "$K" -c user.email=t@t -c user.name=t add -A >/dev/null
 git -C "$K" -c user.email=t@t -c user.name=t commit -qm fixture
-HEAD_SHA="$(git -C "$K" rev-parse HEAD)"
-: > "$WORK/pulls"
-deploy shop api "$D64" "katap=$HEAD_SHA" env=production >/dev/null 2>&1 || true
-check "a request resolved against this exact, clean checkout is accepted (it reaches the pull)" test -s "$WORK/pulls"
-touch "$K/projects/shop/uncommitted.yml.bak"
-refuses "a checkout with uncommitted project changes is refused" "has uncommitted changes" \
-    deploy shop api "$D64" "katap=$HEAD_SHA"
-rm -f "$K/projects/shop/uncommitted.yml.bak"
+vdeploy -- shop api "$D64" env=production >/dev/null 2>&1 || true
+check "a clean tool checkout goes on to the pull" test -s "$WORK/pulls"
+echo '# local edit' >> "$K/templates/spa.yml"
+refuses "a tool checkout with local modifications is refused" "has local modifications" vdeploy -- shop api "$D64"
+check "…before anything is pulled" test ! -s "$WORK/pulls"
+# An enclosing repository, as /srv could be: git must never fall back to it when
+# the tool's own .git cannot be read.
+git -C "$WORK" init -q
+echo garbage > "$K/.git/HEAD.tmp"; mv "$K/.git/HEAD" "$K/.git/HEAD.bak"; mv "$K/.git/HEAD.tmp" "$K/.git/HEAD"
+refuses "a checkout git cannot read is refused, never checked against an enclosing repository" "could not check" vdeploy -- shop api "$D64"
+mv "$K/.git/HEAD.bak" "$K/.git/HEAD"
+rm -rf "$WORK/.git"
+git -C "$K" checkout -q -- templates/spa.yml
+rm -rf "$K/.git"
 : > "$WORK/pulls"
 
 cat > "$WORK/fake-docker" <<STUB
@@ -615,13 +760,23 @@ refuses "a rollback names only a release this host has deployed" "was never depl
 echo "IMAGE_API=$(rel 10)" > "$K/srv/state/shop/images.env"
 refuses "the first release has nothing before it" "no earlier release" fake rollback shop api
 
+echo "IMAGE_API=$(rel 11)" > "$K/srv/state/shop/images.env"
+set_conf shop api provenance none
+fake deploy shop api "$D64" >/dev/null 2>&1 || true
+check "a deploy completes with the fake docker" grep -q 'deploy api IMAGE_API=ghcr.io/acme/shop-api@' "$K/srv/state/shop/history"
+check "…and does not reload the shared edge" bash -c "! grep -qE 'caddy (reload|validate)|katap-edge' '$WORK/fake.log'"
+set_conf shop api provenance attested
+echo "IMAGE_API=$(rel 10)" > "$K/srv/state/shop/images.env"
+
 check "katap run finds a service whatever line compose prints it on" \
     env FAKE_SLOW_SERVICES="api-scheduler api-redis api-db api-artisan api-migrate api-permissions api-worker api" \
         KATAP_DOCKER="$WORK/fake-docker" KATAP_SRV="$K/srv" "$K/bin/katap" run shop api-scheduler
 : > "$WORK/fake.log"
+set_conf shop api provenance none
 refuses "a released component whose database is down is not deployed without a dump" "the pre-deploy dump failed" \
     env FAKE_DB_DOWN=1 KATAP_DOCKER="$WORK/fake-docker" KATAP_SRV="$K/srv" "$K/bin/katap" deploy shop api "$D64"
 check "…and no migration ran" bash -c "! grep -q 'run --rm api-migrate' '$WORK/fake.log'"
+set_conf shop api provenance attested
 check "katap cron runs each scheduler without starting its dependencies" fake cron shop
 check "…as 'run --rm --no-deps api-scheduler'" grep -q 'run --rm --no-deps api-scheduler' "$WORK/fake.log"
 exec 5>"$K/srv/state/shop/.lock"
@@ -630,7 +785,7 @@ check "katap cron skips a minute while the project is busy" fake cron shop
 check "…and runs nothing" bash -c "! grep -q ' run ' '$WORK/fake.log'"
 exec 5>&-
 
-cp -R "$K/projects/shop" "$K/projects/shop2"
+cp -R "$K/srv/projects/shop" "$K/srv/projects/shop2"
 mkdir -p "$K/srv/state/shop2"
 echo "IMAGE_API=$(rel 10)" > "$K/srv/state/shop2/images.env"
 refuses "one project's failed dump fails the nightly run" "the backup of 'shop' failed" \
@@ -648,7 +803,7 @@ check "retention keeps KATAP_BACKUP_KEEP nightly dumps however many deploys came
     test "$(find "$K/srv/backups/shop2" -name 'api-*-scheduled.dump' | wc -l)" -eq 2
 check "…and leaves the other kinds alone" \
     test "$(find "$K/srv/backups/shop2" -name 'api-29990101*-predeploy.dump' | wc -l)" -eq 3
-rm -rf "$K/projects/shop2" "$K/srv/state/shop2"
+rm -rf "$K/srv/projects/shop2" "$K/srv/state/shop2"
 
 # --- ssh-dispatch detaches from the session --------------------------------------
 
@@ -662,15 +817,34 @@ touch "$WORK/detached-done"
 exit "\${SLOW_EXIT:-0}"
 STUB
 chmod +x "$WORK/slow-self"
-rm -f "$WORK/detached-done"
+rm -f "$WORK/detached-done" "$K/srv/state/.dispatch/shop"/*.log.status
 # `head -n 1` closes the pipe after the first line: the session is gone.
-(SSH_ORIGINAL_COMMAND="deploy shop api $D64 katap=$SHA40" KATAP_SELF="$WORK/slow-self" KATAP_SRV="$K/srv" "$K/bin/katap" ssh-dispatch production | head -n 1 >/dev/null) || true
+(SSH_ORIGINAL_COMMAND="deploy shop api $D64" KATAP_SELF="$WORK/slow-self" KATAP_SRV="$K/srv" KATAP_SETTINGS="$K/katap.env" KATAP_DISPATCH_COOLDOWN=0 "$K/bin/katap" ssh-dispatch production shop api | head -n 1 >/dev/null) || true
 for _ in $(seq 1 100); do [ -e "$WORK/detached-done" ] && break; sleep 0.1; done
 check "the deploy finishes after the session is closed" test -e "$WORK/detached-done"
+for _ in $(seq 1 50); do [ -n "$(find "$K/srv/state/.dispatch/shop" -name '*.log.status')" ] && break; sleep 0.1; done
+rm -f "$WORK/detached-done"
+(SSH_ORIGINAL_COMMAND="deploy shop api $D64" KATAP_SELF="$WORK/slow-self" KATAP_SRV="$K/srv" KATAP_SETTINGS="$K/katap.env" KATAP_DISPATCH_COOLDOWN=0 "$K/bin/katap" ssh-dispatch production shop api >/dev/null 2>&1 &)
+sleep 0.5
+refuses "while a dispatched deploy runs, its worker holds the component's lock" "already running" dispatch "deploy shop api $D64"
+refuses "…against every key bound to that component" "a dispatch for shop/api is already running" dispatch "deploy shop api $D64" production shop api,web
+for _ in $(seq 1 100); do [ -e "$WORK/detached-done" ] && break; sleep 0.1; done
+sleep 0.5
+# A key bound to two components: one dispatch at a time across both, and the
+# cooldown after it covers both.
+rm -f "$WORK/detached-done"
+(SSH_ORIGINAL_COMMAND="deploy shop api $D64" KATAP_SELF="$WORK/slow-self" KATAP_SRV="$K/srv" KATAP_SETTINGS="$K/katap.env" KATAP_DISPATCH_COOLDOWN=0 "$K/bin/katap" ssh-dispatch production shop api,web >/dev/null 2>&1 &)
+sleep 0.5
+refuses "a key bound to two components cannot run the second while the first runs" "dispatch by this key" \
+    dispatch "deploy shop web $D64" production shop api,web
+for _ in $(seq 1 100); do [ -e "$WORK/detached-done" ] && break; sleep 0.1; done
+sleep 0.5
+refuses "…nor right after it, within the cooldown" "this key (shop/{api,web}) dispatched less than" \
+    env KATAP_DISPATCH_COOLDOWN=60 bash -c "$(declare -f dispatch katap); K='$K' WORK='$WORK' STUBS='$STUBS'; dispatch 'deploy shop web $D64' production shop api,web"
 check "the session receives the deploy's exit status" \
-    bash -c "SSH_ORIGINAL_COMMAND='deploy shop api $D64 katap=$SHA40' KATAP_SELF='$WORK/slow-self' SLOW_EXIT=3 KATAP_SRV='$K/srv' '$K/bin/katap' ssh-dispatch production >/dev/null 2>&1; [ \$? = 3 ]"
-check "each dispatch leaves its log, readable by the deploy user only" \
-    test "$(stat -c %a "$(find "$K/srv/state/dispatch" -name '*.log' -size +0 | head -n1)")" = 600
+    bash -c "SSH_ORIGINAL_COMMAND='deploy shop api $D64' KATAP_SELF='$WORK/slow-self' SLOW_EXIT=3 KATAP_SRV='$K/srv' KATAP_SETTINGS='$K/katap.env' KATAP_DISPATCH_COOLDOWN=0 '$K/bin/katap' ssh-dispatch production shop api >/dev/null 2>&1; [ \$? = 3 ]"
+check "each dispatch leaves its log under its project, readable by the deploy user only" \
+    test "$(stat -c %a "$(find "$K/srv/state/.dispatch/shop" -name '*-api-*.log' -size +0 | head -n1)")" = 600
 
 # --- edge config ----------------------------------------------------------------
 
@@ -683,13 +857,13 @@ cp "$WORK/certs/origin.pem" "$WORK/certs/cf-origin-pull-ca.pem"
 for mode in acme cloudflare internal; do
     check "caddy validate, TLS_MODE=$mode, with the shop and blog sites" \
         docker run --rm -e TLS_MODE="$mode" \
-            -v "$K/edge/Caddyfile:/etc/caddy/Caddyfile:ro" -v "$K/projects:/etc/caddy/projects:ro" \
+            -v "$K/edge/Caddyfile:/etc/caddy/Caddyfile:ro" -v "$K/srv/projects:/etc/caddy/projects:ro" \
             -v "$WORK/certs:/etc/caddy/certs:ro" "$CADDY_IMAGE" caddy validate --config /etc/caddy/Caddyfile
 done
 
 # The client address is set on the proxied request itself, in Cloudflare mode only.
 xff() {
-    docker run --rm -e TLS_MODE="$1" -v "$K/edge/Caddyfile:/etc/caddy/Caddyfile:ro" -v "$K/projects:/etc/caddy/projects:ro" \
+    docker run --rm -e TLS_MODE="$1" -v "$K/edge/Caddyfile:/etc/caddy/Caddyfile:ro" -v "$K/srv/projects:/etc/caddy/projects:ro" \
         -v "$WORK/certs:/etc/caddy/certs:ro" "$CADDY_IMAGE" caddy adapt --config /etc/caddy/Caddyfile 2>/dev/null \
         | jq -c '[.. | objects | select(.handler? == "reverse_proxy") | .headers.request.set["X-Forwarded-For"] // null] | unique'
 }
