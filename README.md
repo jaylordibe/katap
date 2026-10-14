@@ -81,12 +81,15 @@ sudo nano /srv/katap.json
   "host": "203.0.113.10",
   "projects": {
     "shop": {
-      "api": { "type": "laravel-api", "repo": "you/shop-api", "domains": ["api.shop.com"] },
-      "web": { "type": "spa",         "repo": "you/shop-web", "domains": ["shop.com", "www.shop.com"] }
+      "api": { "type": "laravel-api", "repo": "you/shop-api", "domains": ["api.example.com"] },
+      "web": { "type": "spa",         "repo": "you/shop-web", "domains": ["example.com", "www.example.com"] }
     }
   }
 }
 ```
+
+Put in your own server address, repositories and domains: `you/…` and `example.com`
+are placeholders.
 
 ```bash
 sudo -u deploy /srv/katap/bin/katap apply

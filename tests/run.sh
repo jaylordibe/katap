@@ -1072,8 +1072,14 @@ rm -f "$WORK/provisioned-by-release"
 env KATAP_REPO_URL="$ORIGIN" KATAP_API_URL="file://$API" KATAP_INSTALL_ROOT="$INST/katap" KATAP_RELEASE_FILE="$INST/release" \
     bash "$REPO/install.sh" --version v1.1.0 --harden-ssh >/dev/null 2>&1 || true
 check "…which is the checked-out release's own host/provision.sh" test "$(cat "$WORK/provisioned-by-release" 2>/dev/null)" = "v1.1.0 --harden-ssh"
-check "running it again upgrades to a newer release" installs --version v1.2.0
+up_out="$(installs --version v1.2.0 2>&1)" && up_rc=0 || up_rc=$?
+check "running it again upgrades to a newer release" test "$up_rc" = 0
 check "…to its commit" test "$(git -C "$INST/katap" rev-parse HEAD)" = "$(tag_commit v1.2.0)"
+check "…naming both releases" grep -qF "upgrading Katap from v1.1.0 to v1.2.0." <<<"$up_out"
+again_out="$(installs --version v1.2.0 2>&1)" && again_rc=0 || again_rc=$?
+check "running it again on the installed release provisions again" test "$again_rc" = 0 -a -e "$WORK/provisioned"
+check "…and says it is already installed, not upgrading" \
+    bash -c "grep -qF 'Katap v1.2.0 is already installed' <<<\"\$1\" && ! grep -q upgrading <<<\"\$1\"" _ "$again_out"
 before="$(cat "$INST/release")"
 echo edited >> "$INST/katap/VERSION"
 refuses "a checkout with local changes is never upgraded over" "has local changes" installs --version v1.1.0
@@ -1164,6 +1170,12 @@ shift
 method=GET
 if [ "$1" = -X ]; then method="$2"; shift 2; fi
 path="$1"
+# The repository itself: missing (CN_MISSING_REPOS) or not administered (CN_NOT_ADMIN).
+if [ "$method" = GET ] && [[ "$path" =~ ^repos/[^/]+/[^/]+$ ]]; then
+    case " ${CN_MISSING_REPOS:-} " in *" ${path#repos/} "*) echo "HTTP 404: Not Found" >&2; exit 1 ;; esac
+    case " ${CN_NOT_ADMIN:-} " in *" ${path#repos/} "*) echo false; exit 0 ;; esac
+    echo true; exit 0
+fi
 case "$method $path" in
     "GET repos/jaylordibe/katap/git/ref/tags/"*)
         if [ -n "${CN_LIGHTWEIGHT:-}" ]; then echo "commit $CN_GITHUB_COMMIT"; else echo "tag 1111111111111111111111111111111111111111"; fi ;;
@@ -1250,6 +1262,15 @@ check "running it again makes no key and authorises nothing" bash -c "! grep -q 
 jq '.components[0].domain = "api2.shop.test"' "$CN/info.json" > "$CN/info2.json"
 connects CN_INFO="$CN/info2.json" -- root@203.0.113.10 >/dev/null 2>&1 || true
 check "…but brings a connected repository's variables up to date" test "$(val acme/shop-api/production KATAP_URL)" = https://api2.shop.test/api/health/ready
+
+connect_reset
+refuses "a repository that does not exist is refused before anything is asked" "cannot read acme/shop-web on GitHub" \
+    connects CN_MISSING_REPOS=acme/shop-web -- root@203.0.113.10
+check "…having changed nothing anywhere" bash -c "[ -z \"\$($(declare -f gh_writes); CN='$CN'; gh_writes)\" ] && ! grep -q provision.sh '$CN/ssh.log'"
+connect_reset
+refuses "a repository this gh login does not administer is refused before anything is asked" "does not administer acme/blog-api" \
+    connects CN_NOT_ADMIN=acme/blog-api -- root@203.0.113.10
+check "…having changed nothing anywhere" bash -c "[ -z \"\$($(declare -f gh_writes); CN='$CN'; gh_writes)\" ] && ! grep -q provision.sh '$CN/ssh.log'"
 
 connect_reset
 check "a project name limits it to that project" connects -- root@203.0.113.10 blog

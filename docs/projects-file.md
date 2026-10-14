@@ -16,11 +16,11 @@ sudo -u deploy /srv/katap/bin/katap apply
   "host": "203.0.113.10",
   "projects": {
     "shop": {
-      "api": { "type": "laravel-api", "repo": "you/shop-api", "domains": ["api.shop.com"] },
-      "web": { "type": "spa",         "repo": "you/shop-web", "domains": ["shop.com", "www.shop.com"] }
+      "api": { "type": "laravel-api", "repo": "you/shop-api", "domains": ["api.example.com"] },
+      "web": { "type": "spa",         "repo": "you/shop-web", "domains": ["example.com", "www.example.com"] }
     },
     "shop-staging": {
-      "api": { "type": "laravel-api", "repo": "you/shop-api", "domains": ["api.staging.shop.com"], "environment": "staging" }
+      "api": { "type": "laravel-api", "repo": "you/shop-api", "domains": ["api.staging.example.com"], "environment": "staging" }
     }
   }
 }

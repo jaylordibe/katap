@@ -115,7 +115,13 @@ main() {
         local changes
         changes="$(g status --porcelain 2>&1)" || die "could not read $root with git ($changes); nothing was changed."
         [ -z "$changes" ] || die "$root has local changes, which an upgrade would lose; nothing was changed:"$'\n'"$changes"
-        log "upgrading Katap to $tag."
+        local current
+        current="$(sed -n 's/^tag=//p' "$release_file" 2>/dev/null || true)"
+        if [ "$(g rev-parse HEAD 2>/dev/null)" = "$commit" ]; then
+            log "Katap $tag is already installed; running its provisioning again."
+        else
+            log "upgrading Katap${current:+ from $current} to $tag."
+        fi
         # Only this release's tag, into FETCH_HEAD: local tags are never rewritten.
         g fetch --quiet "$repo_url" "refs/tags/$tag" || die "could not fetch $tag from $repo_url; nothing was changed."
     fi

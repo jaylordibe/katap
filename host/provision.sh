@@ -356,8 +356,12 @@ sudo -u "$DEPLOY_USER" "$KATAP_ROOT/bin/katap" edge up
 log "done. Next:"
 [ -n "$(current_gh_token /etc/katap/katap.env)" ] \
     || log "  - set KATAP_GH_TOKEN in /etc/katap/katap.env (see the comments there);"
-log "  - describe your projects in /srv/katap.json (sudo nano /srv/katap.json), then:"
-log "      sudo -u $DEPLOY_USER $KATAP_ROOT/bin/katap apply"
+if jq -e '(.projects // {}) | length > 0' /srv/katap.json >/dev/null 2>&1; then
+    log "  - after any change to /srv/katap.json: sudo -u $DEPLOY_USER $KATAP_ROOT/bin/katap apply"
+else
+    log "  - describe your projects in /srv/katap.json (sudo nano /srv/katap.json), then:"
+    log "      sudo -u $DEPLOY_USER $KATAP_ROOT/bin/katap apply"
+fi
 log "  - if images are private: sudo -u $DEPLOY_USER docker login ghcr.io -u <user> --password-stdin   (a read:packages token)."
 }
 

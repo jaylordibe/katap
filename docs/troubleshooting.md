@@ -13,6 +13,8 @@
 | connect: the server's ed25519 host key is not in your known_hosts | You have connected with another key type only, or never | Check the fingerprint it prints against your provider's console, then run the `ssh -o HostKeyAlgorithms=ssh-ed25519 …` command it suggests |
 | connect: … but GitHub's vX is … | The server runs a commit that is not that release | Run the installer again on the server |
 | connect: … must allow deployments from exactly: main | The environment exists with no branch limit, or a wider one, so another branch could read its key | Set its deployment branches to exactly `main` (and `staging` for staging) in the repository's Settings → Environments, then run again |
+| connect: cannot read … on GitHub | The repository in `/srv/katap.json` is misspelled, does not exist, or your `gh` login cannot see it | `repo` in `/srv/katap.json` (then `katap apply`); `gh repo view <owner>/<name>` |
+| connect: your gh login does not administer … | `gh` is signed in as someone without admin rights on that repository | `gh auth status`; sign in as one of its administrators |
 | connect: check that your gh login administers … | `gh` could read the repository but not its environments | Sign in to `gh` as an administrator of the repository |
 | apply: … still serves | A domain moves to another component before its old site block is gone | See "Moving a domain" in [The projects file](projects-file.md#what-stays-yours) |
 | apply: run apply as the owner of /srv/projects | apply was run as root | `sudo -u deploy /srv/katap/bin/katap apply` |

@@ -89,7 +89,8 @@ main() {
     # The host key must be one this computer already trusts for this server: the
     # key every deploy will pin is never learned from the network.
     local cfg hostname port files name file trusted=false
-    cfg="$("$SSH" -G -- "$target")" || die "could not read the ssh configuration for $target."
+    # -T: OpenSSH 10 warns about a pseudo-terminal under `curl | bash` otherwise.
+    cfg="$("$SSH" -G -T -- "$target")" || die "could not read the ssh configuration for $target."
     hostname="$(awk '$1 == "hostname" { print $2; exit }' <<<"$cfg")"
     port="$(awk '$1 == "port" { print $2; exit }' <<<"$cfg")"
     files="$(awk '$1 == "userknownhostsfile" { $1 = ""; print; exit }' <<<"$cfg")"
@@ -122,7 +123,7 @@ main() {
     local rows row
     rows="$(jq -r '.components[] | [.project, .component, .environment, .repo, .image, .image_migrate, .domain, .smoke_path] | map(tostring) | join("\u001f")' <<<"$info")" \
         || die "the server's component list is malformed."
-    local todo=() refresh=() repos=' ' pairs=' ' pair project component environment repo image image_migrate domain smoke_path
+    local todo=() refresh=() repos=' ' pairs=' ' pair admin project component environment repo image image_migrate domain smoke_path
     while IFS= read -r row; do
         [ -n "$row" ] || continue
         IFS=$'\x1f' read -r project component environment repo image image_migrate domain smoke_path <<<"$row"
@@ -139,12 +140,19 @@ main() {
         [[ "$pairs" != *" $pair "* ]] || die "the server lists $repo twice for $environment; a repository deploys one component per environment."
         pairs+="$pair "
         [ "$only" = "  " ] || [[ "$only" == *" $project "* ]] || continue
+        if [[ "$repos" != *" $repo "* ]]; then
+            # A repository that does not exist, or that this gh login does not
+            # administer, stops the run here, before anything is asked or changed.
+            admin="$("$GH" api "repos/$repo" --jq '.permissions.admin' 2>/dev/null)" \
+                || die "cannot read $repo on GitHub: check its name in the server's /srv/katap.json, and that your gh login can see it. Nothing was changed."
+            [ "$admin" = true ] || die "your gh login does not administer $repo; sign in to gh as one of its administrators. Nothing was changed."
+            repos+="$repo "
+        fi
         if connected "$repo" "$environment"; then
             refresh+=("$row")
         else
             todo+=("$row")
         fi
-        [[ "$repos" == *" $repo "* ]] || repos+="$repo "
     done <<<"$rows"
 
     [ "$repos" != ' ' ] || die "the server's katap.json declares no component${*:+ in $*}."
