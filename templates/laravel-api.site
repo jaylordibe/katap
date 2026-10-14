@@ -1,0 +1,5 @@
+# __C__ (laravel-api)
+__DOMAINS__ {
+	import kit_site
+	import kit_proxy __UPSTREAM__
+}

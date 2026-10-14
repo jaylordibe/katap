@@ -1,0 +1,40 @@
+# Component __C__: a single-page app (Angular, React, Vue, ...) served as static
+# files from its own image.
+#
+# What the image must do (README "Publishing a SPA image"):
+#   - serve the built files on port 80, answering an unknown path with index.html
+#     (client-side routing) and `/` with 200;
+#   - contain `wget` for the healthcheck below (nginx:alpine and caddy:alpine do),
+#     or replace the healthcheck here.
+# The API URL is baked in at build time by most SPA toolchains, so it is a build
+# argument of the SPA's own publish workflow, not a setting here.
+
+services:
+  __C__:
+    image: ${IMAGE___CU__:-kit/unreleased:none}
+    restart: unless-stopped
+    mem_limit: 128m
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: '3'
+    healthcheck:
+      test: ['CMD-SHELL', 'wget -q -O /dev/null http://127.0.0.1:80/ || exit 1']
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+      start_interval: 2s
+    networks:
+      default: {}
+      edge:
+        aliases:
+          - ${KIT_PROJECT}-__C__
+
+networks:
+  edge:
+    name: kit-edge
+    external: true

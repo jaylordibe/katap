@@ -1,0 +1,40 @@
+# Component __C__: a server-rendered web app (Next.js, Nuxt, SvelteKit, Remix, ...)
+# running its own Node server on port 3000.
+#
+# What the image must do (README "Publishing a server-rendered image"):
+#   - listen on 0.0.0.0:3000 and answer `/` with 200;
+#   - contain `wget` (any alpine-based Node image does), or replace the healthcheck.
+# Server-side calls to an API in the same project can use its internal address
+# (http://<component>:<port>) on the project network instead of the public URL.
+
+services:
+  __C__:
+    image: ${IMAGE___CU__:-kit/unreleased:none}
+    env_file:
+      - ${KIT_SECRETS}/__C__.env
+    restart: unless-stopped
+    mem_limit: 512m
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: '3'
+    healthcheck:
+      test: ['CMD-SHELL', 'wget -q -O /dev/null http://127.0.0.1:3000/ || exit 1']
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+      start_interval: 2s
+    networks:
+      default: {}
+      edge:
+        aliases:
+          - ${KIT_PROJECT}-__C__
+
+networks:
+  edge:
+    name: kit-edge
+    external: true

@@ -1,0 +1,138 @@
+# Reference publish workflow for an application repository (an SPA, a Next.js
+# app, any service). Copy it to .github/workflows/publish-image.yml in the app
+# repository: the Deploy workflow of the kit verifies that an image was attested
+# by exactly that file path.
+#
+# It builds, scans and publishes; it never deploys and holds no server
+# credential. jaylordibe/laravel-api and jaylordibe/nestjs-api carry their own
+# adapted copy (their test and security gates in front of it).
+#
+# Order matters: the image is pushed under its immutable sha-<commit> tag, scanned
+# by digest, and only then given the provenance attestation and the moving branch
+# tag. An image that fails the scan therefore has no attestation, and the kit
+# refuses to deploy it.
+#
+# Settings (repository variables):
+#   PUBLISH_ENABLED=true          publish at all (a fresh copy runs the build only)
+#   DEPLOY_DISPATCH_REPO          optional: owner/cicd, to ask for a staging deploy
+#   DEPLOY_DISPATCH_PROJECT / DEPLOY_DISPATCH_COMPONENT   that deploy's target
+# and secret DEPLOY_DISPATCH_TOKEN: a fine-grained token with ONLY Actions: write on
+# the kit repository (it can start the Deploy workflow, not change a file there).
+
+name: Publish image
+
+on:
+  push:
+    branches: [main, staging]
+  workflow_dispatch:
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # Replace with the repository's own tests (or `uses:` its reusable test workflow).
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Test
+        run: echo 'Run the test suite here.'
+
+  publish:
+    name: Build, scan and publish
+    needs: test
+    if: ${{ vars.PUBLISH_ENABLED == 'true' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/staging') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Name the image
+        id: name
+        run: echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Build and push (immutable tag only)
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          push: true
+          # Re-resolve FROM so a refreshed base image reaches this build.
+          pull: true
+          tags: ${{ steps.name.outputs.image }}:sha-${{ github.sha }}
+
+      - name: Scan the pushed digest
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        env:
+          TRIVY_USERNAME: ${{ github.actor }}
+          TRIVY_PASSWORD: ${{ github.token }}
+        with:
+          image-ref: ${{ steps.name.outputs.image }}@${{ steps.build.outputs.digest }}
+          format: table
+          exit-code: '1'
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+
+      - name: Attest build provenance
+        # Attestations need a public repository, or a GitHub plan that supports them for
+        # private ones; set ATTEST_PROVENANCE=true on such a plan. Without one, the
+        # deployer's component must say provenance=none.
+        if: ${{ github.event.repository.visibility == 'public' || vars.ATTEST_PROVENANCE == 'true' }}
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ steps.name.outputs.image }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      - name: Tag the branch
+        env:
+          IMAGE: ${{ steps.name.outputs.image }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: docker buildx imagetools create --tag "$IMAGE:$GITHUB_REF_NAME" "$IMAGE@$DIGEST"
+
+      - name: Summary
+        env:
+          IMAGE: ${{ steps.name.outputs.image }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: echo "Published \`$IMAGE@$DIGEST\` (\`$IMAGE:$GITHUB_REF_NAME\`)." >> "$GITHUB_STEP_SUMMARY"
+
+      # Optional: ask the deployer for a STAGING deploy of what was just published.
+      # Production is always started by a person, in the deployer. Set the variables
+      # DEPLOY_DISPATCH_REPO (owner/repo), DEPLOY_DISPATCH_PROJECT and
+      # DEPLOY_DISPATCH_COMPONENT, and the secret DEPLOY_DISPATCH_TOKEN: a fine-grained
+      # token with ONLY Actions: write on that repository. It can start the
+      # deployer's Deploy workflow; it cannot change a file there.
+      - name: Ask for a staging deploy
+        if: ${{ github.ref == 'refs/heads/staging' && vars.DEPLOY_DISPATCH_REPO != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.DEPLOY_DISPATCH_TOKEN }}
+          REPO: ${{ vars.DEPLOY_DISPATCH_REPO }}
+          PROJECT: ${{ vars.DEPLOY_DISPATCH_PROJECT }}
+          COMPONENT: ${{ vars.DEPLOY_DISPATCH_COMPONENT }}
+          IMAGE: ${{ steps.name.outputs.image }}@${{ steps.build.outputs.digest }}
+        run: |
+          gh workflow run deploy.yml --repo "$REPO" --ref main \
+            -f environment=staging -f project="$PROJECT" -f component="$COMPONENT" \
+            -f image="$IMAGE"

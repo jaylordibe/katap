@@ -1,0 +1,9 @@
+[Unit]
+Description=kit: run per-minute jobs every minute
+
+[Timer]
+OnCalendar=*-*-* *:*:00
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target

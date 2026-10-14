@@ -1,0 +1,117 @@
+# Component __C__: an API built from jaylordibe/nestjs-api (or a fork of it).
+#
+# The image's contract is in that repository's docs/deployment/README.md. Two
+# images come from one Dockerfile: the runtime, and the `migrate` target whose
+# command is the whole schema step (`prisma deploy` then `rbac:sync`; the API
+# refuses to boot when the RBAC catalog and the database disagree).
+#
+#   __C__              node dist/main.js, with the queue worker in-process
+#                      (QUEUE_WORKER_ENABLED=true, the single-host default)
+#   __C__-migrate      predeploy (migrate image); also `kit run` for `yarn prisma:seed`
+#   __C__-db           PostgreSQL
+#   __C__-redis        BullMQ queues and rate limits, appendonly
+#
+# To split the worker out, follow docs/deployment/README.md: add a service running
+# `node dist/worker.js` with QUEUE_WORKER_ENABLED=true, set it false on __C__.
+
+x-__C__-logging: &__C__-logging
+  driver: json-file
+  options:
+    max-size: 10m
+    max-file: '3'
+
+services:
+  __C__:
+    image: ${IMAGE___CU__:-kit/unreleased:none}
+    env_file:
+      - ${KIT_SECRETS}/__C__.env
+    environment:
+      QUEUE_WORKER_ENABLED: 'true'
+    restart: unless-stopped
+    logging: *__C__-logging
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 512m
+    memswap_limit: 512m
+    # Above the worker's 25s drain budget (WORKER_SHUTDOWN_TIMEOUT_MILLISECONDS),
+    # so a shutdown reports what it abandoned instead of being killed mid-job.
+    stop_grace_period: 40s
+    # The runtime image ships node and no curl.
+    healthcheck:
+      test: ['CMD', 'node', '-e', "require('http').get('http://localhost:3000/api/health/liveness',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+      start_interval: 2s
+    depends_on:
+      __C__-db:
+        condition: service_healthy
+      __C__-redis:
+        condition: service_healthy
+    networks:
+      default: {}
+      edge:
+        aliases:
+          - ${KIT_PROJECT}-__C__
+
+  __C__-migrate:
+    image: ${IMAGE___CU___MIGRATE:-kit/unreleased:none}
+    env_file:
+      - ${KIT_SECRETS}/__C__.env
+    profiles: [predeploy]
+    restart: 'no'
+    init: true
+    logging: *__C__-logging
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      __C__-db:
+        condition: service_healthy
+
+  __C__-db:
+    image: postgres:18.6@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336
+    restart: unless-stopped
+    logging: *__C__-logging
+    shm_size: 256mb
+    stop_grace_period: 60s
+    env_file:
+      - ${KIT_SECRETS}/__C__.db.env
+    # Refuses to start an empty cluster beside one of another major version.
+    entrypoint: ['/bin/sh', '/kit/postgres-entrypoint.sh']
+    volumes:
+      - __C__-db:/var/lib/postgresql
+      - ${KIT_ROOT}/lib/postgres-entrypoint.sh:/kit/postgres-entrypoint.sh:ro
+      - ${KIT_ROOT}/lib/postgres-init.sh:/docker-entrypoint-initdb.d/10-kit-app-role.sh:ro
+      - ${KIT_ROOT}/lib/app-database.sql:/kit/app-database.sql:ro
+    healthcheck:
+      # Over TCP: the image's first-start temporary server answers on the socket only.
+      test: ['CMD-SHELL', 'pg_isready -h 127.0.0.1 -U postgres -d app']
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+  __C__-redis:
+    image: redis:8.6.7-alpine@sha256:ac2da09bc822f325a9f68f533120b86fa39c1b8db46b3aa7c1bbea7fdfd4fcba
+    restart: unless-stopped
+    logging: *__C__-logging
+    env_file:
+      - ${KIT_SECRETS}/__C__.redis.env
+    command: ['sh', '-c', 'exec redis-server --requirepass "$$REDIS_PASSWORD" --appendonly yes']
+    volumes:
+      - __C__-redis:/data
+    healthcheck:
+      test: ['CMD-SHELL', 'redis-cli ping | grep -q PONG']
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+networks:
+  edge:
+    name: kit-edge
+    external: true
+
+volumes:
+  __C__-db:
+  __C__-redis:

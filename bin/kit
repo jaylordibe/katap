@@ -1,0 +1,1038 @@
+#!/usr/bin/env bash
+#
+# kit — run several containerized projects on one host, behind one Caddy.
+#
+# A project is a directory under projects/ holding one compose file per component
+# (copied from templates/ by `kit add`), a <component>.conf of deploy settings, and
+# site.caddy. Secrets live on the host only, never in this repository.
+#
+#   kit add <project> <type> <component> [domain...]   define a component (in the repo)
+#   kit secrets <project> <component>                  generate its secrets ONCE (on the host)
+#   kit edge up|reload                                 start the shared edge / reload its config
+#   kit deploy <project> <component> <image@sha256:…> [migrate=<image@sha256:…>]
+#   kit rollback <project> <component> [<image@sha256:…> [migrate=<image@sha256:…>]]
+#   kit run <project> <service> [args...]              one-off command in a one-shot service
+#   kit cron --all | <project>                         per-minute jobs (systemd timer)
+#   kit backup --all | <project>                       database dumps (systemd timer)
+#   kit restore <project> <component> <dump> --confirm <project>
+#   kit check [<project>...]                           enforce the project contract
+#   kit conf <project> <component> <key>               print one deploy setting (read-only)
+#   kit ssh-dispatch                                   forced command for the CI deploy key
+#
+# Host layout (KIT_SRV, default /srv):
+#   secrets/<project>/<component>.env, .db.env, -db-tls/   0700 dir, 0600 files
+#   state/<project>/images.env                             the digests now serving
+#   state/<project>/history                                every deploy and rollback
+#   backups/<project>/<component>-<time>-<reason>.dump
+#
+# Nothing here ever regenerates a secret, drops a database or volume, or runs a
+# destructive migration. `restore` replaces data and is never reachable from CI.
+set -euo pipefail
+shopt -s nullglob
+# bash 5.2 expands `&` in a ${var//pattern/replacement} replacement; a generated
+# secret is substituted literally.
+shopt -u patsub_replacement 2>/dev/null || true
+
+if [ "${BASH_VERSINFO[0]}" -lt 4 ]; then
+    echo "kit: bash 4 or newer is required (this is ${BASH_VERSION})." >&2
+    exit 1
+fi
+
+KIT_ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+KIT_SRV="${KIT_SRV:-/srv}"
+# Test seams: the docker binary, and the program ssh-dispatch hands over to.
+KIT_DOCKER="${KIT_DOCKER:-docker}"
+KIT_SELF="${KIT_SELF:-$KIT_ROOT/bin/kit}"
+KIT_BACKUP_KEEP="${KIT_BACKUP_KEEP:-14}"
+
+# Runs lib/smoke-check.sh on a project network. Pinned like every other image.
+CURL_IMAGE='curlimages/curl:8.22.0@sha256:58adaa4e8dca9c988bae2aba4ab3434a0bb2da16bbe3f92dec39ec7785166777'
+
+PROJECT_RE='^[a-z][a-z0-9-]{0,29}$'
+# No hyphen: the component name becomes part of an environment variable name.
+COMPONENT_RE='^[a-z][a-z0-9]{0,19}$'
+DOMAIN_RE='^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$'
+DIGEST_SUFFIX_RE='@sha256:[0-9a-f]{64}$'
+
+die() { echo "kit: $*" >&2; exit 1; }
+
+# Temporary paths removed on exit, however the command ends.
+CLEANUP=()
+cleanup() { [ "${#CLEANUP[@]}" -eq 0 ] || rm -rf -- "${CLEANUP[@]}"; }
+trap cleanup EXIT
+log() { echo "kit: $*" >&2; }
+
+# --- Names and files ------------------------------------------------------------
+
+valid_project() { [[ "$1" =~ $PROJECT_RE ]] || die "invalid project name '$1' (expected ${PROJECT_RE})."; }
+valid_component() { [[ "$1" =~ $COMPONENT_RE ]] || die "invalid component name '$1' (expected ${COMPONENT_RE})."; }
+
+project_dir() { printf '%s/projects/%s' "$KIT_ROOT" "$1"; }
+secrets_dir() { printf '%s/secrets/%s' "$KIT_SRV" "$1"; }
+state_dir() { printf '%s/state/%s' "$KIT_SRV" "$1"; }
+images_file() { printf '%s/images.env' "$(state_dir "$1")"; }
+conf_file() { printf '%s/%s.conf' "$(project_dir "$1")" "$2"; }
+
+upper() { printf '%s' "$1" | tr '[:lower:]' '[:upper:]'; }
+
+require_project() {
+    valid_project "$1"
+    [ -d "$(project_dir "$1")" ] || die "unknown project '$1' (no projects/$1)."
+}
+
+require_component() {
+    require_project "$1"
+    valid_component "$2"
+    [ -f "$(conf_file "$1" "$2")" ] || die "unknown component '$2' in project '$1'."
+}
+
+# Reads one key from a KEY=VALUE file as data. Never sourced: these files are
+# inputs, and nothing in them is executed.
+file_get() {
+    local file="$1" key="$2" line
+    line="$(grep -E "^${key}=" "$file" | head -n 1 || true)"
+    printf '%s' "${line#*=}"
+}
+
+conf_get() { file_get "$(conf_file "$1" "$2")" "$3"; }
+edge_get() { file_get "$KIT_ROOT/edge/edge.env" "$1"; }
+
+components_of() {
+    local f
+    for f in "$(project_dir "$1")"/*.conf; do
+        basename "$f" .conf
+    done
+}
+
+all_projects() {
+    local d
+    for d in "$KIT_ROOT"/projects/*/; do
+        basename "$d"
+    done
+}
+
+# --- Compose ----------------------------------------------------------------------
+
+# docker compose for one project, every component file merged, with the release
+# digests from <env file>.
+compose_with() {
+    local project="$1" env_file="$2"
+    shift 2
+    local files=() f
+    for f in "$(project_dir "$project")"/*.yml; do
+        files+=(-f "$f")
+    done
+    [ "${#files[@]}" -gt 0 ] || die "project '$project' has no components."
+
+    KIT_ROOT="$KIT_ROOT" KIT_PROJECT="$project" KIT_SECRETS="$(secrets_dir "$project")" \
+        "$KIT_DOCKER" compose --project-name "$project" --project-directory "$(project_dir "$project")" \
+        --env-file "$env_file" "${files[@]}" "$@"
+}
+
+ensure_state() {
+    local dir
+    dir="$(state_dir "$1")"
+    mkdir -p "$dir"
+    [ -f "$dir/images.env" ] || : > "$dir/images.env"
+}
+
+compose() {
+    local project="$1"
+    shift
+    ensure_state "$project"
+    compose_with "$project" "$(images_file "$project")" "$@"
+}
+
+# --- add ------------------------------------------------------------------------
+
+cmd_add() {
+    [ "$#" -ge 3 ] || die "usage: kit add <project> <type> <component> [domain...]"
+    local project="$1" type="$2" component="$3"
+    shift 3
+    valid_project "$project"
+    valid_component "$component"
+    if [ ! -f "$KIT_ROOT/templates/$type.yml" ]; then
+        local known=() template
+        for template in "$KIT_ROOT"/templates/*.yml; do
+            known+=("$(basename "$template" .yml)")
+        done
+        die "unknown type '$type'. Types: ${known[*]}"
+    fi
+
+    local domain
+    for domain in "$@"; do
+        [[ "$domain" =~ $DOMAIN_RE ]] || die "invalid domain '$domain'."
+    done
+
+    local dir cu
+    dir="$(project_dir "$project")"
+    cu="$(upper "$component")"
+    mkdir -p "$dir"
+    [ ! -e "$dir/$component.yml" ] && [ ! -e "$dir/$component.conf" ] \
+        || die "component '$component' already exists in project '$project'."
+
+    # Names are validated above to [a-z0-9-], so they are safe sed replacements.
+    sed -e "s/__C__/$component/g" -e "s/__CU__/$cu/g" "$KIT_ROOT/templates/$type.yml" > "$dir/$component.yml"
+    sed -e "s/__C__/$component/g" -e "s/__CU__/$cu/g" -e "s/__DOMAINS__/$*/" "$KIT_ROOT/templates/$type.conf" > "$dir/$component.conf"
+
+    if [ "$#" -gt 0 ] && [ -f "$KIT_ROOT/templates/$type.site" ]; then
+        local port domains
+        port="$(conf_get "$project" "$component" port)"
+        domains="$(printf '%s, ' "$@")"
+        domains="${domains%, }"
+        local separator=''
+        [ ! -s "$dir/site.caddy" ] || separator=$'\n'
+        {
+            printf '%s' "$separator"
+            sed -e "s/__C__/$component/g" -e "s/__DOMAINS__/$domains/" \
+                -e "s/__UPSTREAM__/$project-$component:$port/" "$KIT_ROOT/templates/$type.site"
+        } >> "$dir/site.caddy"
+    fi
+
+    cat <<EOF
+Added $type component '$component' to project '$project' (projects/$project/).
+Next:
+  1. Set image= and source_repo= in projects/$project/$component.conf (and image_migrate= if present).
+  2. Commit projects/$project, and pull it on the host.
+  3. On the host: kit secrets $project $component, then fill every empty required value.
+EOF
+}
+
+# --- secrets --------------------------------------------------------------------
+
+pem_one_line() { awk 'BEGIN { ORS = "" } { if (NR > 1) printf "\\n"; printf "%s", $0 }' "$1"; }
+
+cmd_secrets() {
+    [ "$#" -eq 2 ] || die "usage: kit secrets <project> <component>"
+    local project="$1" component="$2"
+    require_component "$project" "$component"
+
+    local type spec dir tls_dir
+    type="$(conf_get "$project" "$component" type)"
+    spec="$KIT_ROOT/templates/$type.env.spec"
+    [ -f "$spec" ] || die "no secret spec for type '$type'."
+    dir="$(secrets_dir "$project")"
+    tls_dir="$dir/$component-db-tls"
+
+    # Each spec section is one file, read only by the containers that need it.
+    declare -A section_file=([app]="$dir/$component.env" [db]="$dir/$component.db.env" [redis]="$dir/$component.redis.env")
+
+    # Generated once. Regenerating APP_KEY, Passport keys or a database password
+    # breaks every token, every encrypted value and the database login.
+    local existing
+    for existing in "${section_file[@]}" "$tls_dir"; do
+        [ ! -e "$existing" ] || die "secrets for '$project/$component' already exist in $dir; refusing to overwrite them."
+    done
+
+    umask 077
+    mkdir -p "$dir"
+    chmod 700 "$dir"
+
+    local domain cloudflare caddy_ip
+    domain="$(conf_get "$project" "$component" domains)"
+    domain="${domain%% *}"
+    caddy_ip="$(edge_get CADDY_IP)"
+    cloudflare=false
+    [ "$(edge_get TLS_MODE)" != cloudflare ] || cloudflare=true
+
+    # Inside the 0700 secrets directory, so nothing generated is ever readable
+    # elsewhere, even briefly.
+    local work
+    work="$(mktemp -d "$dir/.work.XXXXXX")"
+    CLEANUP+=("$work")
+
+    declare -A value=()
+    local section='' line key generator out pair name
+    for name in "${!section_file[@]}"; do
+        : > "$work/$name"
+    done
+
+    while IFS= read -r line || [ -n "$line" ]; do
+        line="${line//__C__/$component}"
+        case "$line" in
+            ''|'#'*) continue ;;
+            '['*']')
+                section="${line#[}"
+                section="${section%]}"
+                [ -n "${section_file[$section]+set}" ] || die "$spec: unknown section '$line'."
+                continue
+                ;;
+        esac
+        [ -n "$section" ] || die "$spec: '$line' is outside a section."
+        key="${line%%=*}"
+        generator="${line#*=}"
+        [[ "$key" =~ ^[A-Z][A-Z0-9_]*$ ]] || die "$spec: invalid key in '$line'."
+
+        case "$generator" in
+            hex:*)
+                out="$(openssl rand -hex "${generator#hex:}")"
+                ;;
+            laravel-key)
+                out="base64:$(openssl rand -base64 32)"
+                ;;
+            rsa-private:*|rsa-public:*)
+                pair="${generator#*:}"
+                if [ ! -f "$work/$pair.key" ]; then
+                    openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:4096 -out "$work/$pair.key" 2>/dev/null
+                    openssl pkey -in "$work/$pair.key" -pubout -out "$work/$pair.pub" 2>/dev/null
+                fi
+                if [ "${generator%%:*}" = rsa-private ]; then
+                    out="$(pem_one_line "$work/$pair.key")"
+                else
+                    out="$(pem_one_line "$work/$pair.pub")"
+                fi
+                ;;
+            same:*)
+                [ -n "${value[${generator#same:}]+set}" ] || die "$spec: '$key' refers to '${generator#same:}' before it is defined."
+                out="${value[${generator#same:}]}"
+                ;;
+            literal:*)
+                out="${generator#literal:}"
+                out="${out//\{project\}/$project}"
+                out="${out//\{component\}/$component}"
+                out="${out//\{domain\}/$domain}"
+                out="${out//\{caddy_ip\}/$caddy_ip}"
+                out="${out//\{cloudflare\}/$cloudflare}"
+                while [[ "$out" =~ \{secret:([A-Z][A-Z0-9_]*)\} ]]; do
+                    [ -n "${value[${BASH_REMATCH[1]}]+set}" ] || die "$spec: '$key' uses secret '${BASH_REMATCH[1]}' before it is defined."
+                    out="${out//\{secret:${BASH_REMATCH[1]}\}/${value[${BASH_REMATCH[1]}]}}"
+                done
+                ;;
+            required)
+                printf '# kit:required\n%s=\n' "$key" >> "$work/$section"
+                value[$key]=''
+                continue
+                ;;
+            *)
+                die "$spec: unknown generator '$generator' for '$key'."
+                ;;
+        esac
+
+        value[$key]="$out"
+        printf '%s=%s\n' "$key" "$out" >> "$work/$section"
+    done < "$spec"
+
+    if grep -qF "\${KIT_SECRETS}/$component-db-tls" "$(project_dir "$project")/$component.yml"; then
+        mkdir -p "$tls_dir"
+        openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -subj "/CN=$component-db" \
+            -keyout "$tls_dir/server.key" -out "$tls_dir/server.crt" 2>/dev/null
+        chmod 600 "$tls_dir/server.key" "$tls_dir/server.crt"
+    fi
+
+    for name in "${!section_file[@]}"; do
+        mv "$work/$name" "${section_file[$name]}"
+        chmod 600 "${section_file[$name]}"
+    done
+
+    echo "Wrote ${section_file[app]} and its database and Redis files (mode 0600). Fill every empty value marked '# kit:required' before the first deploy."
+}
+
+# Refuses a deploy while a required value is still empty.
+require_filled_secrets() {
+    local project="$1" component="$2" file
+    file="$(secrets_dir "$project")/$component.env"
+    [ -f "$file" ] || die "no secrets for '$project/$component'; run 'kit secrets $project $component' on this host first."
+    local missing
+    local files=("$file")
+    [ ! -f "${file%.env}.db.env" ] || files+=("${file%.env}.db.env")
+    [ ! -f "${file%.env}.redis.env" ] || files+=("${file%.env}.redis.env")
+    missing="$(awk '/^# kit:required$/ { getline; if ($0 ~ /^[A-Z0-9_]+=$/) print substr($0, 1, length($0) - 1) }' "${files[@]}")"
+    [ -z "$missing" ] || die "required values are empty in $file: $(echo "$missing" | tr '\n' ' ')"
+}
+
+# --- check ----------------------------------------------------------------------
+
+# The project contract, enforced on the merged compose configuration rendered with
+# placeholder digests and empty secret files.
+check_project() {
+    local project="$1"
+    require_project "$project"
+    local fixture
+    fixture="$(mktemp -d)"
+    CLEANUP+=("$fixture")
+
+    local component cu
+    : > "$fixture/images.env"
+    mkdir -p "$fixture/secrets"
+    for component in $(components_of "$project"); do
+        cu="$(upper "$component")"
+        printf 'IMAGE_%s=registry.invalid/kit/check@sha256:%064d\nIMAGE_%s_MIGRATE=registry.invalid/kit/check@sha256:%064d\n' \
+            "$cu" 0 "$cu" 0 >> "$fixture/images.env"
+        : > "$fixture/secrets/$component.env"
+        : > "$fixture/secrets/$component.db.env"
+        : > "$fixture/secrets/$component.redis.env"
+        mkdir -p "$fixture/secrets/$component-db-tls"
+    done
+
+    local files=() f config
+    for f in "$(project_dir "$project")"/*.yml; do
+        files+=(-f "$f")
+    done
+    config="$(KIT_ROOT="$KIT_ROOT" KIT_PROJECT="$project" KIT_SECRETS="$fixture/secrets" \
+        "$KIT_DOCKER" compose --project-name "$project" --project-directory "$(project_dir "$project")" \
+        --env-file "$fixture/images.env" --profile '*' "${files[@]}" config --format json)" \
+        || die "project '$project': the compose files do not render."
+
+    local problems
+    problems="$(jq -r '
+        .services | to_entries[] | .key as $name | .value as $s |
+        ( if (($s.ports // []) | length) > 0 then "\($name): publishes ports; only the edge may" else empty end ),
+        ( if ($s.image // "" | test("@sha256:[0-9a-f]{64}$") | not) then "\($name): image \"\($s.image // "(build)")\" is not pinned by digest" else empty end ),
+        ( if $s.privileged == true then "\($name): privileged" else empty end ),
+        ( if ($s.network_mode // "") == "host" then "\($name): host networking" else empty end ),
+        ( if ($s.pid // "") == "host" then "\($name): host PID namespace" else empty end ),
+        ( if any(($s.volumes // [])[]; (.source // "") | test("docker\\.sock")) then "\($name): mounts the Docker socket" else empty end ),
+        ( if (($s.profiles // []) | length) == 0 and (($s.healthcheck // {}) | .disable == true) then "\($name): healthcheck disabled" else empty end ),
+        ( if (($s.profiles // []) | length) == 0 and ($s.healthcheck == null) then "\($name): long-running service without a healthcheck" else empty end ),
+        ( if (($s.profiles // []) | length) > 0 and (($s.restart // "no") != "no") then "\($name): a one-shot service must not restart" else empty end ),
+        ( if ($s.image // "" | test("^(docker\\.io/)?(library/)?(postgres|redis|mysql|mariadb|mongo)[:@]")) and (($s.networks // {}) | has("edge")) then "\($name): a data service is on the edge network" else empty end ),
+        ( if ($s.hostname // "") != "" then "\($name): a fixed hostname (worker health keys on it)" else empty end ),
+        ( if (($s.cap_add // []) | length) > 0 then "\($name): adds Linux capabilities" else empty end ),
+        ( if (($s.devices // []) | length) > 0 then "\($name): maps host devices" else empty end ),
+        ( if ($s.ipc // "") == "host" then "\($name): host IPC namespace" else empty end ),
+        ( if [($s.network_mode // ""), ($s.pid // ""), ($s.ipc // "")] | any(startswith("container:")) then "\($name): shares another container'"'"'s namespace" else empty end ),
+        ( if ($s.userns_mode // "") == "host" then "\($name): host user namespace" else empty end ),
+        ( if any(($s.security_opt // [])[]; test("unconfined")) then "\($name): an unconfined security profile" else empty end ),
+        ( if any(($s.volumes // [])[]; .type == "bind" and ((.source // "") | test("^/(etc|proc|sys|root|boot|dev|var/lib/docker)?/?$|^/(etc|proc|sys|root|boot|dev|var/lib/docker)/"))) then "\($name): bind-mounts a host system path" else empty end )
+    ' <<<"$config")"
+    # A project joins no network but its own and the edge: another project's
+    # network is another project's data services.
+    problems+=$'\n'"$(jq -r '
+        .networks // {} | to_entries[]
+        | select(.value.external == true and .value.name != "kit-edge")
+        | "network \(.value.name): an external network other than kit-edge"
+    ' <<<"$config")"
+    local site
+    site="$(project_dir "$project")/site.caddy"
+    if [ -f "$site" ] && grep -nE '^[[:space:]]*reverse_proxy' "$site" >/dev/null; then
+        problems+=$'\n'"site.caddy: a bare reverse_proxy; proxy through 'import kit_proxy', which sets the client address"
+    fi
+
+    local key name services line
+    services="$(jq -r '.services | keys[]' <<<"$config")"
+    for component in $(components_of "$project"); do
+        for key in predeploy rollout cron smoke_service backup; do
+            for name in $(conf_get "$project" "$component" "$key"); do
+                grep -qxF -- "$name" <<<"$services" \
+                    || problems+=$'\n'"$component.conf: $key names '$name', which is not a service"
+            done
+        done
+        case "$(conf_get "$project" "$component" environment)" in
+            production|staging) ;;
+            *) problems+=$'\n'"$component.conf: environment= must be production or staging" ;;
+        esac
+        for name in $(conf_get "$project" "$component" predeploy); do
+            jq -e --arg n "$name" '.services[$n].profiles // [] | index("predeploy")' <<<"$config" >/dev/null 2>&1 \
+                || problems+=$'\n'"$component.conf: predeploy service '$name' is not in the predeploy profile"
+        done
+        for name in $(conf_get "$project" "$component" cron); do
+            jq -e --arg n "$name" '.services[$n].profiles // [] | index("cron")' <<<"$config" >/dev/null 2>&1 \
+                || problems+=$'\n'"$component.conf: cron service '$name' is not in the cron profile"
+        done
+    done
+
+    problems="$(sed '/^$/d' <<<"$problems")"
+    if [ -n "$problems" ]; then
+        echo "kit: project '$project' breaks the project contract:" >&2
+        while IFS= read -r line; do
+            echo "  - $line" >&2
+        done <<<"$problems"
+        return 1
+    fi
+}
+
+cmd_check() {
+    local projects=("$@") project failed=0
+    [ "${#projects[@]}" -gt 0 ] || mapfile -t projects < <(all_projects)
+    for project in "${projects[@]}"; do
+        if check_project "$project"; then
+            echo "kit: project '$project' meets the project contract."
+        else
+            failed=1
+        fi
+    done
+    return "$failed"
+}
+
+# --- edge -----------------------------------------------------------------------
+
+edge_compose() {
+    KIT_SRV="$KIT_SRV" "$KIT_DOCKER" compose --project-directory "$KIT_ROOT/edge" \
+        --env-file "$KIT_ROOT/edge/edge.env" -f "$KIT_ROOT/edge/compose.yml" "$@"
+}
+
+edge_reload() {
+    mkdir -p "$KIT_SRV/state"
+    exec 8>"$KIT_SRV/state/.edge.lock"
+    flock -w 120 8 || { log "another edge reload is still running."; return 1; }
+    if [ -z "$(edge_compose ps -q caddy 2>/dev/null)" ]; then
+        log "the edge is not running; start it with 'kit edge up'."
+        exec 8>&-
+        return 0
+    fi
+    # Validates before swapping: a broken site file leaves the old config serving.
+    local status=0
+    edge_compose exec -T caddy caddy reload --config /etc/caddy/Caddyfile || status=1
+    exec 8>&-
+    return "$status"
+}
+
+cmd_edge() {
+    case "${1:-}" in
+        up)
+            mkdir -p "$KIT_SRV/edge/certs"
+            edge_compose up -d --wait
+            ;;
+        reload)
+            edge_reload || die "the edge rejected its configuration; the previous one keeps serving."
+            ;;
+        *)
+            die "usage: kit edge up|reload"
+            ;;
+    esac
+}
+
+# --- deploy / rollback ----------------------------------------------------------
+
+# Prints the image lines for a release of one component, validating each reference
+# against the repository its .conf allows.
+release_lines() {
+    local project="$1" component="$2"
+    shift 2
+    local cu image image_migrate main='' migrate='' arg
+    cu="$(upper "$component")"
+    image="$(conf_get "$project" "$component" image)"
+    image_migrate="$(conf_get "$project" "$component" image_migrate)"
+
+    [ -n "$image" ] && [[ "$image" != *OWNER/REPO* ]] || die "set image= in projects/$project/$component.conf."
+
+    for arg in "$@"; do
+        case "$arg" in
+            migrate=*) migrate="${arg#migrate=}" ;;
+            *=*) die "unknown image target '${arg%%=*}'." ;;
+            *) [ -z "$main" ] || die "more than one image given."; main="$arg" ;;
+        esac
+    done
+
+    [ -n "$main" ] || die "no image given."
+    [[ "$main" =~ $DIGEST_SUFFIX_RE ]] || die "'$main' is not pinned by digest (expected <repository>@sha256:<64 hex>)."
+    [ "${main%@sha256:*}" = "$image" ] || die "'${main%@sha256:*}' is not this component's repository ($image)."
+    printf 'IMAGE_%s=%s\n' "$cu" "$main"
+
+    if [ -n "$image_migrate" ]; then
+        [ -n "$migrate" ] || die "this component also needs migrate=<$image_migrate@sha256:…>."
+        [[ "$migrate" =~ $DIGEST_SUFFIX_RE ]] || die "'$migrate' is not pinned by digest."
+        [ "${migrate%@sha256:*}" = "$image_migrate" ] || die "'${migrate%@sha256:*}' is not this component's migrate repository ($image_migrate)."
+        printf 'IMAGE_%s_MIGRATE=%s\n' "$cu" "$migrate"
+    elif [ -n "$migrate" ]; then
+        die "this component has no migrate image."
+    fi
+}
+
+smoke() {
+    local project="$1" component="$2" service port path body
+    service="$(conf_get "$project" "$component" smoke_service)"
+    port="$(conf_get "$project" "$component" port)"
+    path="$(conf_get "$project" "$component" smoke_path)"
+    body="$(conf_get "$project" "$component" smoke_body)"
+    [ -n "$service" ] || return 0
+
+    "$KIT_DOCKER" run --rm --network "${project}_default" --entrypoint sh \
+        -e SMOKE_ATTEMPTS -e SMOKE_INTERVAL_SECONDS \
+        -v "$KIT_ROOT/lib/smoke-check.sh:/kit/smoke-check.sh:ro" \
+        "$CURL_IMAGE" /kit/smoke-check.sh "http://$service:$port$path" "$body"
+}
+
+rollout() {
+    local project="$1" component="$2" env_file="$3" service
+    for service in $(conf_get "$project" "$component" rollout); do
+        log "starting $service."
+        compose_with "$project" "$env_file" up -d --wait --wait-timeout 300 "$service" || return 1
+    done
+    smoke "$project" "$component"
+}
+
+# One lock per project, held by deploy, rollback, restore, backup and cron, so none
+# of them ever runs against a project another one is changing.
+lock_project() {
+    ensure_state "$1"
+    exec 9>"$(state_dir "$1")/.lock"
+    flock -w "${2:-900}" 9 || die "another operation on '$1' is still running."
+}
+
+# lock_project without waiting: returns 1 when the project is busy.
+try_lock_project() {
+    ensure_state "$1"
+    exec 9>"$(state_dir "$1")/.lock"
+    flock -n 9 || { exec 9>&-; return 1; }
+}
+
+# deploy: pull → pre-deploy dump → predeploy one-shots → rollout → smoke → record.
+# rollback: the same without the dump and the one-shots. Migrations only go
+# forward; the previous release runs against the expanded schema.
+release() {
+    local mode="$1" project="$2" component="$3"
+    shift 3
+    require_component "$project" "$component"
+    require_filled_secrets "$project" "$component"
+
+    # kit=<commit>: the Deploy workflow's view of this repository. Refused when the
+    # host checkout differs, so a host never deploys a .conf or compose file other
+    # than the one the request was resolved against. Not pulled automatically:
+    # what this host runs changes only when its operator pulls.
+    local images=() arg
+    for arg in "$@"; do
+        case "$arg" in
+            env=*)
+                # Set by ssh-dispatch from the key's forced command, never by the request:
+                # a staging key cannot touch a production component on a shared host.
+                [ "${arg#env=}" = "$(conf_get "$project" "$component" environment)" ] \
+                    || die "'$project/$component' is a $(conf_get "$project" "$component" environment) component; this key deploys ${arg#env=} only."
+                ;;
+            kit=*)
+                [[ "${arg#kit=}" =~ ^[0-9a-f]{40}$ ]] || die "invalid kit= commit."
+                local head
+                head="$(git -C "$KIT_ROOT" rev-parse HEAD 2>/dev/null || true)"
+                [ "$head" = "${arg#kit=}" ] \
+                    || die "this host runs kit ${head:-(not a git checkout)}, the request was resolved against ${arg#kit=}; pull /srv/kit first."
+                [ -z "$(git -C "$KIT_ROOT" status --porcelain -- projects templates lib edge bin 2>/dev/null)" ] \
+                    || die "/srv/kit has uncommitted changes; the request was resolved against committed files only."
+                ;;
+            *) images+=("$arg") ;;
+        esac
+    done
+    set -- "${images[@]}"
+
+    check_project "$project" || die "fix the project contract before deploying."
+
+    local lines cu current candidate state
+    lines="$(release_lines "$project" "$component" "$@")"
+    cu="$(upper "$component")"
+
+    if [ "$mode" = rollback ]; then
+        # Only to a release this host has served: a rollback skips the dump and the
+        # migrations, so it must never be a way to put a new image live.
+        # The whole set of images (runtime and migrate) must be one earlier deploy.
+        local wanted deployed
+        wanted=" $(tr '\n' ' ' <<<"$lines")"
+        wanted="${wanted% }"
+        deployed="$(awk -v c="$component" '$2 == "deploy" && $3 == c { $1 = $2 = $3 = ""; sub(/^ +/, " "); print }' \
+            "$(state_dir "$project")/history" 2>/dev/null || true)"
+        grep -qxF -- "$wanted" <<<"$deployed" \
+            || die "${lines#*=} was never deployed here as one release; deploy it instead of rolling back to it."
+    fi
+
+    lock_project "$project"
+    state="$(state_dir "$project")"
+    current="$(images_file "$project")"
+    candidate="$(mktemp "$state/images.XXXXXX")"
+    CLEANUP+=("$candidate")
+    grep -vE "^IMAGE_${cu}(_MIGRATE)?=" "$current" > "$candidate" || true
+    printf '%s\n' "$lines" >> "$candidate"
+
+    local ref
+    while IFS= read -r ref; do
+        ref="${ref#*=}"
+        log "pulling $ref."
+        "$KIT_DOCKER" pull --quiet "$ref" >/dev/null || die "could not pull $ref; nothing was changed."
+    done <<<"$lines"
+
+    if [ "$mode" = deploy ]; then
+        backup_component "$project" "$component" predeploy || die "the pre-deploy dump failed; nothing was changed."
+
+        local service
+        for service in $(conf_get "$project" "$component" predeploy); do
+            log "running $service."
+            compose_with "$project" "$candidate" run --rm "$service" \
+                || die "$service failed; the current release keeps serving."
+        done
+    fi
+
+    if ! rollout "$project" "$component" "$candidate"; then
+        if grep -qE "^IMAGE_${cu}=" "$current"; then
+            log "the new release is not healthy; rolling back to the release before it."
+            rollout "$project" "$component" "$current" || log "ROLLBACK FAILED: the component may be down."
+            echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) failed $component $(tr '\n' ' ' <<<"$lines")" >> "$state/history"
+            die "$mode of '$project/$component' failed and was rolled back."
+        fi
+        die "$mode of '$project/$component' failed; there is no earlier release to roll back to."
+    fi
+
+    mv "$candidate" "$current"
+    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $mode $component $(tr '\n' ' ' <<<"$lines")" >> "$state/history"
+    log "$mode of '$project/$component' is serving."
+
+    # The release is serving whatever happens here; a site file that does not load
+    # leaves the edge on its previous configuration.
+    if [ -n "$(conf_get "$project" "$component" domains)" ] && ! edge_reload; then
+        log "WARNING: the edge did not reload; it keeps its previous configuration. Fix the site file, then 'kit edge reload'."
+    fi
+}
+
+cmd_deploy() {
+    [ "$#" -ge 3 ] || die "usage: kit deploy <project> <component> <image@sha256:…> [migrate=<image@sha256:…>]"
+    release deploy "$@"
+}
+
+cmd_rollback() {
+    [ "$#" -ge 2 ] || die "usage: kit rollback <project> <component> [<image@sha256:…> [migrate=<image@sha256:…>]]"
+    local project="$1" component="$2"
+    shift 2
+    require_component "$project" "$component"
+
+    # env=/kit= words (from ssh-dispatch) travel through to release; the rest name images.
+    local passthrough=() images=() arg
+    for arg in "$@"; do
+        case "$arg" in env=*|kit=*) passthrough+=("$arg") ;; *) images+=("$arg") ;; esac
+    done
+    set -- "${images[@]}"
+
+    if [ "$#" -eq 0 ]; then
+        # The release deployed before the one now serving. Only `deploy` entries
+        # count: walking back from the newest deploy of the serving image, so a second
+        # rollback goes further back instead of returning to what was rolled away from.
+        local cu now line entry=() target=() found=false
+        cu="$(upper "$component")"
+        now="$(file_get "$(images_file "$project")" "IMAGE_$cu")"
+        [ -n "$now" ] || die "'$project/$component' has no release serving."
+        while IFS= read -r line; do
+            read -ra entry <<<"$line"
+            [ "${entry[1]:-}" = deploy ] && [ "${entry[2]:-}" = "$component" ] || continue
+            if [ "$found" = false ]; then
+                [ "${entry[3]#IMAGE_"$cu"=}" != "$now" ] || found=true
+                continue
+            fi
+            [ "${entry[3]#IMAGE_"$cu"=}" != "$now" ] || continue
+            target=("${entry[@]}")
+            break
+        done < <(tac "$(state_dir "$project")/history" 2>/dev/null || true)
+        [ "${#target[@]}" -gt 0 ] || die "no earlier release of '$project/$component' to roll back to."
+
+        set -- "${target[3]#IMAGE_"$cu"=}"
+        [ "${#target[@]}" -lt 5 ] || set -- "$1" "migrate=${target[4]#IMAGE_"${cu}"_MIGRATE=}"
+        log "rolling back to $1."
+    fi
+
+    release rollback "$project" "$component" "$@" "${passthrough[@]}"
+}
+
+# --- run / cron -----------------------------------------------------------------
+
+cmd_run() {
+    [ "$#" -ge 2 ] || die "usage: kit run <project> <service> [args...]"
+    local project="$1" service="$2"
+    shift 2
+    require_project "$project"
+    # Captured first: piped into `grep -q` under pipefail, compose dies of SIGPIPE
+    # whenever the match is not its last line, and the lookup fails at random.
+    local services
+    services="$(compose "$project" --profile '*' config --services)"
+    grep -qxF -- "$service" <<<"$services" || die "project '$project' has no service '$service'."
+    if [ "${1:-}" = --no-deps-run ]; then
+        shift
+        compose "$project" run --rm --no-deps "$service" "$@"
+        return
+    fi
+    compose "$project" run --rm "$service" "$@"
+}
+
+released() { grep -qE "^IMAGE_$(upper "$2")=" "$(images_file "$1")"; }
+
+cron_project() {
+    local project="$1" component service
+    # Busy (the previous minute's run, a deploy, a restore, a backup): skip this
+    # minute rather than pile up or run against a project being changed.
+    try_lock_project "$project" || return 0
+    for component in $(components_of "$project"); do
+        released "$project" "$component" || continue
+        for service in $(conf_get "$project" "$component" cron); do
+            # --no-deps: a scheduler never starts, or recreates, the database it
+            # depends on; if that is down, this minute fails and the next one retries.
+            # Bounded below the 15 minutes a deploy waits for the project lock: work
+            # longer than that belongs on the queue, not in the scheduler's foreground.
+            timeout --kill-after=30s "${KIT_CRON_TIMEOUT:-10m}" \
+                "$KIT_SELF" run "$project" "$service" --no-deps-run || log "$project/$service failed."
+        done
+    done
+    exec 9>&-
+}
+
+cmd_cron() {
+    local project
+    if [ "${1:-}" = --all ]; then
+        # One process per project, started and not waited for: a slow job in one
+        # project must not hold back another's minute. kit-cron.service sets
+        # KillMode=process so systemd leaves them running.
+        for project in $(all_projects); do
+            setsid "$KIT_SELF" cron "$project" </dev/null &
+        done
+    else
+        [ "$#" -eq 1 ] || die "usage: kit cron --all | <project>"
+        require_project "$1"
+        cron_project "$1"
+    fi
+}
+
+# --- backup / restore -----------------------------------------------------------
+
+# Dumps one component's database. Returns non-zero (with the reason logged) when a
+# dump was due and could not be taken; the caller decides whether that is fatal.
+# Beside every dump, <dump>.images records the release serving when it was taken,
+# which is what `restore` puts back.
+backup_component() {
+    local project="$1" component="$2" reason="$3" keep="${4:-}" service dir file
+    service="$(conf_get "$project" "$component" backup)"
+    [ -n "$service" ] || return 0
+    # Before a component's first release there is nothing to dump.
+    [ "$reason" != predeploy ] || released "$project" "$component" || return 0
+    if [ -z "$(compose "$project" ps -q --status running "$service" 2>/dev/null)" ]; then
+        log "$project/$component: $service is not running; no dump was taken."
+        return 1
+    fi
+
+    dir="$KIT_SRV/backups/$project"
+    mkdir -p "$dir"
+    chmod 700 "$dir"
+    file="$dir/$component-$(date -u +%Y%m%dT%H%M%SZ)-$reason.dump"
+
+    log "dumping $project/$service to $file."
+    # A dump waiting on a lock (a migration's ALTER TABLE) gives up instead of
+    # stalling every query queued behind both.
+    if ! (umask 077 && compose "$project" exec -T "$service" \
+        pg_dump -U postgres -d app -Fc --lock-wait-timeout=300s > "$file.partial"); then
+        rm -f "$file.partial"
+        log "$project/$component: the database dump failed."
+        return 1
+    fi
+    if [ ! -s "$file.partial" ]; then
+        rm -f "$file.partial"
+        log "$project/$component: the database dump is empty."
+        return 1
+    fi
+    if ! (umask 077 && cp "$(images_file "$project")" "$file.images") || ! mv "$file.partial" "$file"; then
+        rm -f "$file.partial" "$file.images"
+        log "$project/$component: the dump could not be saved."
+        return 1
+    fi
+
+    # Keep the newest KIT_BACKUP_KEEP dumps of each kind, so a run of deploys never
+    # rotates out the nightly ones. Names are <component>-<UTC time>-<reason>.dump
+    # and sort by time.
+    local dumps=()
+    dumps=("$dir/$component-"*"-$reason.dump")
+    while [ "${#dumps[@]}" -gt "$KIT_BACKUP_KEEP" ]; do
+        # Never the dump a restore is reading from.
+        [ "$(readlink -f "${dumps[0]}")" = "$keep" ] || rm -f "${dumps[0]}" "${dumps[0]}.images"
+        dumps=("${dumps[@]:1}")
+    done
+
+    if [ -n "${KIT_RCLONE_REMOTE:-}" ]; then
+        if ! command -v rclone >/dev/null || ! rclone copy "$file" "$KIT_RCLONE_REMOTE/$project/" \
+            || ! rclone copy "$file.images" "$KIT_RCLONE_REMOTE/$project/"; then
+            log "$project/$component: the off-host copy failed; $file is on this host only."
+            # A deploy is not held hostage by the backup remote; the nightly run is.
+            [ "$reason" = predeploy ] || return 1
+        fi
+    fi
+}
+
+cmd_backup() {
+    local projects=() project component failed=0
+    if [ "${1:-}" = --all ]; then
+        mapfile -t projects < <(all_projects)
+    else
+        [ "$#" -eq 1 ] || die "usage: kit backup --all | <project>"
+        require_project "$1"
+        projects=("$1")
+    fi
+    # Every project is attempted whatever another one does; the exit status says
+    # whether any failed.
+    for project in "${projects[@]}"; do
+        if ! (
+            lock_project "$project" 1800
+            status=0
+            for component in $(components_of "$project"); do
+                released "$project" "$component" || continue
+                backup_component "$project" "$component" scheduled || status=1
+            done
+            exit "$status"
+        ); then
+            log "the backup of '$project' failed."
+            failed=1
+        fi
+    done
+    return "$failed"
+}
+
+# Restores one component's database from a dump, and the release that was serving
+# when it was taken. The dump goes into a new database, swapped in only once it is
+# complete: a failed restore leaves the current data untouched, and a successful one
+# leaves nothing of the current schema behind.
+cmd_restore() {
+    [ "$#" -eq 5 ] && [ "$4" = --confirm ] || die "usage: kit restore <project> <component> <dump> --confirm <project>"
+    local project="$1" component="$2" dump="$3"
+    require_component "$project" "$component"
+    [ "$5" = "$project" ] || die "--confirm must repeat the project name."
+    [ -s "$dump" ] || die "no dump at $dump."
+    [ -s "$dump.images" ] || die "no $dump.images: the release that wrote this dump is unknown."
+
+    local service cu lines
+    service="$(conf_get "$project" "$component" backup)"
+    [ -n "$service" ] || die "component '$component' has no database."
+    cu="$(upper "$component")"
+    lines="$(grep -E "^IMAGE_${cu}(_MIGRATE)?=" "$dump.images" || true)"
+    [ -n "$lines" ] || die "$dump.images has no release of '$component'."
+
+    # Held open from here on, and kept out of the safety dump's pruning.
+    exec 6<"$dump"
+    dump="$(readlink -f "$dump")"
+
+    lock_project "$project"
+    [ -n "$(compose "$project" ps -q --status running "$service" 2>/dev/null)" ] || die "$service is not running."
+
+    local ref
+    while IFS= read -r ref; do
+        "$KIT_DOCKER" pull --quiet "${ref#*=}" >/dev/null || die "could not pull ${ref#*=}; nothing was changed."
+    done <<<"$lines"
+
+    psql_admin() { compose "$project" exec -T "$service" psql -X -q -v ON_ERROR_STOP=1 -U postgres -d postgres "$@"; }
+    local rollout_services current
+    rollout_services="$(conf_get "$project" "$component" rollout)"
+    current="$(images_file "$project")"
+
+    # Stopped before the safety dump, so no write lands after it and is lost.
+    # shellcheck disable=SC2086 # a list of service names
+    compose "$project" stop $rollout_services || die "could not stop $rollout_services; nothing was changed."
+
+    # Any failure until the swap leaves the data as it was: bring the services back.
+    abandon() {
+        psql_admin -c 'DROP DATABASE IF EXISTS app_restore WITH (FORCE)' >/dev/null 2>&1 || true
+        rollout "$project" "$component" "$current" || log "the services did not come back; check them."
+        die "$1; the database is unchanged."
+    }
+    backup_component "$project" "$component" prerestore "$dump" || abandon "the safety dump failed"
+    psql_admin -c 'DROP DATABASE IF EXISTS app_restore WITH (FORCE)' >/dev/null || abandon "could not prepare the restore"
+    psql_admin -v db=app_restore < "$KIT_ROOT/lib/app-database.sql" >/dev/null || abandon "could not create the restore database"
+    compose "$project" exec -T "$service" pg_restore -U postgres -d app_restore --single-transaction --exit-on-error <&6 \
+        || abandon "the restore failed"
+    psql_admin -c 'DROP DATABASE app WITH (FORCE)' -c 'ALTER DATABASE app_restore RENAME TO app' >/dev/null \
+        || die "the swap failed: the restored data is in database app_restore; rename it to app by hand, then 'kit rollback'."
+
+    # From here the data is the dump's, so the state records the dump's release
+    # whatever happens next.
+    local state candidate
+    state="$(state_dir "$project")"
+    candidate="$(mktemp "$state/images.XXXXXX")"
+    CLEANUP+=("$candidate")
+    grep -vE "^IMAGE_${cu}(_MIGRATE)?=" "$current" > "$candidate" || true
+    printf '%s\n' "$lines" >> "$candidate"
+    mv "$candidate" "$current"
+    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) restore $component $(tr '\n' ' ' <<<"$lines")from $(basename "$dump")" >> "$state/history"
+
+    # Queued jobs and cached state (permissions, sessions) describe the data that was
+    # just replaced. Cleared before anything starts, so no worker runs a job for a row
+    # that no longer exists.
+    if grep -qxF -- "$component-redis" <<<"$(compose "$project" --profile '*' config --services)"; then
+        compose "$project" exec -T "$component-redis" redis-cli FLUSHALL >/dev/null \
+            || log "WARNING: could not clear $component-redis; clear queued jobs and caches by hand."
+    fi
+
+    rollout "$project" "$component" "$current" \
+        || die "the data is restored, but its release did not become healthy; check the services."
+    log "restored '$project/$component' from $(basename "$dump"), with the release that wrote it."
+}
+
+# --- ssh-dispatch ---------------------------------------------------------------
+
+# The CI deploy key's forced command (authorized_keys: command="…/kit ssh-dispatch",restrict).
+# It admits exactly `deploy` and `rollback`; every argument is validated again by them.
+cmd_ssh_dispatch() {
+    # The environment this key serves comes from its forced command
+    # (command="…/kit ssh-dispatch production"), never from the request.
+    local environment="${1:-}"
+    case "$environment" in
+        production|staging) ;;
+        *) die "refused: this key has no environment (authorized_keys: command=\"…/kit ssh-dispatch <production|staging>\")." ;;
+    esac
+    local request="${SSH_ORIGINAL_COMMAND:-}"
+    [[ "$request" =~ ^[A-Za-z0-9\ ._:/@=-]+$ ]] || die "refused: the request contains characters outside the allowed set."
+    local words=()
+    read -ra words <<<"$request"
+    case "${words[0]:-}" in
+        deploy|rollback) ;;
+        *) die "refused: only 'deploy' and 'rollback' are allowed over SSH." ;;
+    esac
+    local word kit_words=0
+    for word in "${words[@]}"; do
+        case "$word" in
+            kit=*) kit_words=$((kit_words + 1)) ;;
+            env=*) die "refused: the environment is the key's, not the request's." ;;
+        esac
+    done
+    [ "${words[0]}" != deploy ] || [ "$kit_words" -eq 1 ] || die "refused: a deploy names the kit commit it was resolved against (kit=<commit>)."
+    words+=("env=$environment")
+    command -v logger >/dev/null && logger -t kit "ssh-dispatch: $request" || true
+
+    # The work outlives the SSH session: a cancelled workflow or a dropped
+    # connection must never stop a deploy between its steps. It runs with HUP and
+    # PIPE ignored and its output in a log, which the session follows while it lasts.
+    local dir log
+    dir="$KIT_SRV/state/dispatch"
+    umask 077
+    mkdir -p "$dir"
+    log="$dir/$(date -u +%Y%m%dT%H%M%SZ)-$$.log"
+    : > "$log"
+    (
+        trap '' HUP PIPE
+        status=0
+        "$KIT_SELF" "${words[@]}" >"$log" 2>&1 || status=$?
+        echo "$status" > "$log.status"
+    ) </dev/null &
+    local worker=$!
+    tail -n +1 --pid="$worker" -f "$log" 2>/dev/null || true
+    wait "$worker" 2>/dev/null || true
+
+    # Keep the newest 50 logs: the record of what each dispatch did.
+    local logs=("$dir"/*.log)
+    while [ "${#logs[@]}" -gt 50 ]; do
+        rm -f "${logs[0]}" "${logs[0]}.status"
+        logs=("${logs[@]:1}")
+    done
+    exit "$(cat "$log.status" 2>/dev/null || echo 1)"
+}
+
+# --- conf -----------------------------------------------------------------------
+
+# One deploy setting, for the Deploy workflow: the single reader of .conf files.
+cmd_conf() {
+    [ "$#" -eq 3 ] || die "usage: kit conf <project> <component> <key>"
+    require_component "$1" "$2"
+    [[ "$3" =~ ^[a-z_]+$ ]] || die "invalid key '$3'."
+    conf_get "$1" "$2" "$3"
+    echo
+}
+
+# --- main -----------------------------------------------------------------------
+
+main() {
+    local command="${1:-help}"
+    [ "$#" -eq 0 ] || shift
+    case "$command" in
+        add) cmd_add "$@" ;;
+        secrets) cmd_secrets "$@" ;;
+        edge) cmd_edge "$@" ;;
+        deploy) cmd_deploy "$@" ;;
+        rollback) cmd_rollback "$@" ;;
+        run) cmd_run "$@" ;;
+        cron) cmd_cron "$@" ;;
+        backup) cmd_backup "$@" ;;
+        restore) cmd_restore "$@" ;;
+        check) cmd_check "$@" ;;
+        conf) cmd_conf "$@" ;;
+        ssh-dispatch) cmd_ssh_dispatch "$@" ;;
+        help|-h|--help) sed -n '3,30p' "$KIT_ROOT/bin/kit" | sed 's/^# \{0,1\}//' ;;
+        *) die "unknown command '$command'; see 'kit help'." ;;
+    esac
+}
+
+main "$@"
