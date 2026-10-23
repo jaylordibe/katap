@@ -142,17 +142,17 @@ curl -fsSL https://raw.githubusercontent.com/jaylordibe/katap/main/install.sh | 
 The installer puts the latest release at `/srv/katap` and sets up everything listed
 in [What Katap does](#what-katap-does-and-what-stays-yours).
 
-It then asks for a **GitHub token** (input hidden). The server uses it only to read
-build attestations and check where each image came from. It can't deploy, publish
-or pull anything.
-- Create a [fine-grained personal access token](https://github.com/settings/personal-access-tokens/new), for example named `katap-provenance-read`.
-- Choose **Repository access: Only select repositories**, select your application repositories, and grant **Attestations: Read-only**. GitHub documents that permission for the API Katap uses, for public and private repositories alike.
-- Whether **Public repositories** access alone is enough hasn't been verified; that needs a test with a real account.
+It then asks for a **GitHub token** (input hidden). You set it up once, here:
+- **What it's for:** every deploy of a component that verifies provenance (the default, production included) uses it to read GitHub's build attestations before pulling the image. It can't deploy, publish or pull anything.
+- **Where it lives:** Katap keeps it in `/etc/katap/katap.env` and reads it from there on each deploy.
+- **If it expires or is revoked:** later deploys are refused until you replace it. Running applications keep serving.
 
-[The server's provenance token](docs/connecting-apps.md#the-servers-provenance-token)
-walks through every field, private-repository limits, and rotation. You can press
-Enter to skip it. Components that verify provenance (the default) can't deploy until
-`KATAP_GH_TOKEN` is set in `/etc/katap/katap.env`.
+Create a [fine-grained personal access token](https://github.com/settings/personal-access-tokens/new),
+for example named `katap-provenance-read`. Choose **Only select repositories**,
+select your application repositories, and add the repository permission
+**Attestations: Read-only**. The field-by-field walkthrough, including expiration,
+is in [Create the token](docs/connecting-apps.md#create-the-token). You can press
+Enter to skip the prompt and [add the token later](docs/connecting-apps.md#install-the-token).
 
 **Options:**
 

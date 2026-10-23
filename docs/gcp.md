@@ -95,7 +95,7 @@ action (see
 So choosing "Allow full access to all Cloud APIs":
 
 - grants no IAM permission;
-- gives the server no GitHub access: it still needs `KATAP_GH_TOKEN`, and a registry login for private images;
+- gives the server no GitHub access: it still needs `KATAP_GH_TOKEN` to deploy components that verify provenance, and a registry login for private images;
 - gives GitHub Actions no access to the VM: deploys still use the deploy keys from `connect.sh`.
 
 ## Backups to Cloud Storage

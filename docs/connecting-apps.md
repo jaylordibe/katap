@@ -164,60 +164,82 @@ branches only** are refused too.
 ## The server's provenance token
 
 `KATAP_GH_TOKEN` lets the server read GitHub's build attestations and verify where
-an application image came from. Before a component with `"provenance": "attested"`
-(the default) deploys, `bin/katap` runs:
+an application image came from.
+
+> [!IMPORTANT]
+> **How Katap uses it**
+> - **Every deploy** of a component with `"provenance": "attested"` (the default), staging and production alike, verifies the image with this token before pulling it. Rollbacks, restores and backups don't verify anything and don't use it.
+> - **You set it up once**, on the server, in `/etc/katap/katap.env`. Katap reads it from there on each deploy; you don't create or enter a token per deploy.
+> - **If it expires or is revoked**, later deploys of attested components are refused before anything is pulled or changed, until you [install a new one](#rotate-or-replace-the-token). Applications already running keep serving.
+> - **`"provenance": "none"`** on a component skips the verification, and with it the token. It also removes the protection: anything pushed to that image repository can then be deployed. See [Private repositories](#private-repositories).
+
+The verification `bin/katap` runs:
 
 ```text
 gh attestation verify oci://<image>@<digest> --repo <repo>
    --signer-workflow <repo>/.github/workflows/publish-image.yml --source-ref refs/heads/main …
 ```
 
-It's a read-only verification credential:
-- it doesn't authorise any SSH deploy: deploy keys do that;
-- it doesn't publish or pull images.
+It's a read-only verification credential. It doesn't authorise any SSH deploy, and
+it doesn't publish or pull images. Keep it apart from these credentials:
 
 | Not this token | What that is |
 |---|---|
 | Your administrator SSH key | Logs you in to the server |
 | A repository's deploy key (`KATAP_SSH_KEY`) | Lets that repository's workflow ask the server to deploy one component |
 | Your laptop's `gh` login | Used by `connect.sh` to create environments and secrets |
-| The registry login for private images | Lets the server pull images; see [Private repositories](#private-repositories) |
-
-**When it's needed.** Only for components that verify provenance:
-- The installer lets you skip it (press Enter).
-- A deploy is refused with `set KATAP_GH_TOKEN` only when it reaches a component with `"provenance": "attested"`.
-- If every component sets `"provenance": "none"`, deploys don't use it. That setting removes the check entirely; see [Private repositories](#private-repositories).
+| The registry login for private images | A classic token with `read:packages`, so the server can read private images; see [Private images](#private-images) |
 
 ### Create the token
 
-Sign in to GitHub as a user who can read the application repositories, then open
+Sign in to GitHub as a user who can read the application repositories. Open
 **Settings → Developer settings → Personal access tokens → Fine-grained tokens →
 Generate new token** ([direct link](https://github.com/settings/personal-access-tokens/new)).
-Fill in the form:
+Then fill in the form from top to bottom:
 
-1. **Token name:** for example `katap-provenance-read`. It's only a label.
-2. **Expiration:** pick a date you'll act on. When the token expires, GitHub revokes it, and deploys of attested components are refused until you install a new one; running sites keep serving. An organization can cap token lifetimes (366 days by default for fine-grained tokens), and tokens beyond the cap are rejected for that organization's resources ([token expiration](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/token-expiration-and-revocation)). Set a reminder to [rotate](#rotate-or-replace-the-token) it before then.
-3. **Description:** for example `Allows Katap to read build attestations and verify application image provenance.`
-4. **Resource owner:** the user or organization that owns the application repositories, such as `your-org` for `your-org/shop-api`. A fine-grained token reaches only one owner's resources. If the organization requires approval, enter a justification; see [Organization approval](#organization-approval-and-policies).
-5. **Repository access** and **Permissions:** see [Repository access and permissions](#repository-access-and-permissions).
-6. Select **Generate token**.
+1. **Token name:** `katap-provenance-read`. It's only a suggested label; any name works.
+2. **Description:** `Allows Katap to read build attestations and verify application image provenance.`
+3. **Resource owner:** the user or organization that owns the application repositories, such as `your-org` for `your-org/shop-api`. A token reaches only one owner's resources. If the organization requires approval, a justification box appears below; see [Organization approval and policies](#organization-approval-and-policies).
+4. **Expiration:** a date, or **No expiration** where your organization allows it. GitHub shows a warning recommending a date when you pick **No expiration**. See [Choosing an expiration](#choosing-an-expiration).
+5. **Repository access:** choose **Only select repositories**. Leave **Public repositories** and **All repositories** unselected.
+6. **Select repositories:** open the dropdown and pick every repository whose images this server verifies, which is each `repo` in `/srv/katap.json` with `"provenance": "attested"`. In the example, that's `your-org/shop-api` (the API) and `your-org/shop-web` (the frontend).
+7. **Permissions:** on the **Repositories** tab, select **Add permissions**, choose **Attestations**, and set its **Access** to **Read-only**.
+8. **Metadata** appears on its own, marked **Required**, with **Access: Read-only**. That's expected, so leave it.
+9. Add nothing else. The **Account** tab stays at 0, and nothing is set to write or admin. This setup needs only those two read permissions.
+10. Check that **Selected repositories** lists your application repositories and **Permissions** lists exactly **Attestations** and **Metadata**, both **Read-only**. Then select **Generate token**.
 
-GitHub shows the token once. Copy it into a password manager, or straight into the
-installer prompt. Never put it in git, chat, screenshots, logs or a command line.
+These labels match GitHub's form as of October 2026. GitHub's documentation names
+the sections, but not the buttons and options in steps 4, 7 and 8. If GitHub
+changes the form, look for the same choices under new names.
+
+### Choosing an expiration
+
+Neither choice affects how deploys use the token. Either way it's created once,
+never per deploy.
+
+- **A date** limits how long a leaked token stays useful, but you must replace it before it expires. After expiry, deploys of attested components are refused until you install a new one. Set a reminder.
+- **No expiration** avoids scheduled renewal. GitHub warns against it on the form. The token still stops working if it's revoked or invalidated, or if an organization policy restricts it. Organizations can cap token lifetimes (366 days by default for fine-grained tokens) and reject tokens beyond the cap. See [token expiration](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/token-expiration-and-revocation) and [organization token policies](https://docs.github.com/en/organizations/managing-programmatic-access-to-your-organization/setting-a-personal-access-token-policy-for-your-organization).
+
+Pick what fits how you manage credentials. Either way, the [replacement
+steps](#rotate-or-replace-the-token) are the same.
+
+### After you generate it
+
+1. **Copy the token now.** GitHub shows it only on the page after you generate it. Save it in a password manager. Never put it in git, chat, screenshots, logs or a command line.
+2. **Give it to the server once:** paste it into the installer's hidden prompt, or, if Katap is already installed, put it in `/etc/katap/katap.env`. Both are in [Install the token](#install-the-token).
 
 ### Repository access and permissions
 
-**What's documented.** With `--repo`, `gh attestation verify` fetches attestations
-from GitHub's REST API (`GET /repos/{owner}/{repo}/attestations/{digest}`). For a
-fine-grained token, [GitHub's documentation for that endpoint](https://docs.github.com/en/rest/repos/attestations) requires the
-**`attestations:read`** permission, plus read access to the repository.
-
-**The recommended setting**, for public and private repositories alike:
-- **Repository access: Only select repositories.** Select every repository whose images this server verifies, which is each `repo` in `/srv/katap.json` with `"provenance": "attested"`. For example: `your-org/shop-api` and `your-org/shop-web`.
-- **Permissions → Repository permissions → Attestations: Read-only.** GitHub adds the mandatory **Metadata: Read-only** on its own. Add nothing else.
+The steps above use what GitHub documents. With `--repo`, `gh attestation verify`
+fetches attestations from GitHub's REST API (`GET
+/repos/{owner}/{repo}/attestations/{digest}`). For a fine-grained token,
+[GitHub's documentation for that endpoint](https://docs.github.com/en/rest/repos/attestations)
+requires the **`attestations:read`** permission, plus read access to the
+repository. That's **Only select repositories** with **Attestations: Read-only**,
+for public and private repositories alike.
 
 **Not established:**
-- **Public repositories without that permission.** GitHub says every fine-grained token can read all public repositories, and that some endpoints work on public resources without a permission, but it doesn't say whether this endpoint is one of them. Katap's installer prompt suggests the **Public repositories** access setting, but this documentation hasn't verified that it's enough. Testing it needs a real GitHub account and token. Use the recommended setting unless you've tested the other on your own repositories.
+- **Public repositories without that permission.** GitHub says every fine-grained token can read all public repositories, and that some endpoints work on public resources without a permission, but it doesn't say whether this endpoint is one of them. Katap's installer prompt suggests the **Public repositories** access setting, but this documentation hasn't verified that it's enough. Testing it needs a real GitHub account and token. Use the documented setting unless you've tested the other on your own repositories.
 - **Repositories under another owner.** A token can select repositories of its own resource owner only. Whether a public repository under a different owner can be verified needs the same test.
 
 **Private repositories also need:**
