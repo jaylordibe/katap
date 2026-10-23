@@ -245,6 +245,10 @@ and explains how a change reaches a running application (on its next deploy).
 sudo -u deploy nano /srv/secrets/shop/api.env
 ```
 
+Every component has its own settings file, `/srv/secrets/<project>/<component>.env`.
+- **A `node-ssr` frontend** reads its runtime settings from its file, `web.env` for a component named `web`. `apply` lists nothing there as required, so it never shows under `Fill in`, but you still add what your app reads at runtime: the API's URL, auth secrets, and so on.
+- **A `spa` frontend,** as in this example, has no runtime settings: its values go into the image at build time (see [build-time settings](docs/reference.md#build-time-and-runtime-settings)).
+
 Keep secrets out of git and out of your terminal history and logs:
 
 - Type or paste values into the editor. Don't use `echo KEY=value >> file` or put a value on a command line, where shell history and the process list keep it.
