@@ -145,7 +145,7 @@ in [What Katap does](#what-katap-does-and-what-stays-yours).
 It then asks for a **GitHub token** (input hidden). The server uses it only to read
 build attestations and check where each image came from. It can't deploy, publish
 or pull anything.
-- Create a fine-grained token, for example named `katap-provenance-read`.
+- Create a [fine-grained personal access token](https://github.com/settings/personal-access-tokens/new), for example named `katap-provenance-read`.
 - Choose **Repository access: Only select repositories**, select your application repositories, and grant **Attestations: Read-only**. GitHub documents that permission for the API Katap uses, for public and private repositories alike.
 - Whether **Public repositories** access alone is enough hasn't been verified; that needs a test with a real account.
 

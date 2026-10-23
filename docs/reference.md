@@ -169,7 +169,7 @@ In this mode, Caddy:
 - takes the client's address from `CF-Connecting-IP`.
 
 1. *Cloudflare dashboard:* set **SSL/TLS** encryption mode to **Full (strict)**.
-2. *Cloudflare dashboard:* create an origin certificate under **SSL/TLS → Origin Server → Origin Certificates → Create Certificate**. Cover every domain the server serves and choose the PEM format. Save the certificate as `origin.pem` and the private key as `origin.key`. Cloudflare shows the key only once. Browsers don't trust this certificate: only Cloudflare does. Cloudflare doesn't send expiry reminders for it.
+2. *Cloudflare dashboard:* create an origin certificate under **SSL/TLS → Origin Server → Origin Certificates → Create Certificate**. Cover every domain the server serves and choose the PEM format. Save the certificate as `origin.pem` and the private key as `origin.key`. Cloudflare shows the key only once. Browsers don't trust this certificate: only Cloudflare does. Cloudflare doesn't send expiry reminders for it ([Origin CA](https://developers.cloudflare.com/ssl/origin-configuration/origin-ca/)).
 3. *Cloudflare dashboard:* download the Authenticated Origin Pulls CA certificate (the [`authenticated_origin_pull_ca.pem`](https://developers.cloudflare.com/ssl/static/authenticated_origin_pull_ca.pem) file Cloudflare's documentation links), and save it as `cf-origin-pull-ca.pem`. Then turn on **SSL/TLS → Origin Server → Authenticated Origin Pulls → Global**.
 4. *Server SSH session:* create the three files in `/srv/edge/certs` as the deploy user, for example `sudo -u deploy nano /srv/edge/certs/origin.key`. Then lock down the key: `sudo -u deploy chmod 600 /srv/edge/certs/origin.key`.
 5. *Server SSH session:* set `TLS_MODE=cloudflare` in `/srv/edge/edge.env` (`sudo -u deploy nano /srv/edge/edge.env`), then run `sudo -u deploy /srv/katap/bin/katap edge up`.
@@ -182,9 +182,9 @@ were generated.
 **Checks.** Each one proves one thing. A failed connection only counts as evidence
 when it fails for the expected reason.
 
-1. **Through Cloudflare** (*your computer*): `curl -sSI https://example.com/` returns a `200` status, with a `server: cloudflare` and a `cf-ray` header. This proves visitors get HTTPS from Cloudflare. It doesn't prove Cloudflare reached your origin, or that its client certificate was accepted: Cloudflare can answer from its cache (`CF-Cache-Status: HIT`) without contacting the origin.
+1. **Through Cloudflare** (*your computer*): `curl -sSI https://example.com/` returns a `200` status, with a `server: cloudflare` and a `cf-ray` header. This proves visitors get HTTPS from Cloudflare. It doesn't prove Cloudflare reached your origin, or that its client certificate was accepted: Cloudflare can answer from its cache ([`CF-Cache-Status: HIT`](https://developers.cloudflare.com/cache/concepts/cache-responses/)) without contacting the origin.
 
-   Evidence of an origin request needs a request you can see arrive. Choose an endpoint your Cloudflare cache settings don't cache (by default Cloudflare doesn't cache HTML or JSON, but Cache Rules can change that), request it through Cloudflare, and find that request in the application's logs at the same time (`docker compose -p <project> logs --since 5m <component>`). Katap's edge doesn't log requests itself. A random query string, a `Cache-Control` request header or a response header alone doesn't guarantee the origin was contacted.
+   Evidence of an origin request needs a request you can see arrive. Choose an endpoint your Cloudflare cache settings don't cache (by default Cloudflare [doesn't cache HTML or JSON](https://developers.cloudflare.com/cache/concepts/default-cache-behavior/), but Cache Rules can change that), request it through Cloudflare, and find that request in the application's logs at the same time (`docker compose -p <project> logs --since 5m <component>`). Katap's edge doesn't log requests itself. A random query string, a `Cache-Control` request header or a response header alone doesn't guarantee the origin was contacted.
 2. **The network path to the origin** (*your computer*):
    ```bash
    nc -vz -w 5 203.0.113.10 443
@@ -220,7 +220,7 @@ come from a local test against the same Caddy settings, not from a real Cloudfla
 zone.
 
 **Limits:**
-- Global Authenticated Origin Pulls uses a certificate shared by every Cloudflare account. It proves a request came through Cloudflare, not through your zone. Zone-level pulls with your own CA certificate are stricter, but they're **not tested with Katap**.
+- Global Authenticated Origin Pulls uses a certificate shared by every Cloudflare account. It proves a request came through Cloudflare, not through your zone ([global Authenticated Origin Pulls](https://developers.cloudflare.com/ssl/origin-configuration/authenticated-origin-pull/set-up/global/)). Zone-level pulls with your own CA certificate are stricter, but they're **not tested with Katap**.
 - Cloudflare's IPv4 ranges are written into `edge/Caddyfile` and change only with a Katap release.
 - Port 22 still needs direct access for SSH and deploys: Cloudflare's proxy carries only web traffic.
 

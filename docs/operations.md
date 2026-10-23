@@ -51,7 +51,7 @@ Creating a bucket configures nothing by itself.
 After every dump, Katap runs `rclone copy` for the dump and its `.images` file, as
 the `deploy` user, into `$KATAP_RCLONE_REMOTE/<project>/`.
 
-1. **Install rclone.** *Server, as your administrator.* Provisioning doesn't install it. rclone's own installer is current; distribution packages are often out of date:
+1. **Install [rclone](https://rclone.org/).** *Server, as your administrator.* Provisioning doesn't install it. rclone's own [installer](https://rclone.org/install/) is current; distribution packages are often out of date:
    ```bash
    sudo -v ; curl https://rclone.org/install.sh | sudo bash
    ```
@@ -62,7 +62,7 @@ the `deploy` user, into `$KATAP_RCLONE_REMOTE/<project>/`.
    ```
    - `offsite`: the storage remote, of your provider's type, with the credential from step 2.
    - `offsite-crypt`: type **crypt**, with `remote = offsite:your-bucket/katap`. Use standard filename encryption, and set both a password and a salt (rclone calls it password2). Dumps hold personal data, so encrypt them.
-4. **Keep the crypt password and salt safe, off the server**, in a password manager, together with a copy of `rclone.conf`. Without them, the encrypted copies can't be read. Changing them later makes existing copies unreadable. rclone only obscures these passwords in its config file; it doesn't encrypt them. Don't set an rclone configuration password: Katap's nightly run has no way to supply it, so the copies would fail.
+4. **Keep the crypt password and salt safe, off the server**, in a password manager, together with a copy of `rclone.conf`. Without them, the encrypted copies can't be read. Changing them later makes existing copies unreadable. rclone only obscures these passwords in its config file; it doesn't encrypt them ([rclone crypt](https://rclone.org/crypt/)). Don't set an rclone configuration password: Katap's nightly run has no way to supply it, so the copies would fail.
 5. **Point Katap at the crypt remote.** In `/etc/katap/katap.env` (`sudo nano /etc/katap/katap.env`):
    ```text
    KATAP_RCLONE_REMOTE=offsite-crypt:dumps
@@ -77,7 +77,7 @@ the `deploy` user, into `$KATAP_RCLONE_REMOTE/<project>/`.
 
 **Retention:**
 - **On the server:** the newest `KATAP_BACKUP_KEEP` dumps (14 by default) of each kind are kept per component.
-- **Remote:** Katap never deletes remote copies, so they accumulate. Set a lifecycle or retention rule at your storage provider.
+- **Remote:** Katap never deletes remote copies, because it only runs [`rclone copy`](https://rclone.org/commands/rclone_copy/), so they accumulate. Set a lifecycle or retention rule at your storage provider.
 
 **Monitoring:** Katap sends no alerts.
 - A failed dump or copy fails the nightly `katap-backup.service`.

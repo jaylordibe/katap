@@ -131,7 +131,7 @@ branches only** are refused too.
 1. **Commit `.github/workflows/deploy.yml`** with the command `connect.sh` printed, on `main`.
 2. **Decide who approves production.** In **Settings → Environments → production → Deployment protection rules**:
    - **Required reviewers:** up to six people or teams; one approval releases the job. Until then, the job can't read the environment's secrets, including the deploy key.
-   - **Prevent self-reviews:** whoever started the deployment can't approve it, even if they're a reviewer. It needs **a second eligible reviewer**. A solo maintainer who turns it on can never approve their own deploys.
+   - **Prevent self-reviews:** whoever started the deployment can't approve it, even if they're a reviewer ([deployments and environments](https://docs.github.com/en/actions/reference/workflows-and-actions/deployments-and-environments)). It needs **a second eligible reviewer**. A solo maintainer who turns it on can never approve their own deploys.
    - **Plans:** on GitHub Free, Pro and Team, required reviewers work only in public repositories.
 
    | If you are | Choose | What it protects |
@@ -196,7 +196,7 @@ Generate new token** ([direct link](https://github.com/settings/personal-access-
 Fill in the form:
 
 1. **Token name:** for example `katap-provenance-read`. It's only a label.
-2. **Expiration:** pick a date you'll act on. When the token expires, GitHub revokes it, and deploys of attested components are refused until you install a new one; running sites keep serving. An organization can cap token lifetimes (366 days by default for fine-grained tokens), and tokens beyond the cap are rejected for that organization's resources. Set a reminder to [rotate](#rotate-or-replace-the-token) it before then.
+2. **Expiration:** pick a date you'll act on. When the token expires, GitHub revokes it, and deploys of attested components are refused until you install a new one; running sites keep serving. An organization can cap token lifetimes (366 days by default for fine-grained tokens), and tokens beyond the cap are rejected for that organization's resources ([token expiration](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/token-expiration-and-revocation)). Set a reminder to [rotate](#rotate-or-replace-the-token) it before then.
 3. **Description:** for example `Allows Katap to read build attestations and verify application image provenance.`
 4. **Resource owner:** the user or organization that owns the application repositories, such as `your-org` for `your-org/shop-api`. A fine-grained token reaches only one owner's resources. If the organization requires approval, enter a justification; see [Organization approval](#organization-approval-and-policies).
 5. **Repository access** and **Permissions:** see [Repository access and permissions](#repository-access-and-permissions).
@@ -209,7 +209,7 @@ installer prompt. Never put it in git, chat, screenshots, logs or a command line
 
 **What's documented.** With `--repo`, `gh attestation verify` fetches attestations
 from GitHub's REST API (`GET /repos/{owner}/{repo}/attestations/{digest}`). For a
-fine-grained token, GitHub's documentation for that endpoint requires the
+fine-grained token, [GitHub's documentation for that endpoint](https://docs.github.com/en/rest/repos/attestations) requires the
 **`attestations:read`** permission, plus read access to the repository.
 
 **The recommended setting**, for public and private repositories alike:
@@ -221,13 +221,13 @@ fine-grained token, GitHub's documentation for that endpoint requires the
 - **Repositories under another owner.** A token can select repositories of its own resource owner only. Whether a public repository under a different owner can be verified needs the same test.
 
 **Private repositories also need:**
-- **A plan that offers attestations.** Artifact attestations in private or internal repositories need **GitHub Enterprise Cloud**. On Free, Pro and Team they work in public repositories only. A token can't turn on a feature the plan lacks: the publish workflow can't create attestations, so there's nothing to verify. The publish workflow attests a private repository only when the repository variable `ATTEST_PROVENANCE=true` is set.
+- **A plan that offers attestations.** Artifact attestations in private or internal repositories need **GitHub Enterprise Cloud**. On Free, Pro and Team they work in public repositories only ([actions/attest-build-provenance](https://github.com/actions/attest-build-provenance)). A token can't turn on a feature the plan lacks: the publish workflow can't create attestations, so there's nothing to verify. The publish workflow attests a private repository only when the repository variable `ATTEST_PROVENANCE=true` is set.
 - **One owner per server.** Each token covers one owner, and the server holds one `KATAP_GH_TOKEN`, so one server can verify private repositories from only one owner.
 - **No attestations?** Use the `"provenance": "none"` fallback, and accept what it removes; see [Private repositories](#private-repositories).
 
 ### Organization approval and policies
 
-- If the organization requires approval for fine-grained tokens (the default), the token stays **pending** until an organization owner approves it. A pending token can read only public resources, so it can't verify private repositories. Tokens created by organization owners are approved automatically.
+- If the organization requires approval for fine-grained tokens (the default), the token stays **pending** until an organization owner approves it. A pending token can read only public resources, so it can't verify private repositories. Tokens created by organization owners are approved automatically. See [Setting a personal access token policy for your organization](https://docs.github.com/en/organizations/managing-programmatic-access-to-your-organization/setting-a-personal-access-token-policy-for-your-organization).
 - An organization can block fine-grained tokens entirely, or cap their lifetime; ask an organization owner.
 
 ### Install the token
@@ -334,7 +334,7 @@ still apply.
 ### Private images
 
 A GHCR package has its own visibility, separate from its repository's. A new
-package is **private** even in a public repository. The server reads the image
+package is **private** even in a public repository ([package access and visibility](https://docs.github.com/en/packages/learn-github-packages/configuring-a-packages-access-control-and-visibility)). The server reads the image
 twice:
 - once while verifying provenance (`gh attestation verify oci://…`);
 - once while pulling.
@@ -343,7 +343,7 @@ Both need registry access. So either make the package public, or log the server'
 `deploy` user in to the registry. The token for that login is separate from
 `KATAP_GH_TOKEN`.
 
-**The credential.** GHCR accepts only a **personal access token (classic)**. Give
+**The credential.** GHCR accepts only a **personal access token (classic)** ([Working with the Container registry](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry)). Give
 it the **`read:packages`** scope alone. Create it at **Settings → Developer settings
 → Personal access tokens → Tokens (classic)**, with an expiration.
 - **Account:** the token's GitHub account must be able to read the package. A package published by a repository's workflow inherits that repository's access by default (the **Inherit access from repository** setting). Otherwise, grant the account **Read** under the package's **Manage access**.
