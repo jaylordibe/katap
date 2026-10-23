@@ -225,7 +225,7 @@ steps](#rotate-or-replace-the-token) are the same.
 
 ### After you generate it
 
-1. **Copy the token now.** GitHub shows it only on the page after you generate it. Save it in a password manager. Never put it in git, chat, screenshots, logs or a command line.
+1. **Copy the token now.** GitHub shows it once, with the message "Make sure to copy your personal access token now as you will not be able to see this again." Save it in a password manager. Never put it in git, chat, screenshots, logs or a command line.
 2. **Give it to the server once:** paste it into the installer's hidden prompt, or, if Katap is already installed, put it in `/etc/katap/katap.env`. Both are in [Install the token](#install-the-token).
 
 ### Repository access and permissions
