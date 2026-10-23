@@ -331,6 +331,22 @@ KATAP_DOCKER="$WORK/edge-recorder" katap edge reload >/dev/null 2>&1 || true
 check "the edge's compose reads the same files, defaults first, then the host's" \
     grep -qF -- "--env-file $K/edge/edge.env --env-file $K/srv/edge/edge.env" "$WORK/edge.log"
 check "…and mounts the host's projects directory" bash -c "grep -q 'KATAP_PROJECTS' '$REPO/edge/compose.yml' && ! grep -q '\.\./projects' '$REPO/edge/compose.yml'"
+# compose stats its working directory, and `sudo -u deploy` keeps the caller's, often
+# a home directory deploy cannot read: every compose call must run from /.
+cat > "$WORK/pwd-recorder" <<EOF
+#!/usr/bin/env bash
+echo "\$PWD" >> "$WORK/pwd.log"
+EOF
+chmod +x "$WORK/pwd-recorder"
+: > "$WORK/pwd.log"
+(
+    cd "$WORK" || exit 1
+    KATAP_DOCKER="$WORK/pwd-recorder" katap edge up
+    KATAP_DOCKER="$WORK/pwd-recorder" katap check shop
+    KATAP_DOCKER="$WORK/pwd-recorder" katap run shop api-artisan
+) >/dev/null 2>&1 || true
+check "every compose call runs from /, whichever directory katap was started in (edge, check, project)" \
+    bash -c "[ \"\$(wc -l < '$WORK/pwd.log')\" -ge 3 ] && ! grep -vx / '$WORK/pwd.log'"
 echo TLS_MODE=cloudflare > "$K/srv/edge/edge.env"
 rm -rf "$K/srv/secrets/blog"
 katap secrets blog api >/dev/null

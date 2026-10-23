@@ -187,9 +187,12 @@ compose_with() {
     done
     [ "${#files[@]}" -gt 0 ] || die "project '$project' has no components."
 
-    KATAP_ROOT="$KATAP_ROOT" KATAP_PROJECT="$project" KATAP_SECRETS="$(secrets_dir "$project")" \
+    # From /: compose reads the working directory even with --project-directory,
+    # and `sudo -u deploy` keeps the caller's, often a home directory deploy cannot
+    # read. Every path given to compose is absolute.
+    (cd / && KATAP_ROOT="$KATAP_ROOT" KATAP_PROJECT="$project" KATAP_SECRETS="$(secrets_dir "$project")" \
         "$KATAP_DOCKER" compose --project-name "$project" --project-directory "$(project_dir "$project")" \
-        --env-file "$env_file" "${files[@]}" "$@"
+        --env-file "$env_file" "${files[@]}" "$@")
 }
 
 ensure_state() {
@@ -491,7 +494,8 @@ check_project() {
     for f in "$(project_dir "$project")"/*.yml; do
         files+=(-f "$f")
     done
-    config="$(KATAP_ROOT="$KATAP_ROOT" KATAP_PROJECT="$project" KATAP_SECRETS="$fixture/secrets" \
+    # From /, as compose_with does.
+    config="$(cd / && KATAP_ROOT="$KATAP_ROOT" KATAP_PROJECT="$project" KATAP_SECRETS="$fixture/secrets" \
         "$KATAP_DOCKER" compose --project-name "$project" --project-directory "$(project_dir "$project")" \
         --env-file "$fixture/images.env" --profile '*' "${files[@]}" config --format json)" \
         || die "project '$project': the compose files do not render."
@@ -618,8 +622,9 @@ edge_compose() {
     while IFS= read -r file; do
         env_files+=(--env-file "$file")
     done < <(edge_env_files)
-    KATAP_SRV="$KATAP_SRV" KATAP_PROJECTS="$KATAP_PROJECTS" "$KATAP_DOCKER" compose \
-        --project-directory "$KATAP_ROOT/edge" "${env_files[@]}" -f "$KATAP_ROOT/edge/compose.yml" "$@"
+    # From /, as compose_with does.
+    (cd / && KATAP_SRV="$KATAP_SRV" KATAP_PROJECTS="$KATAP_PROJECTS" "$KATAP_DOCKER" compose \
+        --project-directory "$KATAP_ROOT/edge" "${env_files[@]}" -f "$KATAP_ROOT/edge/compose.yml" "$@")
 }
 
 edge_reload() {
