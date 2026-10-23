@@ -12,7 +12,7 @@ cd /srv/katap
 | Add a project or component | Add it to `/srv/katap.json` (as root), then `bin/katap apply`; see [The projects file](projects-file.md) |
 | Roll back | `bin/katap rollback shop api`: back to the release before the one serving; run it again to go further back. It never runs migrations backwards, so keep migrations expand-only |
 | One-off command | `bin/katap run shop api-artisan <args>`: as the application user, never root |
-| Logs / status | `docker compose -p shop logs -f api` · `docker compose -p shop ps` |
+| Logs / status | `docker compose -p shop logs -f api` · `docker ps --filter label=com.docker.compose.project=shop` (running containers only; check every expected service appears) |
 | Back up now | `bin/katap backup shop`. Also nightly, by timer; 14 of each kind are kept per component (`KATAP_BACKUP_KEEP`) |
 | Off-server copies | Not on by default; see [What a backup covers](#what-a-backup-covers) |
 | Restore | `bin/katap restore shop api /srv/backups/shop/<file>.dump --confirm shop` |
@@ -101,19 +101,260 @@ described the replaced data.
 
 > [!IMPORTANT]
 > **Test a restore before you need one.** A backup that has never been restored is
-> a hope, not a backup. Keep a copy of `/srv/secrets` somewhere safe as well: a
-> dump without its `APP_KEY` cannot decrypt what the application encrypted.
+> a hope, not a backup. Back up `/srv/secrets` separately as well. Laravel needs the
+> original `APP_KEY` to decrypt application-encrypted values restored from the
+> database. The database dump itself is not encrypted by `APP_KEY`; encrypting
+> backup files (an rclone `crypt` remote) is separate.
 
 ## Upgrading PostgreSQL
 
-To a new major version, never with the application serving in between:
+**A minor version** (18.6 → 18.7) uses the same data files. Pin the new digest in
+the `<component>-db` service's `image:`, then recreate that container (step 6 below
+shows how).
 
-1. `docker compose -p <project> stop <component> <component>-worker`;
-2. `bin/katap backup <project>`;
-3. change the image in `/srv/projects/<project>/<component>.yml`;
-4. `docker volume rm <project>_<component>-db`;
-5. `docker compose -p <project> up -d <component>-db` (the database alone);
-6. `bin/katap restore <project> <component> <that dump> --confirm <project>`, which restores the data and starts the release again.
+**A major version** (18 → 19) can't open the old cluster's files. Katap supports a
+**logical dump and restore** into a new, empty cluster, using its own `katap
+backup` and `katap restore`. It doesn't run `pg_upgrade`, and the procedure below
+doesn't mix the two approaches.
 
-The database refuses to start an empty cluster beside an old one. A forgotten step
-stops the database rather than serving an empty one.
+> [!WARNING]
+> This procedure is not covered by Katap's test suite. Rehearse it on a copy (a
+> staging project, or a snapshot of the server) before running it on real data.
+
+### Why the new major gets its own volume
+
+The data volume is mounted at `/var/lib/postgresql`, and Katap's database
+entrypoint refuses to initialise an empty cluster in a volume that already holds
+another major's cluster, which it detects as a `<major>/docker` directory, the layout of the `postgres:18` and later images (`lib/postgres-entrypoint.sh`). So the new major gets a
+**new volume**. The old volume stays untouched until the new database is
+verified, and it's your way back.
+
+Never delete the only copy of the old volume, and never use `docker compose down -v`
+on a project: it removes every volume of every component in it.
+
+### What restore does on the new cluster
+
+On first start, the new cluster creates the `app` role and the `app` database from
+the passwords in `/srv/secrets/<project>/<component>.db.env`. `katap restore` then,
+in order:
+
+1. stops the component's `rollout=` services;
+2. dumps the new, still empty database as a safety copy;
+3. builds `app_restore` with `lib/app-database.sql` and restores the dump into it as the `postgres` superuser, in one transaction;
+4. swaps it in as `app`;
+5. records the release named in the dump's `.images` file;
+6. empties the component's Redis;
+7. rolls the release out again, waiting for healthchecks and the smoke check.
+
+### Limits to plan for
+
+- **Dump version.** The dump comes from the old server's own `pg_dump`. PostgreSQL accepts that, but recommends dumping with the newer version's `pg_dump` for upgrades. Katap has no way to do that, so rehearse.
+- **What the dump holds.** Only the `app` database. Roles other than `app`, and settings made with `ALTER DATABASE … SET` or `ALTER ROLE … SET`, aren't included and must be recreated by hand.
+- **Extensions.** Every extension in the database must exist in the new image. The official image ships PostgreSQL's contrib modules; others, such as PostGIS or pgvector, don't.
+- **A failed restore restarts the application on the new, empty database.** Restore's failure path brings the release back up against the database it just failed to fill. If step 7 fails, go straight to [If the upgrade fails](#if-the-upgrade-fails).
+- **Queued jobs are lost.** Restore empties Redis, so drain the queue before step 3.
+- **Downtime** runs from step 3 until step 8 succeeds.
+- **Every project's scheduled jobs and nightly dumps pause** while the timers are stopped (steps 2 to 9).
+- **Deploy keys stay valid.** Disabling the deploy workflow stops normal deploys; it doesn't revoke the keys.
+
+### Placeholders and where commands run
+
+| Placeholder | Example | Meaning |
+|---|---|---|
+| `<project>` / `<component>` | `shop` / `api` | The component whose database you upgrade |
+| `<new image>` | `postgres:19.1@sha256:…` | The new major, pinned by digest; `katap check` refuses a tag alone |
+| `<new volume>` | `api-db-pg19` | A volume name not used in the project yet |
+| `your-org/shop-api` | | Each repository that deploys to this project |
+
+Server commands run in an SSH session as your administrator (`sudo` lines) or as
+the deploy user (after `sudo -iu deploy`).
+
+### Before you start
+
+- Find the new image's digest (*server, either user*): `docker buildx imagetools inspect postgres:19.1` prints a `Digest:` line.
+- Check where the new image keeps its data: `docker image inspect <new image> --format '{{json .Config.Volumes}} {{.Config.Env}}'`. Both the declared volume and `PGDATA` must be at or under `/var/lib/postgresql`, where Katap mounts the named volume, as in `postgres:18`. An image that declares its volume elsewhere (`postgres:17` and earlier use `/var/lib/postgresql/data`) would put the cluster in an anonymous volume, outside Katap's named volume. Those data can be lost when the container is replaced, for example when its image changes.
+- Check what writes to this database (*server*): `grep -E '^(rollout|cron|predeploy|backup)=' /srv/projects/<project>/<component>.conf`.
+  - `rollout=` lists the long-running services: for laravel-api, `<component>-worker <component>`; for nestjs-api, `<component>`, which runs its queue worker in-process.
+  - `cron=` is the per-minute scheduler.
+  - `predeploy=` runs only during deploys.
+  - Other components normally have databases of their own.
+- Rehearse, and announce the downtime.
+
+### 1. Stop deploys
+
+*Your computer.* For each repository that deploys to the project:
+
+```bash
+gh workflow disable Deploy --repo your-org/shop-api
+gh run list --repo your-org/shop-api --workflow Deploy --status in_progress   # must print nothing
+```
+
+Don't approve any deploy still waiting for review.
+
+### 2. Stop scheduled work
+
+*Server, as your administrator.*
+
+```bash
+sudo systemctl stop katap-cron.timer katap-backup.timer
+```
+
+A job already running finishes on its own. Step 4's backup waits for it, because
+both take the project's lock.
+
+### 3. Stop the application
+
+*Server, as the deploy user.* Open a shell, then define a helper that runs Docker
+Compose with exactly the files, settings and image digests `bin/katap` uses:
+
+```bash
+sudo -iu deploy
+P=shop C=api                      # <project> and <component>
+kcompose() {
+    local files=() f
+    for f in /srv/projects/"$P"/*.yml; do files+=(-f "$f"); done
+    KATAP_ROOT=/srv/katap KATAP_PROJECT="$P" KATAP_SECRETS=/srv/secrets/"$P" \
+        docker compose --project-name "$P" --project-directory /srv/projects/"$P" \
+        --env-file /srv/state/"$P"/images.env "${files[@]}" "$@"
+}
+```
+
+Stop the API first, so no new requests or jobs arrive:
+
+```bash
+kcompose stop "$C"
+```
+
+For laravel-api, wait until the queue is empty, then stop the worker. How you
+check the queue depends on your application.
+
+```bash
+kcompose stop "$C-worker"
+```
+
+**Downtime starts here.**
+
+**Checkpoint:** `docker ps --filter label=com.docker.compose.project=$P` shows
+`$C-db` and `$C-redis` running, and no `$C`, `$C-worker` or scheduler container.
+
+### 4. Take the final dump and copy it off the server
+
+*Server, as the deploy user.*
+
+```bash
+/srv/katap/bin/katap backup "$P"
+DUMP="$(ls -t /srv/backups/"$P"/"$C"-*-scheduled.dump | head -n 1)"
+echo "$DUMP"; cat "$DUMP.images"
+kcompose exec -T "$C-db" pg_restore --list < "$DUMP" > /dev/null && echo "dump is readable"
+sha256sum "$DUMP" "$DUMP.images"
+```
+
+`katap backup` dumps every component of the project that has a database. Note a
+few row counts too (`kcompose exec -T "$C-db" psql -U postgres -d app -Atc 'select
+count(*) from users'`), so you can compare them after the restore.
+
+*Your computer.* Copy the dump, its `.images` file and the project's secrets
+off the server. The secrets hold the passwords the new cluster will use, the
+application's `APP_KEY`, and the database TLS certificate. Then compare checksums:
+
+```bash
+D=api-20261023T030000Z-scheduled.dump    # the file name step 4 printed
+for f in "$D" "$D.images"; do
+    ssh admin@203.0.113.10 sudo cat "/srv/backups/shop/$f" > "$f"
+done
+ssh admin@203.0.113.10 sudo tar -C /srv/secrets -czf - shop > shop-secrets.tgz
+shasum -a 256 "$D" "$D.images"
+```
+
+Keep `shop-secrets.tgz` encrypted and private.
+
+**Checkpoint:** don't continue until the checksums match the server's.
+
+### 5. Point the database at a new volume and image
+
+*Server, as the deploy user.* Keep a copy of the compose file. Its name must not end
+in `.yml`, because Katap loads every `*.yml` in the project directory:
+
+```bash
+cp /srv/projects/"$P"/"$C".yml /srv/projects/"$P"/"$C".yml.before-upgrade
+nano /srv/projects/"$P"/"$C".yml
+```
+
+Make three edits:
+
+1. In the `<component>-db` service, set `image:` to `<new image>`.
+2. In the same service, change the volume line `- <component>-db:/var/lib/postgresql` to `- <new volume>:/var/lib/postgresql`.
+3. Under the top-level `volumes:` key at the end of the file, add `  <new volume>:`.
+
+Then:
+
+```bash
+diff /srv/projects/"$P"/"$C".yml.before-upgrade /srv/projects/"$P"/"$C".yml
+/srv/katap/bin/katap check "$P"
+```
+
+`katap check` must pass. The diff should show only those three edits.
+
+### 6. Start the new database alone
+
+```bash
+kcompose up -d "$C-db"
+docker ps --filter label=com.docker.compose.project="$P"     # $C-db shows (healthy)
+kcompose exec -T "$C-db" psql -U postgres -d app -Atc 'select version()'
+docker volume ls --filter name="${P}_${C}-db"                 # the old volume is still there
+```
+
+Compose recreates the database container on the new volume. The old volume is no
+longer attached to any container, and it isn't changed.
+
+### 7. Restore into the new cluster
+
+```bash
+/srv/katap/bin/katap restore "$P" "$C" "$DUMP" --confirm "$P"
+```
+
+**Success** ends with `restored '<project>/<component>' from <file>, with the
+release that wrote it.` On any failure, go to [If the upgrade fails](#if-the-upgrade-fails).
+
+### 8. Verify
+
+- `select version()` (step 6) names the new major.
+- Your row counts from step 4 match.
+- `docker ps --filter label=com.docker.compose.project=$P` shows every service `(healthy)`.
+- The public URL answers, and you can sign in and read data, including values the application encrypts.
+
+### 9. Resume
+
+*Server, as your administrator*, then *your computer*:
+
+```bash
+sudo systemctl start katap-cron.timer katap-backup.timer
+gh workflow enable Deploy --repo your-org/shop-api
+```
+
+Then take a dump on the new version and check that it works:
+`/srv/katap/bin/katap backup <project>`, as the deploy user.
+
+Keep the old volume, the `.before-upgrade` file and the off-server dump until
+you're confident. To remove the old volume later (irreversible), first confirm that
+`docker ps -a --filter volume=<project>_<component>-db` lists nothing, then run
+`docker volume rm <project>_<component>-db`.
+
+### If the upgrade fails
+
+The old volume still holds the cluster exactly as it was at step 4. *Server, as
+the deploy user*, with the helper from step 3:
+
+```bash
+kcompose stop "$C" "$C-worker"          # nestjs-api: "$C" only
+cp /srv/projects/"$P"/"$C".yml.before-upgrade /srv/projects/"$P"/"$C".yml
+kcompose up -d "$C-db"                   # the old image on the old volume
+for s in $(sed -n 's/^rollout=//p' /srv/projects/"$P"/"$C".conf); do kcompose up -d --wait "$s"; done
+```
+
+`/srv/state/<project>/images.env` names the release that was serving before
+step 3, even if the restore got as far as recording the dump's release: they're the
+same one. Then resume as in step 9.
+
+Anything written to the new database after step 7 isn't in the old one. If the
+restore emptied Redis, the jobs it held are gone.

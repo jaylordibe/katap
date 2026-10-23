@@ -41,7 +41,7 @@
 
 | Symptom | Likely cause | Check |
 |---|---|---|
-| `502` from the edge | The upstream container is down or unhealthy | `docker compose -p <project> ps` |
+| `502` from the edge | The upstream container is down or unhealthy | `docker ps --filter label=com.docker.compose.project=<project>`: a missing service is not running |
 | No certificate (acme) | DNS not pointing at the server yet, or 80/443 blocked upstream | `docker compose -p katap-edge logs caddy` |
 | `525` / `526` from Cloudflare | Origin certificate missing or wrong, or Authenticated Origin Pulls off | `ls -l /srv/edge/certs`, the Cloudflare dashboard |
 | Every client shares one IP | The application does not trust the edge's address | nestjs-api: `TRUST_PROXY` = `CADDY_IP`; laravel-api: `TRUSTED_PROXIES=0.0.0.0/0` |

@@ -160,9 +160,13 @@ private ones. You can press Enter to skip, but deploys are refused until
 timers and the edge:
 
 ```bash
-systemctl list-timers 'katap-*'        # katap-cron.timer and katap-backup.timer
-sudo docker compose -p katap-edge ps   # the caddy service, running
+systemctl list-timers 'katap-*'
+sudo docker ps --filter label=com.docker.compose.project=katap-edge
 ```
+
+The first should list `katap-cron.timer` and `katap-backup.timer`. `docker ps` lists
+running containers only: the edge's `katap-edge-caddy-1` should appear with a status
+of `Up …`. It has no healthcheck, so no `(healthy)` is shown.
 
 ### 2. Describe your projects and apply
 
@@ -241,8 +245,10 @@ Keep secrets out of git and out of your terminal history and logs:
 - To see what's still missing without printing any values, run `sudo -u deploy /srv/katap/bin/katap apply` again. It lists empty keys by name only.
 
 The files are mode 0600 and generated once; Katap never regenerates or overwrites
-them. Back up `/srv/secrets` somewhere safe: a database dump can't be decrypted
-without its `APP_KEY`.
+them. Back up `/srv/secrets` separately. Laravel needs the original `APP_KEY` to
+decrypt application-encrypted values restored from the database. The database dump
+itself is not encrypted by `APP_KEY`; encrypting backup files, for example with an
+rclone `crypt` remote, is a separate step (see [Backups](#backups-whats-covered)).
 
 ### 4. Add DNS records
 
@@ -339,10 +345,13 @@ environment, if you add one, deploys after every publish from `staging`.
 Work through each check yourself:
 
 - [ ] **Workflow:** in GitHub, the **Deploy** run for `production` succeeded, and its log shows `is serving` and `smoke check: ready`.
-- [ ] **Services healthy**, *where: Server SSH session*: every long-running service's status shows `(healthy)`.
+- [ ] **Services running and healthy**, *where: Server SSH session*: `docker ps` lists running containers only, so check that every expected service appears.
   ```bash
-  sudo -u deploy docker compose -p shop ps
+  sudo docker ps --filter label=com.docker.compose.project=shop
   ```
+  - For this example, look for `shop-api-1`, `shop-api-worker-1`, `shop-api-db-1`, `shop-api-redis-1` and `shop-web-1`. A missing one has stopped or never started.
+  - Each status should read `Up … (healthy)`. `katap check`, which every deploy runs, refuses a long-running project service without a healthcheck.
+  - One-shot services such as `api-migrate` aren't expected here.
 - [ ] **Public API**, *where: Your computer*: you get `HTTP 200` and a body containing `"status":"ready"`.
   ```bash
   curl -sS -w '\nHTTP %{http_code}\n' https://api.example.com/api/health/ready

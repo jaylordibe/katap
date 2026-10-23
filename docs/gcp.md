@@ -69,8 +69,19 @@ behave:
 - **`install.sh --harden-ssh`** refuses unless an `authorized_keys` *file* exists for the sudo user or for root. OS Login supplies keys without such a file, so with an OS Login account the check refuses unless root has one. Hardening also turns off keyboard-interactive login, which two-step verification prompts may rely on (**unverified**: test it before relying on it). Skip `--harden-ssh` and use OS Login's own controls instead.
 - **`connect.sh`** runs `ssh` with `BatchMode=yes` and `sudo -n`. It can't answer an OS Login two-step verification prompt or a sudo password. With OS Login 2FA on, run `connect.sh` as a local administrator account with a key and passwordless sudo, or follow [Doing it by hand](connecting-apps.md#doing-it-by-hand).
 
-Your OS Login account needs `roles/compute.osAdminLogin` for sudo. Check that sudo
-doesn't ask for a password with `sudo -n true`.
+**Permissions for the human administrator.** These are IAM roles granted to *your*
+Google account, not to the VM (see
+[Set up OS Login](https://docs.cloud.google.com/compute/docs/oslogin/set-up-oslogin)):
+- `roles/compute.osAdminLogin`, on the project or the instance: login with sudo, which installing Katap and running `connect.sh` need. `roles/compute.osLogin` alone gives login without sudo.
+- `roles/iam.serviceAccountUser`, granted **on the VM's attached service account**, when the VM has one. Google requires it for every user who connects to such a VM.
+- `roles/iap.tunnelResourceAccessor`, only if you connect through IAP.
+
+Check that sudo doesn't ask for a password with `sudo -n true`.
+
+**These grants are separate from the VM service account's own permissions**
+(below). `roles/iam.serviceAccountUser` lets *you* act as that service account. It
+gives the service account nothing, and the service account's roles give you no
+login.
 
 ## Service accounts and scopes
 
