@@ -8,7 +8,7 @@
 | **Deploy keys** | One per application and environment: `restrict,command="katap ssh-dispatch <environment> <project> <component>"`. A key can deploy its own component, or roll it back to a release this server has served, with validated arguments, one at a time, and nothing else. Each dispatch is logged with the key's binding and the client address |
 | **What may deploy** | `/srv/katap.json` is root's and only read by the deploy user. A deploy is refused while a component's `.conf` disagrees with it |
 | **The tool** | `/srv/katap` is root's, at the commit of a release. A deploy refuses a tool with local modifications, or one not at the commit `/etc/katap/release` names |
-| **Destructive operations** | None are automated. Nothing drops a volume, regenerates a key or runs a fresh migration. `restore` is human-only, needs `--confirm`, and dumps first. `apply` never removes anything |
+| **Destructive operations** | Katap automates none. Nothing drops a volume, regenerates a key or runs a fresh migration. `restore` is human-only, needs `--confirm`, and dumps first. `apply` never removes anything. The application's own forward migrations do run on every deploy, after a pre-deploy dump, and are never reversed automatically |
 
 ## The installer and connect.sh
 

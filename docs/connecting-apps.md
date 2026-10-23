@@ -21,11 +21,15 @@ What each type expects from its image is in [Reference](reference.md#what-each-t
 curl -fsSL https://raw.githubusercontent.com/jaylordibe/katap/main/connect.sh | bash -s -- root@203.0.113.10
 ```
 
-`katap apply` prints this line with your server's address. Add project names after
-the address to connect only those projects. It needs:
-- `ssh`, `ssh-keygen`, `jq`, `base64` and the [GitHub CLI](https://cli.github.com/), signed in (`gh auth login`) as an administrator of the repositories;
-- SSH to the server as root, or as a user with passwordless sudo;
-- the server already in your `known_hosts`. Connect once by hand, and check the fingerprint against your provider's console.
+`katap apply` prints this line with your server's address and `root@`. Use whichever
+administrator account you log in with, for example `admin@203.0.113.10`, or a
+`Host` alias from `~/.ssh/config`. An alias is how you pick a non-default key: the
+script has no key option. See [The SSH keys involved](../README.md#the-ssh-keys-involved).
+Add project names after the address to connect only those projects. It needs:
+- `bash`, `curl`, `ssh`, `ssh-keygen`, `jq` and the [GitHub CLI](https://cli.github.com/), signed in (`gh auth login`) as an administrator of the repositories;
+- SSH to the server as root, or as a user with passwordless sudo. It runs `ssh` with `BatchMode=yes` and `sudo -n`, so nothing can prompt: a passphrase-protected key must already be in `ssh-agent`, and a login that needs a password or a second factor fails;
+- the server's ed25519 host key already in your `known_hosts`. Connect once by hand, and check the fingerprint against your provider's console;
+- `host` set in `/srv/katap.json`. That's the address GitHub Actions deploys to, always on port 22.
 
 It reads the components `/srv/katap.json` declares from the server and checks every
 value. It also checks two things:
@@ -64,6 +68,7 @@ In each repository:
    - turn on "Prevent self-review".
 
    `connect.sh` limits deployment branches but leaves approval rules to you, and prints the link.
+   On GitHub Free, Pro and Team, required reviewers work only in public repositories. Without them, anyone who can run the workflow on `main` can deploy to production.
 3. **Protect `main`** with a ruleset: require a pull request, block force pushes, no bypass. Whoever can change the deploy workflow on `main` can use the key.
 
 After that:
@@ -81,18 +86,30 @@ After that:
 
 ## Private repositories
 
+The deploy setup relies on environment secrets and deployment branch limits. In a
+private repository, those need GitHub Pro, Team or Enterprise: on GitHub Free,
+environment secrets exist only in public repositories.
+
 Attestations need a public repository, or a GitHub plan that offers them on
-private ones (set `ATTEST_PROVENANCE=true` in the publish workflow). Without them,
+private ones (set the repository variable `ATTEST_PROVENANCE=true`, which the
+publish workflow reads). The server's `KATAP_GH_TOKEN` then needs "Attestations:
+read" on that repository. Without them,
 set `"provenance": "none"` for that component in `/srv/katap.json`. The server then
 deploys anything pushed to that image repository, and logs a warning on every
 deploy.
 
-If the images are private, log the deploy user in to the registry with a token
-that can only read packages:
+If the images are private, the server needs its own login to pull them. This is
+separate from `KATAP_GH_TOKEN`, which only checks provenance. On the server, log
+the deploy user in to the registry with a token that can only read packages (for
+GHCR, a personal access token (classic) with only `read:packages`):
 
 ```bash
 sudo -u deploy docker login ghcr.io -u <you> --password-stdin
 ```
+
+Paste the token, then press Enter and Ctrl-D. It never reaches your shell history.
+The deploy workflow resolves the image tag with its own built-in token
+(`packages: read`), so the workflow itself needs no extra secret.
 
 ## Doing it by hand
 

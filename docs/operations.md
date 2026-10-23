@@ -14,7 +14,7 @@ cd /srv/katap
 | One-off command | `bin/katap run shop api-artisan <args>`: as the application user, never root |
 | Logs / status | `docker compose -p shop logs -f api` · `docker compose -p shop ps` |
 | Back up now | `bin/katap backup shop`. Also nightly, by timer; 14 of each kind are kept per component (`KATAP_BACKUP_KEEP`) |
-| Off-server copies | Install rclone and set `KATAP_RCLONE_REMOTE=remote:bucket/path` in `/etc/katap/katap.env`. Use an rclone `crypt` remote, because dumps hold personal data |
+| Off-server copies | Not on by default; see [What a backup covers](#what-a-backup-covers) |
 | Restore | `bin/katap restore shop api /srv/backups/shop/<file>.dump --confirm shop` |
 | Change a site | Edit `/srv/projects/<project>/site.caddy`, then `bin/katap edge reload` |
 | Change the TLS mode or edge address | Set it in `/srv/edge/edge.env` (it overrides `edge/edge.env` key by key), then `bin/katap edge up` |
@@ -24,6 +24,29 @@ cd /srv/katap
 Back up `/srv/katap.json`, `/srv/projects` and `/srv/secrets` together, or keep the
 first two in a repository of your own. Never edit files in `/srv/katap`: a deploy
 refuses to run while the tool has local modifications.
+
+## What a backup covers
+
+`katap backup` (nightly through `katap-backup.timer`, around 03:00 server time, and
+before every deploy) dumps **each component's PostgreSQL database** to
+`/srv/backups/<project>/`. Each dump has a `.images` file beside it that records the
+release serving at the time. The newest 14 of each kind (`scheduled`, `predeploy`,
+`prerestore`) are kept per component (`KATAP_BACKUP_KEEP`).
+
+It does not cover:
+- Redis (queues, caches, sessions);
+- files the application writes inside its containers or to other Docker volumes. Keep uploads in object storage;
+- `/srv/secrets`, `/srv/katap.json`, `/srv/projects`, `/etc/katap` or Caddy's certificates.
+
+**The dumps stay on this server** unless you set up off-server copies:
+1. Install [rclone](https://rclone.org/) yourself. Provisioning doesn't install it.
+2. Configure a remote for the `deploy` user, which runs the backups: `sudo -iu deploy rclone config`. Use an rclone `crypt` remote, because dumps hold personal data.
+3. Set `KATAP_RCLONE_REMOTE=<remote>:<bucket>/<path>` in `/etc/katap/katap.env`.
+4. Run `bin/katap backup <project>` and check that the copy arrived.
+
+Creating a bucket in a cloud console connects nothing by itself. A failed copy fails
+the nightly run (`systemctl status katap-backup.service`). Before a deploy it's
+logged, and the deploy goes ahead.
 
 ## Is one server enough?
 
@@ -44,7 +67,10 @@ Yes, for side projects, internal tools and low-traffic products. There are two c
 
 ## What a deploy does
 
-Every step either succeeds or leaves the current release serving.
+A failure before the **Migrate** step changes nothing. From **Migrate** on, the
+database may already have changed, and nothing undoes a migration: keep migrations
+backward compatible (expand-only), so the previous release still runs on the new
+schema, and use the pre-deploy dump with `restore` when that isn't enough.
 
 | Step | What happens | If it fails |
 |---|---|---|
@@ -53,12 +79,15 @@ Every step either succeeds or leaves the current release serving.
 | **Verify** | `gh attestation verify`: built by `source_repo`'s `publish-image.yml`, from `main` for production. Runtime and migrate images come from one commit | Refused; nothing changed |
 | **Pull** | `docker pull` by digest | Nothing changed |
 | **Dump** | `pg_dump` of the component's database, kept with the nightly dumps | Refused; nothing changed |
-| **Migrate** | One-shots in order. Laravel: `migrate`, then `permissions`. Nest: the migrate image (Prisma deploy + RBAC sync) | The current release keeps serving |
-| **Roll out** | Services recreated in order (Laravel: worker, then API), waiting for each healthcheck. Caddy holds requests across the swap | **Automatic rollback** to the previous release |
+| **Migrate** | One-shots in order. Laravel: `migrate`, then `permissions`. Nest: the migrate image (Prisma deploy + RBAC sync) | The current release keeps serving; migrations that already ran stay applied |
+| **Roll out** | Services recreated in order (Laravel: worker, then API), waiting for each healthcheck. Caddy holds requests across the swap | **Automatic rollback** to the previous images; the schema stays migrated. On a component's first deploy there is nothing to roll back to. If the rollback itself fails, the log says `ROLLBACK FAILED` and the component may be down |
 | **Smoke check** | An HTTP check from inside the project network: 200, the expected body, no redirects followed | **Automatic rollback** |
 | **Record** | The release joins the project's history | — |
 
-The action then checks the public URL with the same smoke check. The deploy runs
+The action then checks the public URL with the same smoke check. A failure there
+fails the workflow, but the new release stays serving: nothing rolls back. The
+first deploy of a component takes no pre-deploy dump, because it has no data yet.
+The deploy runs
 detached on the server, so a cancelled workflow or a dropped connection never stops
 it halfway. Its log is in `/srv/state/.dispatch/<project>/`.
 
