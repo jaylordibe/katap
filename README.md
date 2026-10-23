@@ -75,7 +75,7 @@ or need.
 **Administrator access**
 
 - You can **SSH into the server with a key** as `root`, or as an administrator account with **passwordless `sudo`**. The installer can prompt for a sudo password, but `connect.sh` runs `sudo -n` and fails if sudo asks for one. To check, run `ssh admin@203.0.113.10 sudo -n true` from your computer.
-- The server's **ed25519 host key** must already be in your computer's `known_hosts`, checked against your provider's console. See [the SSH keys involved](#the-ssh-keys-involved).
+- The server's **ed25519 host key** must already be in your computer's `known_hosts`, checked against the fingerprint your provider's console shows. [Server access and identity](docs/server-access.md) covers the key, a non-default key, the agent and the sudo check.
 
 **Your computer**
 
@@ -84,10 +84,10 @@ or need.
 
 **GitHub and your images**
 
-- Each application in a GitHub repository that **publishes its image** from `.github/workflows/publish-image.yml`, at exactly that path. Forks of `laravel-api` and `nestjs-api` already ship one. Other apps copy [`examples/publish-image.yml`](examples/publish-image.yml). Production images must be built from `main`, and staging images from `main` or `staging`. Those branch names are fixed.
+- Each application in a GitHub repository that **publishes its image** from `.github/workflows/publish-image.yml`, at exactly that path. Forks of `laravel-api` and `nestjs-api` already ship one. Other apps copy [`examples/publish-image.yml`](examples/publish-image.yml). It adds no `Dockerfile`, and its `test` job is a placeholder to replace with your real tests (see [image expectations](docs/reference.md#what-each-template-expects-from-an-image)). Production images must be built from `main`, and staging images from `main` or `staging`. Those branch names are fixed.
 - **Provenance:** by default the server deploys only images that GitHub attests were built by that workflow. Public repositories get attestations on every plan. For a **private repository**, attestations depend on your GitHub plan. Without them you must opt out per component with `"provenance": "none"`, which lets anything pushed to that image repository deploy. See [private repositories](docs/connecting-apps.md#private-repositories).
 - **Private repositories also need a paid plan for the deploy setup.** On GitHub Free, environment secrets exist only in public repositories. On GitHub Free, Pro and Team, required reviewers work only in public repositories.
-- **Private images** need a read-only registry login on the server (see [Credentials at a glance](#credentials-at-a-glance)).
+- **A new GHCR package is private, even in a public repository.** The server can verify and pull an image only after you make the package public, or give the server a read-only registry login. See [Private images](docs/connecting-apps.md#private-images).
 
 ## Quick start
 
@@ -142,18 +142,23 @@ curl -fsSL https://raw.githubusercontent.com/jaylordibe/katap/main/install.sh | 
 The installer puts the latest release at `/srv/katap` and sets up everything listed
 in [What Katap does](#what-katap-does-and-what-stays-yours).
 
-It then asks for a **GitHub token** (input hidden). The server uses it only to check
-where each image came from. Create a
-[fine-grained token](https://github.com/settings/personal-access-tokens/new) with
-**read-only access to public repositories**, or with **Attestations: read** on
-private ones. You can press Enter to skip, but deploys are refused until
+It then asks for a **GitHub token** (input hidden). The server uses it only to read
+build attestations and check where each image came from. It can't deploy, publish
+or pull anything.
+- Create a fine-grained token, for example named `katap-provenance-read`.
+- Choose **Repository access: Only select repositories**, select your application repositories, and grant **Attestations: Read-only**. GitHub documents that permission for the API Katap uses, for public and private repositories alike.
+- Whether **Public repositories** access alone is enough hasn't been verified; that needs a test with a real account.
+
+[The server's provenance token](docs/connecting-apps.md#the-servers-provenance-token)
+walks through every field, private-repository limits, and rotation. You can press
+Enter to skip it. Components that verify provenance (the default) can't deploy until
 `KATAP_GH_TOKEN` is set in `/etc/katap/katap.env`.
 
 **Options:**
 
 - Add `-s -- --harden-ssh` to turn off password login. It's refused unless an authorised key already exists for your sudo user or for root.
 - `-s -- --version vX.Y.Z` pins a release.
-- For an unattended install, `export KATAP_GH_TOKEN=…` and pipe into `sudo --preserve-env=KATAP_GH_TOKEN bash` instead. Never put the token on a command line.
+- For an unattended install, read the token into the environment without echoing it (`read -rs KATAP_GH_TOKEN && export KATAP_GH_TOKEN`), then pipe into `sudo --preserve-env=KATAP_GH_TOKEN bash` instead. Never type the token into a command line, where history keeps it.
 - Running the installer again upgrades: see [Updating Katap](docs/updating.md).
 
 **Success:** the output ends with `provision: done. Next:`. These checks confirm the
@@ -229,8 +234,10 @@ deploy, touch DNS or GitHub, or remove anything.
 **Why:** generated secrets (keys, database passwords) are ready, but values only you
 know are left empty, and a deploy is refused while any of them is empty. For this
 example's `laravel-api`, these are `MAIL_MAILER` and `MAIL_FROM_ADDRESS`, plus
-anything else your application reads, such as mail credentials or storage. Your
-application's own deployment notes list those.
+anything else your application reads, such as mail credentials or storage.
+[Application settings](docs/projects-file.md#application-settings) lists each
+template's required values, links the starter's documentation for accepted values,
+and explains how a change reaches a running application (on its next deploy).
 
 *Where: Server SSH session*
 
@@ -255,8 +262,13 @@ rclone `crypt` remote, is a separate step (see [Backups](#backups-whats-covered)
 *Where: GitHub / cloud console* (your DNS provider)
 
 Add the A records apply printed, one per domain, all pointing at `203.0.113.10`.
-Don't add AAAA records. Caddy requests certificates once DNS points at the server
-and ports 80 and 443 reach it.
+Don't add AAAA records. `www` may be a CNAME instead, but a CNAME isn't a redirect:
+the server must still serve that name. Caddy requests certificates once DNS points
+at the server and ports 80 and 443 reach it.
+
+On Cloudflare, keep the records **DNS only** for this setup. Proxied records need
+Katap's Cloudflare mode, set up separately: see
+[DNS records and TLS modes](docs/reference.md#dns-records).
 
 ### 5. Connect your repositories
 
@@ -293,14 +305,16 @@ repository's environment settings.
 It doesn't commit anything, publish an image, set up reviewers or deploy.
 
 **Success:** it ends with `connect: done.` and the `deploy.yml` command. Running it
-again skips environments that already have a key. Details, refusals and the manual
-equivalent are in [Connecting applications](docs/connecting-apps.md).
+again keeps existing deploy keys but refreshes every environment's address, host key
+and variables: see [Running connect.sh again](docs/connecting-apps.md#running-connectsh-again).
+Details, refusals and the manual equivalent are in
+[Connecting applications](docs/connecting-apps.md).
 
 ### 6. Add the deploy workflow and protect production
 
 *Where: Each app repository* (here `shop-api`, then `shop-web`)
 
-1. Make sure `.github/workflows/publish-image.yml` exists. A `laravel-api` fork ships it; for the SPA, copy [`examples/publish-image.yml`](examples/publish-image.yml) there.
+1. Make sure `.github/workflows/publish-image.yml` exists. A `laravel-api` fork ships it. For the SPA, copy [`examples/publish-image.yml`](examples/publish-image.yml) there, add a `Dockerfile`, and replace the example's placeholder `test` job, which only prints a message.
 2. Run the command `connect.sh` printed. It's the same for every repository and has this shape:
    ```bash
    mkdir -p .github/workflows && curl -fsSL https://raw.githubusercontent.com/jaylordibe/katap/<commit>/examples/deploy.yml \
@@ -311,7 +325,7 @@ equivalent are in [Connecting applications](docs/connecting-apps.md).
 
 *Where: GitHub / cloud console*, in each repository's **Settings**:
 
-- **Environments → production:** add required reviewers and turn on **Prevent self-review**. On a private repository this depends on your plan (see [Before you start](#before-you-start)). Without it, anyone who can run the workflow can deploy.
+- **Environments → production:** add required reviewers. **Prevent self-reviews** needs a second eligible reviewer; with it on, a solo maintainer can never approve their own deploys. On a private repository, reviewers depend on your plan. [Finish in GitHub](docs/connecting-apps.md#3-finish-in-github) compares the options.
 - **Rules:** protect `main` (require a pull request, block force pushes). Anyone who can change `deploy.yml` on `main` can use the deploy key.
 
 ### 7. Publish and deploy
@@ -319,7 +333,8 @@ equivalent are in [Connecting applications](docs/connecting-apps.md).
 *Where: GitHub / cloud console*
 
 1. **Actions → Publish image** (a `laravel-api` fork names it "Publish Image"): wait for the run on `main` to succeed. It builds, scans, attests and pushes `ghcr.io/your-org/shop-api:main`. If the scan fails, the image gets no attestation and the `main` tag doesn't move, so it can't be deployed. That's intended.
-2. **Actions → Deploy → Run workflow**: choose branch `main`, environment `production`, tag `main`. Approve it if you added reviewers.
+   After the first publish, make the package public (the package page's **Package settings → Change visibility**), or set up the server's [registry login](docs/connecting-apps.md#private-images). A new package is private.
+2. **Actions → Deploy → Run workflow**: choose branch `main`, environment `production`, and tag `main` (or `sha-<full commit>` for a specific build). Approve it if you added reviewers.
 3. Do the same in `shop-web`. A SPA usually bakes the API URL in at build time, so pass it as a build argument in its publish workflow.
 
 The run is green when the server reports `deploy of 'shop/api' is serving` and the
@@ -370,8 +385,9 @@ Work through each check yourself:
 
 > [!TIP]
 > Adding a project later takes the same path: add it to `/srv/katap.json`, run
-> `katap apply`, fill in its values, add DNS, run `connect.sh` again (it skips
-> what's already connected), then add `deploy.yml` to the new repository.
+> `katap apply`, fill in its values, add DNS, run `connect.sh` again (it keeps
+> existing keys and refreshes their settings), then add `deploy.yml` to the new
+> repository.
 
 ## The SSH keys involved
 
@@ -402,7 +418,7 @@ Host katap-prod
 Then use the alias (*where: Your computer*):
 
 ```bash
-ssh -o HostKeyAlgorithms=ssh-ed25519 katap-prod true      # once, to trust the ed25519 host key; check its fingerprint
+ssh -o HostKeyAlgorithms=ssh-ed25519 katap-prod true      # once; compare the fingerprint with the console's first
 curl -fsSL https://raw.githubusercontent.com/jaylordibe/katap/main/connect.sh | bash -s -- katap-prod
 ```
 
@@ -411,12 +427,15 @@ A few more rules:
 - `connect.sh` runs `ssh` with `BatchMode=yes`, so a key with a passphrase must already be loaded in `ssh-agent`, and no password or two-factor prompt can be answered.
 - Leave `Port` at 22: deploys always use port 22.
 
+How to get the fingerprint from the console, load a key into the agent, and check
+sudo: [Server access and identity](docs/server-access.md).
+
 ## Credentials at a glance
 
 | Credential | Lives in | Used for | Set up |
 |---|---|---|---|
-| **Server GitHub token** (`KATAP_GH_TOKEN`) | `/etc/katap/katap.env` on the server | `gh attestation verify` before each deploy: checking provenance. Not for pulling images | Asked for by the installer; [step 1](#1-install-the-server) |
-| **Registry login for private images** | The `deploy` user's Docker config on the server | Pulling private images | `sudo -u deploy docker login ghcr.io -u <you> --password-stdin`, with a token that can only read packages; [private repositories](docs/connecting-apps.md#private-repositories) |
+| **Server GitHub token** (`KATAP_GH_TOKEN`) | `/etc/katap/katap.env` on the server | Reading attestations to verify provenance, before deploying a component with `"provenance": "attested"`. It can't deploy, publish or pull images | Asked for by the installer; [setup and rotation](docs/connecting-apps.md#the-servers-provenance-token) |
+| **Registry login for private images** | The `deploy` user's Docker config on the server | Verifying and pulling private images | A personal access token (classic) with only `read:packages`, logged in as `deploy`; [Private images](docs/connecting-apps.md#private-images) |
 | **GitHub Actions credentials** | Each repository | Publishing uses the workflow's built-in token. Deploying uses the environment secrets from `connect.sh`, plus the built-in token to resolve the image tag | Set by `connect.sh`; [Connecting applications](docs/connecting-apps.md) |
 | **Your `gh` login** | Your computer | `connect.sh` creating environments and secrets | `gh auth login` as a repository administrator |
 | **Cloud service account** | Your cloud provider | Nothing in Katap. It matters only if you give your own tools, such as an rclone backup remote, access to cloud storage | Your provider; see [Running on Google Cloud](docs/gcp.md#service-accounts-and-scopes) |
@@ -433,10 +452,10 @@ A few more rules:
 
   Store uploads in object storage, and keep your own copy of the secrets and project files.
 - **Off-server copies** are optional and need separate setup:
-  - install and configure [rclone](https://rclone.org/) for the `deploy` user;
+  - install and configure [rclone](https://rclone.org/) for the `deploy` user, ideally with an encrypted (`crypt`) remote;
   - set `KATAP_RCLONE_REMOTE` in `/etc/katap/katap.env`.
 
-  Creating a storage bucket alone connects nothing. See [Day to day → Backups](docs/operations.md#what-a-backup-covers).
+  Creating a storage bucket alone connects nothing, and Katap never deletes remote copies. See [Off-server copies with rclone](docs/operations.md#off-server-copies-with-rclone).
 - **Restore** is manual and must be tested before you need it: see [Restoring](docs/operations.md#restoring).
 
 ## How it works
@@ -521,6 +540,7 @@ Have a person review the deploy path before trusting it with real data.
 | [Security model](docs/security.md) | What each control protects, and the known limits |
 | [Reference](docs/reference.md) | Layout, the project contract, image expectations, TLS modes, trusted proxies |
 | [Troubleshooting](docs/troubleshooting.md) | Each refusal, what causes it and what to check |
+| [Server access and identity](docs/server-access.md) | Administrator SSH, a non-default key, verifying the host key, and the sudo check |
 | [Running on Google Cloud](docs/gcp.md) | Firewall rules, SSH access with OS Login, IAP, and service accounts |
 
 ## Development

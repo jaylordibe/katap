@@ -38,15 +38,70 @@ It does not cover:
 - files the application writes inside its containers or to other Docker volumes. Keep uploads in object storage;
 - `/srv/secrets`, `/srv/katap.json`, `/srv/projects`, `/etc/katap` or Caddy's certificates.
 
-**The dumps stay on this server** unless you set up off-server copies:
-1. Install [rclone](https://rclone.org/) yourself. Provisioning doesn't install it.
-2. Configure a remote for the `deploy` user, which runs the backups: `sudo -iu deploy rclone config`. Use an rclone `crypt` remote, because dumps hold personal data.
-3. Set `KATAP_RCLONE_REMOTE=<remote>:<bucket>/<path>` in `/etc/katap/katap.env`.
-4. Run `bin/katap backup <project>` and check that the copy arrived.
+Those need their own copies: keep `/srv/secrets` and the project files somewhere
+safe, and the uploads in object storage. A disk snapshot from your provider copies
+everything on the disk, but a database copied mid-write isn't guaranteed
+consistent. Treat snapshots as an addition to the dumps, not a replacement.
 
-Creating a bucket in a cloud console connects nothing by itself. A failed copy fails
-the nightly run (`systemctl status katap-backup.service`). Before a deploy it's
-logged, and the deploy goes ahead.
+**The dumps stay on this server** unless you set up off-server copies with rclone.
+Creating a bucket configures nothing by itself.
+
+### Off-server copies with rclone
+
+After every dump, Katap runs `rclone copy` for the dump and its `.images` file, as
+the `deploy` user, into `$KATAP_RCLONE_REMOTE/<project>/`.
+
+1. **Install rclone.** *Server, as your administrator.* Provisioning doesn't install it. rclone's own installer is current; distribution packages are often out of date:
+   ```bash
+   sudo -v ; curl https://rclone.org/install.sh | sudo bash
+   ```
+2. **Create a storage credential** at your provider. It needs read, list and write access to one bucket, and nothing administrative. Katap's copies never delete anything.
+3. **Configure two remotes as `deploy`.** *Server SSH session.* The configuration goes to `/home/deploy/.config/rclone/rclone.conf`, where the backups look for it.
+   ```bash
+   sudo -iu deploy rclone config
+   ```
+   - `offsite`: the storage remote, of your provider's type, with the credential from step 2.
+   - `offsite-crypt`: type **crypt**, with `remote = offsite:your-bucket/katap`. Use standard filename encryption, and set both a password and a salt (rclone calls it password2). Dumps hold personal data, so encrypt them.
+4. **Keep the crypt password and salt safe, off the server**, in a password manager, together with a copy of `rclone.conf`. Without them, the encrypted copies can't be read. Changing them later makes existing copies unreadable. rclone only obscures these passwords in its config file; it doesn't encrypt them. Don't set an rclone configuration password: Katap's nightly run has no way to supply it, so the copies would fail.
+5. **Point Katap at the crypt remote.** In `/etc/katap/katap.env` (`sudo nano /etc/katap/katap.env`):
+   ```text
+   KATAP_RCLONE_REMOTE=offsite-crypt:dumps
+   ```
+   Copies then land in `offsite-crypt:dumps/shop/`. Without encryption, the value would be `offsite:your-bucket/katap`, which isn't recommended.
+6. **Check both files arrive.** *Server, as `deploy`:*
+   ```bash
+   /srv/katap/bin/katap backup shop
+   rclone ls offsite-crypt:dumps/shop/
+   ```
+   Both the newest `….dump` and its `….dump.images` should be listed, with the same sizes as in `/srv/backups/shop/`.
+
+**Retention:**
+- **On the server:** the newest `KATAP_BACKUP_KEEP` dumps (14 by default) of each kind are kept per component.
+- **Remote:** Katap never deletes remote copies, so they accumulate. Set a lifecycle or retention rule at your storage provider.
+
+**Monitoring:** Katap sends no alerts.
+- A failed dump or copy fails the nightly `katap-backup.service`.
+- Before a deploy, a failed copy is only logged, and the deploy goes ahead.
+- Check with `systemctl status katap-backup.service`, `systemctl --failed`, and `journalctl -u katap-backup.service --since yesterday`. Wire those into your own monitoring.
+
+**Getting a copy back.** *Server, as `deploy`:*
+
+```bash
+D=api-20261023T030000Z-scheduled.dump     # the file name, from: rclone ls offsite-crypt:dumps/shop/
+rclone copy "offsite-crypt:dumps/shop/$D" /srv/backups/shop/
+rclone copy "offsite-crypt:dumps/shop/$D.images" /srv/backups/shop/
+```
+
+Then follow [Restoring](#restoring). `restore` needs the `.images` file next to
+the dump. To check that a copy can be read, without touching any data, list its
+contents:
+
+```bash
+docker exec -i shop-api-db-1 pg_restore --list < "/srv/backups/shop/$D" > /dev/null && echo readable
+```
+
+That proves the file is a readable dump, not that a restore will succeed. Only a
+real restore, on a separate server or project, proves that.
 
 ## Is one server enough?
 
@@ -241,15 +296,35 @@ kcompose stop "$C-worker"
 
 *Server, as the deploy user.*
 
+Take the dump, and pick only a dump written by this attempt. The marker file
+records when the attempt started, so an older dump can never be picked by mistake:
+
 ```bash
-/srv/katap/bin/katap backup "$P"
-DUMP="$(ls -t /srv/backups/"$P"/"$C"-*-scheduled.dump | head -n 1)"
-echo "$DUMP"; cat "$DUMP.images"
-kcompose exec -T "$C-db" pg_restore --list < "$DUMP" > /dev/null && echo "dump is readable"
-sha256sum "$DUMP" "$DUMP.images"
+MARK="$(mktemp)"
+DUMP=''
+if /srv/katap/bin/katap backup "$P"; then
+    DUMP="$(find /srv/backups/"$P" -maxdepth 1 -name "$C-*-scheduled.dump" -newer "$MARK" | sort | tail -n 1)"
+fi
+[ -n "$DUMP" ] && echo "DUMP=$DUMP" || echo "STOP: no dump from this attempt; do not continue"
 ```
 
-`katap backup` dumps every component of the project that has a database. Note a
+Then check that this dump is complete, readable, and recorded with the release
+serving now:
+
+```bash
+[ -n "$DUMP" ] && [ -s "$DUMP" ] && cmp -s "$DUMP.images" /srv/state/"$P"/images.env \
+  && kcompose exec -T "$C-db" pg_restore --list < "$DUMP" > /dev/null \
+  && sha256sum "$DUMP" "$DUMP.images" \
+  || echo "STOP: the dump or its .images file is missing, unreadable, or not from the release serving now"
+```
+
+**Checkpoint:** continue only if the first block printed `DUMP=…` and the second
+printed two checksums with no `STOP`. A failed backup, or a `.images` file that
+differs from `/srv/state/<project>/images.env`, means this isn't the dump to
+upgrade from.
+
+`katap backup` dumps every component of the project that has a database, and fails
+if any of them fails. Note a
 few row counts too (`kcompose exec -T "$C-db" psql -U postgres -d app -Atc 'select
 count(*) from users'`), so you can compare them after the restore.
 
@@ -258,7 +333,7 @@ off the server. The secrets hold the passwords the new cluster will use, the
 application's `APP_KEY`, and the database TLS certificate. Then compare checksums:
 
 ```bash
-D=api-20261023T030000Z-scheduled.dump    # the file name step 4 printed
+D=api-20261023T030000Z-scheduled.dump    # the file name in DUMP= above
 for f in "$D" "$D.images"; do
     ssh admin@203.0.113.10 sudo cat "/srv/backups/shop/$f" > "$f"
 done
@@ -298,14 +373,21 @@ diff /srv/projects/"$P"/"$C".yml.before-upgrade /srv/projects/"$P"/"$C".yml
 ### 6. Start the new database alone
 
 ```bash
-kcompose up -d "$C-db"
-docker ps --filter label=com.docker.compose.project="$P"     # $C-db shows (healthy)
-kcompose exec -T "$C-db" psql -U postgres -d app -Atc 'select version()'
-docker volume ls --filter name="${P}_${C}-db"                 # the old volume is still there
+if kcompose up -d --wait --wait-timeout 300 "$C-db"; then
+    kcompose exec -T "$C-db" psql -U postgres -d app -Atc 'select version()'
+    docker volume ls --filter name="${P}_${C}-db"     # the old volume is still there
+else
+    echo "STOP: the new database did not become healthy; see If the upgrade fails"
+fi
 ```
 
-Compose recreates the database container on the new volume. The old volume is no
-longer attached to any container, and it isn't changed.
+Compose recreates the database container on the new volume and waits, for up to 5
+minutes, until its healthcheck passes. The old volume is no longer attached to any
+container, and it isn't changed.
+
+**Checkpoint:** continue to step 7 only if the version shows the new major and no
+`STOP` was printed. Otherwise run `kcompose logs --tail=100 "$C-db"`, and go to
+[If the upgrade fails](#if-the-upgrade-fails).
 
 ### 7. Restore into the new cluster
 
@@ -348,9 +430,18 @@ the deploy user*, with the helper from step 3:
 ```bash
 kcompose stop "$C" "$C-worker"          # nestjs-api: "$C" only
 cp /srv/projects/"$P"/"$C".yml.before-upgrade /srv/projects/"$P"/"$C".yml
-kcompose up -d "$C-db"                   # the old image on the old volume
-for s in $(sed -n 's/^rollout=//p' /srv/projects/"$P"/"$C".conf); do kcompose up -d --wait "$s"; done
+if kcompose up -d --wait --wait-timeout 300 "$C-db"; then     # the old image on the old volume
+    for s in $(sed -n 's/^rollout=//p' /srv/projects/"$P"/"$C".conf); do
+        kcompose up -d --wait --wait-timeout 300 "$s" || { echo "STOP: $s did not become healthy"; break; }
+    done
+else
+    echo "STOP: the old database did not start; check: kcompose logs --tail=100 $C-db"
+fi
 ```
+
+Start the application only after the old database is healthy. If a `STOP` is
+printed, the old volume is still intact: find the cause in the logs before trying
+again.
 
 `/srv/state/<project>/images.env` names the release that was serving before
 step 3, even if the restore got as far as recording the dump's release: they're the

@@ -96,6 +96,91 @@ edited.
 Run apply as the deploy user (`sudo -u deploy`); it refuses to run as anyone who
 does not own `/srv/projects`, so a project is never left owned by root.
 
+## Application settings
+
+`katap apply` writes each component's settings to `/srv/secrets/<project>/<component>.env`
+(mode 0600, owned by `deploy`), from its template's `templates/<type>.env.spec`:
+
+- **Generated** values are made once on the server: keys, database and Redis passwords, Passport keys and so on. Never change them on a running application: a new `APP_KEY` or database password breaks existing data and logins.
+- **Derived** values come from `katap.json`: `APP_URL` from the first domain, and the frontend URL and CORS origins from the project's single `spa` or `node-ssr` component with domains.
+- **Yours to supply** are left empty under a `# katap:required` marker, and a deploy is refused while any of them is empty.
+
+| Template | Required values you supply | Where accepted values are documented |
+|---|---|---|
+| `laravel-api` | `MAIL_MAILER`, `MAIL_FROM_ADDRESS`; `APP_FRONTEND_URL` and `CORS_ALLOWED_ORIGINS` when the project has no single frontend | [laravel-api DEPLOYMENT.md](https://github.com/jaylordibe/laravel-api/blob/main/DEPLOYMENT.md), "Environment contract" and "Object storage contract" |
+| `nestjs-api` | `EMAIL_PROVIDER`, `EMAIL_FROM`, `SMS_PROVIDER`, `STORAGE_PROVIDER`, `TURNSTILE_WEB_SECRET`, `TURNSTILE_MOBILE_SECRET`, `SEED_ADMIN_EMAIL`; `WEB_BASE_URL` and `CORS_ORIGIN` when the project has no single frontend | [nestjs-api deployment contract](https://github.com/jaylordibe/nestjs-api/blob/main/docs/deployment/README.md), "Environment contract" |
+| `node-ssr` | None. Add the runtime variables your server reads | Your application |
+| `spa` | None. A static site reads no runtime settings; see [build-time settings](reference.md#build-time-and-runtime-settings) | Your application |
+
+**Edit the file** as the deploy user (*server SSH session*):
+`sudo -u deploy nano /srv/secrets/<project>/<component>.env`. Add the values the
+starter's documentation asks for, such as mail credentials and the settings for a
+storage provider. Run `katap apply` again to list required values that are still
+empty, by name only.
+
+**Katap only checks that marked values aren't empty.** It doesn't check that a
+value is valid, that a mail provider accepts the credentials, or that a bucket
+exists. It doesn't check settings without a `# katap:required` marker either. The
+starter applications validate part of their configuration when they start. A
+value that stops them starting fails the deploy's healthcheck, and the deploy rolls
+back. Others, such as wrong mail credentials, only show up when they're used.
+
+**Object storage:** creating a bucket configures nothing by itself. The
+application needs its storage settings (see the starter's object storage
+contract) and credentials that can reach the bucket. Katap's off-server backups are
+configured separately again: see [What a backup covers](operations.md#what-a-backup-covers).
+
+**When a change takes effect:** a running container keeps the settings it started
+with. One-shot services, such as the scheduler and `katap run` commands, read the
+file each time they start. The long-running services pick up a change only when
+they're recreated. A deploy runs `docker compose up -d --wait` for each service in
+the component's `rollout=`, and Compose recreates a service only when its
+configuration changed: a new image, or new settings. Services outside `rollout=`,
+such as the database, are left alone unless their own configuration changed.
+
+### Applying a settings change without a new build
+
+Redeploy the build that's running now. Don't redeploy `main`: `main` is a moving tag
+and may point to a newer build. The Deploy workflow takes a **tag**, not a digest, so
+you need the running build's `sha-<full commit>` tag. Katap records only the
+digest, and its deploy log keeps just the first 12 characters of the commit. The
+full commit comes from the image's attestation.
+
+*Server SSH session, as `deploy`* (`sudo -iu deploy`). The placeholders are
+`shop`/`api` and `your-org/shop-api`:
+
+```bash
+grep '^IMAGE_API' /srv/state/shop/images.env    # IMAGE_API=ghcr.io/your-org/shop-api@sha256:…, plus IMAGE_API_MIGRATE for a nestjs-api
+REF="$(sed -n 's/^IMAGE_API=//p' /srv/state/shop/images.env)"
+COMMIT="$(GH_TOKEN="$(sed -n 's/^KATAP_GH_TOKEN=//p' /etc/katap/katap.env | tail -n 1)" \
+  gh attestation verify "oci://$REF" --repo your-org/shop-api \
+  --signer-workflow your-org/shop-api/.github/workflows/publish-image.yml --format json \
+  | jq -r '.[0].verificationResult.signature.certificate.sourceRepositoryDigest')"
+echo "commit: $COMMIT"
+```
+
+That prints the full 40-character commit, from the same field Katap reads. Before
+using its tag, confirm that the tag still names the running digest:
+
+```bash
+echo "running: ${REF#*@}"
+docker buildx imagetools inspect "ghcr.io/your-org/shop-api:sha-$COMMIT" | grep '^Digest:'
+```
+
+- **The digests match:** deploy with **Run workflow**, choosing the same environment and the tag `sha-` followed by that commit.
+- **A nestjs-api** derives its migrate image from the same tag. Check `ghcr.io/your-org/shop-api-migrate:sha-<commit>` the same way against `IMAGE_API_MIGRATE`.
+- **Any digest differs, or a command fails:** stop. That tag doesn't reproduce the running build.
+
+This is a normal deploy. It verifies provenance again, takes a pre-deploy dump,
+runs the template's pre-deploy steps again (migrations, which apply nothing when
+none are pending, and steps such as laravel-api's permissions sync), rolls out with
+healthchecks and the smoke check, and rolls back automatically if the release
+never becomes healthy.
+
+**Limits:**
+- For a component with `"provenance": "none"` there's no attestation, so the commit can't be recovered this way. Use the commit from the Deploy run that put this build live: its log prints the digest (`Deploying: …`), and its inputs show the tag. If that tag was `main`, find the publish run whose summary shows the same digest.
+- If the `sha-` tag has been deleted from the registry, the Deploy workflow can't select that build at all.
+
 ## Without the file
 
 `katap add <project> <type> <component> [domain...]` and `katap secrets <project>
