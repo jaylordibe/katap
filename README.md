@@ -285,6 +285,12 @@ Add project names after the address to connect only those projects. If your
 administrator key isn't SSH's default, name the server in `~/.ssh/config` instead
 (see [the SSH keys involved](#the-ssh-keys-involved)).
 
+`gh` must be signed in as an account that **administers** each repository. If a
+repository belongs to another account, such as a startup's shared account where
+you're only a collaborator, switch `gh` to that account for this step (`gh auth
+switch`). See
+[When your own account isn't the repository's admin](docs/connecting-apps.md#when-your-own-account-isnt-the-repositorys-admin).
+
 `connect.sh` runs your own `ssh` and `gh` logins. It checks two things before
 asking you to confirm:
 

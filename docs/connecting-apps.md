@@ -29,7 +29,7 @@ administrator account you log in with, for example `admin@203.0.113.10`, or a
 `Host` alias from `~/.ssh/config`. An alias is how you pick a non-default key: the
 script has no key option. See [The SSH keys involved](../README.md#the-ssh-keys-involved).
 Add project names after the address to connect only those projects. It needs:
-- `bash`, `curl`, `ssh`, `ssh-keygen`, `jq` and the [GitHub CLI](https://cli.github.com/), signed in (`gh auth login`) as an administrator of the repositories;
+- `bash`, `curl`, `ssh`, `ssh-keygen`, `jq` and the [GitHub CLI](https://cli.github.com/), signed in (`gh auth login`) as an administrator of the repositories (see [When your own account isn't the repository's admin](#when-your-own-account-isnt-the-repositorys-admin));
 - SSH to the server as root, or as a user with passwordless sudo. It runs `ssh` with `BatchMode=yes` and `sudo -n`, so nothing can prompt: a passphrase-protected key must already be in `ssh-agent`, and a login that needs a password or a second factor fails;
 - the server's ed25519 host key already in your `known_hosts`. Connect once by hand, and check the fingerprint against your provider's console;
 - `host` set in `/srv/katap.json`. That's the address GitHub Actions deploys to, always on port 22.
@@ -52,6 +52,27 @@ Then it prints one command, the same for every repository, that writes
 `.github/workflows/deploy.yml`: [`examples/deploy.yml`](../examples/deploy.yml) at
 the release the server runs, with its pin filled in. Run it in each repository's
 checkout and commit the file.
+
+### When your own account isn't the repository's admin
+
+`connect.sh` stops with `your gh login does not administer …` and changes nothing.
+This happens when `gh` is signed in as you, but the repository belongs to another
+account where you're only a collaborator, such as a startup's shared account. A
+repository owned by a personal account has a single admin, the account itself. So
+run `connect.sh` signed in as that account. `gh` can hold both logins and switch
+between them (*your computer*):
+
+```bash
+gh auth login                           # once: sign in as the account that owns the repository
+gh auth switch --user your-org
+gh api repos/your-org/shop-api --jq .permissions.admin   # must print true
+curl -fsSL https://raw.githubusercontent.com/jaylordibe/katap/main/connect.sh | bash -s -- admin@203.0.113.10
+gh auth switch --user your-username     # back to your own login
+```
+
+`gh auth status` shows which account is active. In an organization's repository,
+an admin can instead give your own account the **Admin** role on that repository
+(**Settings → Collaborators & teams**).
 
 ### Running connect.sh again
 
