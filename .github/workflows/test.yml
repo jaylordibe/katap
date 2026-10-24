@@ -21,7 +21,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Checkout
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: katap
           # Every release tag: the suite runs earlier releases' actions against
@@ -31,13 +31,13 @@ jobs:
       # against the starters' own contracts (the settings nestjs-api requires at
       # boot), and that the starters never mention Katap.
       - name: Checkout nestjs-api
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: jaylordibe/nestjs-api
           path: nestjs-api
           persist-credentials: false
       - name: Checkout laravel-api
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: jaylordibe/laravel-api
           path: laravel-api
@@ -52,7 +52,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: Checkout
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Lint every workflow, including the examples apps copy
         run: |
           docker run --rm -v "$PWD:/repo" -w /repo \
