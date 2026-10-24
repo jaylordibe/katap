@@ -94,10 +94,17 @@ main() {
 
     # A new major version changes how deploys work, so moving to one (or back from
     # one) is never a side effect of re-running the installer: it is named.
+    # A checkout without a release record (v1.0.0 was cloned by hand) is read from
+    # its tag; one that names no release is never moved without --version.
     local installed=''
     [ ! -f "$release_file" ] || installed="$(sed -n 's/^tag=//p' "$release_file" | tail -n 1)"
+    if [ -z "$installed" ] && [ -e "$root/.git" ]; then
+        installed="$(git -c core.hooksPath=/dev/null -c core.fsmonitor=false -C "$root" describe --tags --exact-match HEAD 2>/dev/null || true)"
+        [ -n "$version" ] || [[ "$installed" =~ ^v[0-9]+\. ]] \
+            || die "$root is a Katap checkout with no release record ($release_file); run the installer with --version vX.Y.Z, after reading docs/updating.md. Katap was not changed."
+    fi
     if [ -z "$version" ] && [[ "$installed" =~ ^v([0-9]+)\. ]] && [ "${BASH_REMATCH[1]}" != "$(cut -d. -f1 <<<"${tag#v}")" ]; then
-        die "this server runs $installed and the latest release is $tag, a new major version that changes how deploys work. Read its notes (docs/updating.md), then run the installer with --version $tag. Katap was not changed."
+        die "this server runs $installed and the latest release is $tag, of another major version, which changes how deploys work. Read its notes (docs/updating.md), then run the installer with --version $tag. Katap was not changed."
     fi
 
     # The commit the tag names on GitHub now: an annotated tag's ^{} line, or the

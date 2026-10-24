@@ -57,8 +57,8 @@ network. Only the edge (Caddy) is reachable from the internet.
 | [2](#2-describe-your-projects) | Server | Describe your projects, then `katap apply` |
 | [3](#3-fill-in-the-settings) | Server | Fill in each component's settings |
 | [4](#4-point-dns-at-the-server) | DNS provider | Point your domains at the server |
-| [5](#5-make-the-deploy-keys) | Server, then GitHub | `katap deploy-key`, then add three repository secrets |
-| [6](#6-add-the-deploy-step-and-push) | Each repository | Add the deploy step, and push to `main` |
+| [5](#5-make-the-deploy-keys) | Server, then GitHub | `katap deploy-key`, then add the secrets and variables it prints |
+| [6](#6-add-the-workflow-and-push) | Each repository | Add the workflow, if it hasn't one, and push to `main` |
 
 ### 1. Install
 
@@ -135,25 +135,27 @@ server: see [Cloudflare mode](docs/reference.md#cloudflare-mode).
 katap deploy-key shop api
 ```
 
-It makes a key that can deploy `shop/api` and nothing else, and prints three
-values. *In GitHub,* add each one to that component's repository:
-**Settings → Secrets and variables → Actions → New repository secret**:
+It makes a key that can deploy `shop/api` and nothing else, and prints what to
+add to that component's repository. *In GitHub:* **Settings → Secrets and
+variables → Actions**:
 
-| Secret | Value |
-|---|---|
-| `KATAP_SSH_KEY` | The private key it printed, every line |
-| `KATAP_HOST` | The server's address |
-| `KATAP_KNOWN_HOSTS` | The server's host key line |
+| Tab | Name | Value |
+|---|---|---|
+| Secrets | `KATAP_SSH_KEY` | The private key it printed, every line |
+| Secrets | `KATAP_HOST` | The server's address |
+| Secrets | `KATAP_KNOWN_HOSTS` | The server's host key line |
+| Variables | `KATAP_PROJECT`, `KATAP_COMPONENT` | `shop`, `api` |
 
-The private key is shown once and isn't kept on the server. A staging component's
-three are named `KATAP_STAGING_…`.
+The private key is shown once and isn't kept on the server. A staging
+component's are named `KATAP_STAGING_…`.
 
-### 6. Add the deploy step and push
+### 6. Add the workflow and push
 
-*In each repository:* add the Katap step `katap deploy-key` printed to the end of
-the workflow that builds and pushes your image. No workflow yet? Copy
-[`examples/github-workflow.yml`](examples/github-workflow.yml): it's GitHub's
-standard build-and-push, plus that step.
+*In each repository:*
+- **Made from [laravel-api](https://github.com/jaylordibe/laravel-api) or [nestjs-api](https://github.com/jaylordibe/nestjs-api)?** It already builds in `publish-image.yml`. Paste the two deploy jobs from [`examples/github-workflow.yml`](examples/github-workflow.yml) at its end, as they are (a nestjs-api uncomments their `migrate-image` line), and set the repository variable `PUBLISH_ENABLED` to `true`. A copy made before the starter's `publish` job had `outputs:` takes those lines from the starter too.
+- **Any other repository:** copy [`examples/github-workflow.yml`](examples/github-workflow.yml) to `.github/workflows/`, unchanged. It's GitHub's standard build-and-push, plus the Katap deploy jobs.
+
+More detail, and a repository that already builds its image another way: [The workflow](docs/deploying.md#2-the-workflow).
 
 Push to `main`. The workflow builds, scans and pushes the image, and Katap
 deploys it:
@@ -165,8 +167,8 @@ deploys it:
 
 > [!TIP]
 > **Adding a project later:** add it to `/srv/katap.json`, then repeat steps 2 to 6
-> for it. A component created by mistake, and never deployed, is removed with
-> `katap remove <project> <component> --confirm <project>`.
+> for it. A component created by mistake, and never deployed: delete it from
+> `/srv/katap.json`, then `katap remove <project> <component> --confirm <project>`.
 
 ## How it works
 
@@ -174,7 +176,7 @@ deploys it:
 flowchart LR
     subgraph app["Each app repository"]
         W["your workflow<br/>build · scan · push"]
-        S["Katap deploy step"]
+        S["Katap deploy job"]
     end
     REG[("GitHub Container Registry")]
     subgraph server["Your server"]
@@ -211,7 +213,7 @@ automatically. Migrations are not undone, so keep them backward compatible:
 | Key | Who holds it | What it can do |
 |---|---|---|
 | **Your administrator key** | Your computer | Log in to install and run `katap`. Full control of the server |
-| **Deploy keys** | GitHub, as a repository's `KATAP_SSH_KEY` | Made by `katap deploy-key`. Deploy or roll back one component, nothing else |
+| **Deploy keys** | GitHub, as a repository's `KATAP_SSH_KEY` secret | Made by `katap deploy-key`. Deploy or roll back one component, nothing else |
 | **The server's host key** | The server; pinned in `KATAP_KNOWN_HOSTS` | Proves to GitHub Actions that it's talking to your server |
 
 Never put your administrator key in GitHub. How to log in with a non-default key

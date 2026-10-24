@@ -32,7 +32,7 @@ katap apply
 | `projects.<project>` | | Lowercase letters, digits and hyphens, starting with a letter (30 at most). Each project gets its own network, database and Redis per component |
 | `.<component>` | | Lowercase letters and digits, no hyphen (20 at most) |
 | `type` | yes | `laravel-api`, `nestjs-api`, `spa` or `node-ssr` (a file in `templates/`) |
-| `repo` | yes | The GitHub repository that builds the image, `owner/name`. Only its own publish workflow's builds deploy. One repository deploys one component per environment |
+| `repo` | yes | The GitHub repository that builds the image, `owner/name`. It names the image (below), and one repository deploys one component per environment. Which builds may deploy is decided by who holds the deploy key: see [Security model](security.md#known-limits) |
 | `domains` | no | Where it is served. None: internal only |
 | `environment` | no | `production` (default) or `staging`. Put a staging copy in its own project, as above |
 | `image` | no | The image repository. Default `ghcr.io/<repo>`, lowercased |
@@ -75,7 +75,7 @@ After the first apply, these are never rewritten:
 | File | Edit it to |
 |---|---|
 | `/srv/projects/<project>/<component>.yml` | Tune memory (`mem_limit`), add a worker. The compose file is copied once from its template |
-| `/srv/projects/<project>/<component>.conf`, keys other than the six above | Change `rollout=`, `smoke_path=` and so on, to match your compose file |
+| `/srv/projects/<project>/<component>.conf`, keys other than `type` and the table's `image`, `environment` and `domains` (and `image_migrate`, which follows `image`) | Change `rollout=`, `smoke_path=` and so on, to match your compose file |
 | `/srv/projects/<project>/site.caddy` | Add a redirect, protect staging. A new component appends its block; a changed `domains` list is reported, and you edit the file, then run `katap edge reload` |
 | `/srv/secrets/<project>/<component>.env` | Fill in the values only you know. Generated once, never regenerated. Values derived from a domain (`APP_URL`, the frontend URL) are reported when the file no longer matches, never rewritten |
 
@@ -85,8 +85,10 @@ new component and apply again. Two site blocks for one name would stop the edge,
 so apply refuses a domain another component still serves.
 
 **Nothing is ever removed.** A component you delete from the file is listed as
-"not in katap.json" and keeps running. Stopping it and removing its data is
-deliberate work for you, not for apply.
+"not in katap.json" and keeps running, but **no longer deploys**: its deploy key
+is refused (a rollback still works). Stopping it and removing its data is
+deliberate work for you, not for apply: see
+[Taking a deployed component off the server](#taking-a-deployed-component-off-the-server).
 
 **A deploy follows the file.** `katap check`, which every deploy runs, refuses a
 component whose `.conf` disagrees with `katap.json` until `katap apply` has run,
@@ -112,6 +114,21 @@ Without a component, every component of the project goes, and then the project.
 It removes the compose file, the `.conf`, the site block, the generated settings
 and the deploy key, and reloads the edge. It refuses anything that has served a
 release, has containers or holds data: removing those is deliberate work, by hand.
+
+## Taking a deployed component off the server
+
+For a component that ran, in this order:
+
+1. Delete it from `/srv/katap.json`, then `katap apply`. From now on it no longer deploys.
+2. `katap deploy-key <project> <component> --revoke`: its key stops working. Delete its secrets and variables from the repository.
+3. If it has a database: `katap backup <project>`, and copy the newest dump in `/srv/backups/<project>/` somewhere safe.
+4. Move its `<component>.yml` and `<component>.conf` out of `/srv/projects/<project>/` (keep them until step 7): Katap stops running its scheduled jobs and nightly dumps.
+5. Stop and remove its containers: `sudo docker ps -a --filter label=com.docker.compose.project=<project>` lists them; its services are named `<component>` and `<component>-…`.
+6. Remove its block from `/srv/projects/<project>/site.caddy`, then `katap edge reload`.
+7. Once you are sure, delete what is left, by exact name (another component's name can start with this one's):
+   - in `/srv/secrets/<project>/`: `<component>.env`, `<component>.db.env`, `<component>.redis.env` and the directory `<component>-db-tls/`;
+   - its lines in `/srv/state/<project>/images.env`, so `katap images prune` can remove its images. Under the project's lock, as Katap itself writes it, so no deploy lands in between (for component `api`): `sudo -u deploy flock /srv/state/<project>/.lock sed -i -E '/^IMAGE_API(_MIGRATE)?=/d' /srv/state/<project>/images.env`;
+   - its volumes, `<project>_<component>-db` and `<project>_<component>-redis` (`sudo docker volume ls --filter label=com.docker.compose.project=<project>` lists them).
 
 ## Application settings
 
@@ -177,3 +194,8 @@ becomes healthy.
 <component>` still create one component by hand. You then set `image=` in its
 `.conf` yourself. Apply leaves such components alone; it only
 refuses to give one of their domains to another component.
+
+**Once `katap apply` has run on the server, or `/srv/katap.json` lists any
+project, the file is the list of what deploys:** a component it does not list is
+refused at deploy, even after its last project is removed. Add a component made
+by hand to the file to keep deploying it; `katap apply` then adopts its `.conf`.

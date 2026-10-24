@@ -12,7 +12,8 @@
 #
 #   katap apply [--yes]                                  create what /srv/katap.json declares
 #   katap env <project> <component>                      edit a component's settings
-#   katap deploy-key <project> <component> [--replace]   make its restricted deploy key
+#   katap deploy-key <project> <component> [--replace | --revoke]
+#                                                        make (or withdraw) its restricted deploy key
 #   katap remove <project> [<component>] --confirm <project>
 #                                                        remove what was never deployed
 #   katap add <project> <type> <component> [domain...]   define one component by hand
@@ -66,7 +67,7 @@ KATAP_ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 # every katap process reads it itself.
 KATAP_SETTINGS="${KATAP_SETTINGS:-/etc/katap/katap.env}"
 if [ -r "$KATAP_SETTINGS" ]; then
-    for _key in KATAP_RCLONE_REMOTE KATAP_BACKUP_KEEP KATAP_CRON_TIMEOUT KATAP_DISPATCH_COOLDOWN KATAP_RELEASES_KEPT; do
+    for _key in KATAP_RCLONE_REMOTE KATAP_RCLONE_TIMEOUT KATAP_BACKUP_KEEP KATAP_CRON_TIMEOUT KATAP_PREDEPLOY_TIMEOUT KATAP_DISPATCH_COOLDOWN KATAP_RELEASES_KEPT; do
         if [ -z "${!_key:-}" ] && _line="$(grep -E "^${_key}=" "$KATAP_SETTINGS" | tail -n 1)"; then
             _line="${_line#*=}"
             _line="${_line%$'\r'}"
@@ -99,20 +100,52 @@ KATAP_SRV="${KATAP_SRV:-/srv}"
 KATAP_PROJECTS="${KATAP_PROJECTS:-$KATAP_SRV/projects}"
 KATAP_PROJECTS_FILE="${KATAP_PROJECTS_FILE:-$KATAP_SRV/katap.json}"
 KATAP_RELEASE_FILE="${KATAP_RELEASE_FILE:-/etc/katap/release}"
+# Written by the first `katap apply`: from then on katap.json governs deploys.
+KATAP_APPLIED="$KATAP_SRV/state/.applied"
 KATAP_HOST_KEY_FILE="${KATAP_HOST_KEY_FILE:-/etc/ssh/ssh_host_ed25519_key.pub}"
-# Test seams: the docker binary, the program ssh-dispatch hands over to, and the
-# deploy user's authorized_keys.
+# Test seams: the docker binary, the program ssh-dispatch hands over to, the
+# deploy user's authorized_keys, and KATAP_KILL_AFTER (how long a timed-out
+# one-shot gets between TERM and KILL, 30s).
 KATAP_DOCKER="${KATAP_DOCKER:-docker}"
 KATAP_SELF="${KATAP_SELF:-$KATAP_ROOT/bin/katap}"
 KATAP_AUTHORIZED_KEYS="${KATAP_AUTHORIZED_KEYS:-$HOME/.ssh/authorized_keys}"
+# Dumps of each kind kept per component.
 KATAP_BACKUP_KEEP="${KATAP_BACKUP_KEEP:-14}"
-# Earlier releases kept per component, so a rollback never needs the registry.
+# Earlier releases kept per component besides the newest, so a rollback never
+# needs the registry.
 KATAP_RELEASES_KEPT="${KATAP_RELEASES_KEPT:-5}"
+# How long each of a deploy's one-shot services (migrations) may run, and each
+# off-host copy of a dump may take: either holds the project's lock while it runs.
+# timeout(1) durations.
+KATAP_PREDEPLOY_TIMEOUT="${KATAP_PREDEPLOY_TIMEOUT:-15m}"
+KATAP_RCLONE_TIMEOUT="${KATAP_RCLONE_TIMEOUT:-1h}"
 
 # Runs lib/smoke-check.sh on a project network. Pinned like every other image.
 CURL_IMAGE='curlimages/curl:8.22.0@sha256:58adaa4e8dca9c988bae2aba4ab3434a0bb2da16bbe3f92dec39ec7785166777'
 
 PROJECT_RE='^[a-z][a-z0-9-]{0,29}$'
+
+# Dies unless the host setting named $1 is a whole number of at least 1.
+require_count() {
+    [[ "${!1}" =~ ^[1-9][0-9]{0,3}$ ]] \
+        || die "$1 in $KATAP_SETTINGS must be a whole number of at least 1 (it is '${!1}')."
+}
+
+# Dies unless the host setting named $1 is a timeout(1) duration: 90s, 15m, 1h.
+require_duration() {
+    [[ "${!1}" =~ ^[1-9][0-9]{0,5}[smh]?$ ]] \
+        || die "$1 in $KATAP_SETTINGS must be a duration such as 15m (it is '${!1}')."
+}
+
+# A duration require_duration accepts, in seconds.
+duration_seconds() {
+    local n="${1%[smh]}"
+    case "$1" in
+        *m) echo $((n * 60)) ;;
+        *h) echo $((n * 3600)) ;;
+        *) echo "$n" ;;
+    esac
+}
 # No hyphen: the component name becomes part of an environment variable name.
 COMPONENT_RE='^[a-z][a-z0-9]{0,19}$'
 # The registry login a deploy may carry: a GitHub user (or app bot, or Enterprise
@@ -210,7 +243,8 @@ all_projects() {
 # --- Compose ----------------------------------------------------------------------
 
 # docker compose for one project, every component file merged, with the release
-# digests from <env file>.
+# digests from <env file>. With COMPOSE_TIMEOUT set (a timeout(1) duration), the
+# call is cut off after it.
 compose_with() {
     local project="$1" env_file="$2"
     shift 2
@@ -219,12 +253,14 @@ compose_with() {
         files+=(-f "$f")
     done
     [ "${#files[@]}" -gt 0 ] || die "project '$project' has no components."
+    local bound=()
+    [ -z "${COMPOSE_TIMEOUT:-}" ] || bound=(timeout -k "${KATAP_KILL_AFTER:-30s}" "$COMPOSE_TIMEOUT")
 
     # From /: compose reads the working directory even with --project-directory,
     # and `sudo -u deploy` keeps the caller's, often a home directory deploy cannot
     # read. Every path given to compose is absolute.
     (cd / && KATAP_ROOT="$KATAP_ROOT" KATAP_PROJECT="$project" KATAP_SECRETS="$(secrets_dir "$project")" \
-        "$KATAP_DOCKER" compose --project-name "$project" --project-directory "$(project_dir "$project")" \
+        ${bound[@]+"${bound[@]}"} "$KATAP_DOCKER" compose --project-name "$project" --project-directory "$(project_dir "$project")" \
         --env-file "$env_file" "${files[@]}" "$@")
 }
 
@@ -232,7 +268,9 @@ ensure_state() {
     local dir
     dir="$(state_dir "$1")"
     mkdir -p "$dir"
-    [ -f "$dir/images.env" ] || : > "$dir/images.env"
+    # Created when absent only: anything else there is read, and a read error is
+    # reported, never papered over by an empty file.
+    [ -e "$dir/images.env" ] || : > "$dir/images.env"
 }
 
 compose() {
@@ -555,6 +593,15 @@ check_project() {
         ( if any(($s.security_opt // [])[]; test("unconfined")) then "\($name): an unconfined security profile" else empty end ),
         ( if any(($s.volumes // [])[]; .type == "bind" and ((.source // "") | test("^/(etc|proc|sys|root|boot|dev|var/lib/docker)?/?$|^/(etc|proc|sys|root|boot|dev|var/lib/docker)/"))) then "\($name): bind-mounts a host system path" else empty end )
     ' <<<"$config")"
+    # Raw sockets let a container forge ARP and intercept its neighbours on a shared
+    # bridge: the edge's plain-HTTP hop to every public component, and a project's
+    # database and Redis. Templates drop NET_RAW; a compose file copied from an
+    # older template is warned about, not refused, so an upgrade breaks no deploy.
+    local raw
+    raw="$(jq -r '.services | to_entries[]
+        | select(((.value.cap_drop // []) | map(ascii_upcase) | (index("NET_RAW") or index("ALL") or index("CAP_NET_RAW"))) | not)
+        | .key' <<<"$config")"
+    [ -z "$raw" ] || log "WARNING: project '$project': $(tr '\n' ' ' <<<"$raw")keep NET_RAW; add 'cap_drop: [NET_RAW]' to each in $(project_dir "$project") (docs/security.md)."
     # A project joins no network but its own and the edge: another project's
     # network is another project's data services.
     problems+=$'\n'"$(jq -r '
@@ -681,6 +728,18 @@ cmd_edge() {
         up)
             mkdir -p "$KATAP_SRV/edge/certs"
             edge_compose up -d --wait
+            # The Caddyfile is a single-file bind mount, which keeps the file it was
+            # started with: an upgrade replaces the file, so a running edge would go
+            # on serving the old one. Recreated only when the two differ.
+            # Under the reload lock, so no reload lands on a container being replaced.
+            mkdir -p "$KATAP_SRV/state"
+            exec 8>"$KATAP_SRV/state/.edge.lock"
+            flock -w 120 8 || die "another edge reload is still running; run 'katap edge up' again."
+            if ! edge_compose exec -T caddy cat /etc/caddy/Caddyfile 2>/dev/null | cmp -s - "$KATAP_ROOT/edge/Caddyfile"; then
+                log "the edge's configuration changed; restarting it."
+                edge_compose up -d --wait --force-recreate caddy
+            fi
+            exec 8>&-
             ;;
         reload)
             edge_reload || die "the edge rejected its configuration; the previous one keeps serving."
@@ -788,12 +847,16 @@ edge_cloudflare() {
     [ -f "$edge_env" ] || (umask 022 && : > "$edge_env")
     before="$(edge_get TLS_MODE)"
     set_env_key "$edge_env" TLS_MODE cloudflare || die "could not write $edge_env; nothing else was changed."
-    if ! edge_compose up -d --wait; then
+    # Already in Cloudflare mode, nothing in the edge's configuration changes, so it
+    # is recreated to load the new files; a pair it cannot load brings the old back.
+    local up=(up -d --wait)
+    [ "$before" != cloudflare ] || up+=(--force-recreate caddy)
+    if ! edge_compose "${up[@]}"; then
         for name in origin.pem origin.key cf-origin-pull-ca.pem; do
             if [ -f "$work/previous/$name" ]; then cp -p -- "$work/previous/$name" "$certs/$name"; else rm -f -- "${certs:?}/$name"; fi
         done
         set_env_key "$edge_env" TLS_MODE "${before:-acme}" || true
-        edge_compose up -d --wait || true
+        edge_compose "${up[@]}" || true
         die "the edge did not start in Cloudflare mode; it is back in ${before:-acme} mode with its previous certificate."
     fi
     set_cloudflare_trust true
@@ -866,6 +929,117 @@ release_lines() {
     fi
 }
 
+# The releases a component's database has run, oldest first, one per line as its
+# image words (IMAGE_X=… [IMAGE_X_MIGRATE=…]), from its history: each deploy
+# extends the line, and a restore cuts it back to the time of the dump it put back
+# (from the dump's name, <component>-<UTC time>-<reason>.dump), dropping what was
+# deployed from then on, whose migrations are not in the data. The restored release
+# is then the newest. A dump whose release this host had not run by that time (from
+# another server, or a name without a time) cuts back to that release's newest
+# deploy, or to nothing. A rollback leaves the line as it is. rollback_lines and
+# images prune both read it, so the way back and the images kept agree.
+release_lineage() {
+    local project="$1" component="$2" history entries=() times=() line words images j cut at
+    history="$(state_dir "$project")/history"
+    [ -f "$history" ] || return 0
+    while IFS= read -r line; do
+        read -ra words <<<"$line"
+        [ "${words[2]:-}" = "$component" ] || continue
+        case "${words[1]:-}" in
+            deploy) entries+=("${words[*]:3}"); times+=("${words[0]}") ;;
+            restore)
+                # <time> restore <component> IMAGE_…=… [IMAGE_…_MIGRATE=…] from <dump>
+                images=''
+                for ((j = 3; j < ${#words[@]}; j++)); do
+                    [ "${words[j]}" != from ] || break
+                    images+="${images:+ }${words[j]}"
+                done
+                cut=-1
+                if [[ "${words[*]: -1}" =~ -([0-9]{4})([0-9]{2})([0-9]{2})T([0-9]{2})([0-9]{2})([0-9]{2})Z-[a-z]+\.dump$ ]]; then
+                    at="${BASH_REMATCH[1]}-${BASH_REMATCH[2]}-${BASH_REMATCH[3]}T${BASH_REMATCH[4]}:${BASH_REMATCH[5]}:${BASH_REMATCH[6]}Z"
+                    # Before the dump: a deploy in its own second came after it.
+                    for ((j = ${#entries[@]} - 1; j >= 0; j--)); do
+                        [[ ! "${times[j]}" < "$at" ]] || break
+                    done
+                    cut="$j"
+                    # Only when this host had run that release by then.
+                    for ((; cut >= 0; cut--)); do
+                        [ "${entries[cut]}" != "$images" ] || break
+                    done
+                    [ "$cut" -lt 0 ] || cut="$j"
+                fi
+                if [ "$cut" -lt 0 ]; then
+                    for ((cut = ${#entries[@]} - 1; cut >= 0; cut--)); do
+                        [ "${entries[cut]}" != "$images" ] || break
+                    done
+                fi
+                entries=("${entries[@]:0:cut+1}")
+                times=("${times[@]:0:cut+1}")
+                if [ "${#entries[@]}" -eq 0 ] || [ "${entries[-1]}" != "$images" ]; then
+                    entries+=("$images")
+                    times+=("${words[0]}")
+                fi
+                ;;
+        esac
+    done < "$history"
+    [ "${#entries[@]}" -eq 0 ] || printf '%s\n' "${entries[@]}"
+}
+
+# The image lines of the release a rollback goes to. A rollback skips the dump and
+# the migrations, so it only goes back along release_lineage: the target must come
+# before the newest place on it of the release now serving. A release after it, or
+# cut off by a restore, is deployed instead. Without an image, it is the newest such
+# release that is not the one serving, so a second rollback goes further back. The
+# repository is not held to the .conf: the history proves this host served it, so a
+# component whose repository moved still rolls back.
+rollback_lines() {
+    local project="$1" component="$2"
+    shift 2
+    local cu now entries=() i last=-1 lineage
+    cu="$(upper "$component")"
+    # Each has said why when it fails; its refusal ends only its own subshell.
+    now="$(image_get "$project" "IMAGE_$cu")" || exit 1
+    [ -n "$now" ] || die "'$project/$component' has no release serving; deploy one."
+    lineage="$(release_lineage "$project" "$component")" || exit 1
+    [ -z "$lineage" ] || mapfile -t entries <<<"$lineage"
+    for i in "${!entries[@]}"; do
+        [ "${entries[i]%% *}" != "IMAGE_$cu=$now" ] || last="$i"
+    done
+    [ "$last" -ge 0 ] || die "the release serving '$project/$component' is not in its history; deploy instead of rolling back."
+
+    if [ "$#" -eq 0 ]; then
+        for ((i = last - 1; i >= 0; i--)); do
+            [ "${entries[i]%% *}" != "IMAGE_$cu=$now" ] || continue
+            tr ' ' '\n' <<<"${entries[i]}"
+            return
+        done
+        die "no earlier release of '$project/$component' to roll back to."
+    fi
+
+    local main='' migrate='' arg wanted
+    for arg in "$@"; do
+        case "$arg" in
+            migrate=*) migrate="${arg#migrate=}" ;;
+            *=*) die "unknown image target '${arg%%=*}'." ;;
+            *) [ -z "$main" ] || die "more than one image given."; main="$arg" ;;
+        esac
+    done
+    [[ "$main" =~ $DIGEST_SUFFIX_RE ]] || die "'$main' is not pinned by digest (expected <repository>@sha256:<64 hex>)."
+    [ -z "$migrate" ] || [[ "$migrate" =~ $DIGEST_SUFFIX_RE ]] || die "'$migrate' is not pinned by digest."
+    wanted="IMAGE_$cu=$main"
+    [ -z "$migrate" ] || wanted+=" IMAGE_${cu}_MIGRATE=$migrate"
+    for ((i = last; i >= 0; i--)); do
+        [ "${entries[i]}" = "$wanted" ] || continue
+        tr ' ' '\n' <<<"$wanted"
+        return
+    done
+    for ((i = last + 1; i < ${#entries[@]}; i++)); do
+        [ "${entries[i]}" != "$wanted" ] \
+            || die "$main was deployed after the release now serving, so its migrations may not be in the database; deploy it instead of rolling back to it."
+    done
+    die "$main is not a release the database ran before the one now serving (never deployed here with that migrate image, or cut off by a restore); deploy it instead of rolling back to it."
+}
+
 smoke() {
     local project="$1" component="$2" service port path body
     service="$(conf_get "$project" "$component" smoke_service)"
@@ -894,6 +1068,9 @@ rollout() {
 lock_project() {
     ensure_state "$1"
     exec 9>"$(state_dir "$1")/.lock"
+    flock -n 9 && return
+    # Said, so a deploy log that stops here shows what it is waiting for.
+    log "waiting for another operation on '$1' to finish (at most ${2:-900}s)."
     flock -w "${2:-900}" 9 || die "another operation on '$1' is still running."
 }
 
@@ -996,31 +1173,39 @@ release() {
     set -- "${images[@]}"
 
     [ "$mode" != deploy ] || require_clean_tool
+    # Before anything is pulled or dumped: a bad setting refuses the deploy whole.
+    # Only a deploy uses them, so they never stand in the way back.
+    if [ "$mode" = deploy ]; then
+        require_duration KATAP_PREDEPLOY_TIMEOUT
+        [ -z "${KATAP_RCLONE_REMOTE:-}" ] || require_duration KATAP_RCLONE_TIMEOUT
+    fi
     [ "$mode" = deploy ] || CHECK_DRIFT=false
     check_project "$project" || die "fix the project contract before deploying."
+    # Once katap apply has run here, or katap.json lists any project, the file is
+    # the list of what deploys: taking a component out of it is how it stops
+    # deploying, whatever deploy key a repository still holds, down to the last
+    # one. A rollback still works, so the way back never depends on the file.
+    # (check_project has already refused a file that does not parse.)
+    if [ "$mode" = deploy ] && [ -f "$KATAP_PROJECTS_FILE" ] \
+        && { [ -e "$KATAP_APPLIED" ] || jq -e '(.projects // {}) | length > 0' "$KATAP_PROJECTS_FILE" >/dev/null 2>&1; }; then
+        jq -e --arg p "$project" --arg c "$component" '.projects[$p][$c] != null' "$KATAP_PROJECTS_FILE" >/dev/null 2>&1 \
+            || die "'$project/$component' is not in $KATAP_PROJECTS_FILE, so it no longer deploys (a rollback still works). A component made by hand is added there to deploy."
+    fi
 
     local lines cu current candidate state
-    lines="$(release_lines "$project" "$component" "$@")"
-    cu="$(upper "$component")"
-
     if [ "$mode" = rollback ]; then
-        # Only to a release this host has served: a rollback skips the dump and the
-        # migrations, so it must never be a way to put a new image live.
-        # The whole set of images (runtime and migrate) must be one earlier deploy.
-        local wanted deployed
-        wanted=" $(tr '\n' ' ' <<<"$lines")"
-        wanted="${wanted% }"
-        deployed="$(awk -v c="$component" '$2 == "deploy" && $3 == c { $1 = $2 = $3 = ""; sub(/^ +/, " "); print }' \
-            "$(state_dir "$project")/history" 2>/dev/null || true)"
-        grep -qxF -- "$wanted" <<<"$deployed" \
-            || die "${lines#*=} was never deployed here as one release; deploy it instead of rolling back to it."
+        lines="$(rollback_lines "$project" "$component" "$@")"
+        log "rolling back to $(tr '\n' ' ' <<<"$lines")"
+    else
+        lines="$(release_lines "$project" "$component" "$@")"
     fi
+    cu="$(upper "$component")"
 
     state="$(state_dir "$project")"
     current="$(images_file "$project")"
     candidate="$(mktemp "$state/images.XXXXXX")"
     CLEANUP+=("$candidate")
-    grep -vE "^IMAGE_${cu}(_MIGRATE)?=" "$current" > "$candidate" || true
+    other_releases "$current" "$cu" > "$candidate"
     printf '%s\n' "$lines" >> "$candidate"
 
     ensure_images "$lines"
@@ -1028,19 +1213,36 @@ release() {
     if [ "$mode" = deploy ]; then
         backup_component "$project" "$component" predeploy || die "the pre-deploy dump failed; nothing was changed."
 
-        local service
+        # Bounded: a migration waiting forever on a table lock would hold this
+        # project's lock, and every deploy, backup and scheduled run behind it. No
+        # terminal (-T, no input): timeout(1) runs it outside the terminal's
+        # foreground, where a client that set the terminal up would be stopped.
+        local service name status started limit
+        limit="$(duration_seconds "$KATAP_PREDEPLOY_TIMEOUT")"
         for service in $(conf_get "$project" "$component" predeploy); do
             log "running $service."
-            compose_with "$project" "$candidate" run --rm "$service" \
-                || die "$service failed; the current release keeps serving."
+            name="$project-$service-predeploy-$$"
+            status=0
+            started=$SECONDS
+            COMPOSE_TIMEOUT="$KATAP_PREDEPLOY_TIMEOUT" compose_with "$project" "$candidate" \
+                run --rm -T --name "$name" "$service" </dev/null || status=$?
+            # 124 or 137 is also what a container killed for memory returns; only
+            # the clock tells the deadline apart.
+            if { [ "$status" = 124 ] || [ "$status" = 137 ]; } && [ $((SECONDS - started)) -ge "$limit" ]; then
+                # Stopping the client does not stop the container it started.
+                "$KATAP_DOCKER" rm -f "$name" >/dev/null 2>&1 || true
+                die "$service did not finish within $KATAP_PREDEPLOY_TIMEOUT (KATAP_PREDEPLOY_TIMEOUT) and was stopped; the current release keeps serving. Check what it was waiting on (a table lock held by a long transaction) before deploying again."
+            fi
+            [ "$status" = 0 ] || die "$service failed (exit $status); the current release keeps serving."
         done
     fi
 
     if ! rollout "$project" "$component" "$candidate"; then
         if grep -qE "^IMAGE_${cu}=" "$current"; then
             log "the new release is not healthy; rolling back to the release before it."
-            rollout "$project" "$component" "$current" || log "ROLLBACK FAILED: the component may be down."
             echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) failed $component $(tr '\n' ' ' <<<"$lines")" >> "$state/history"
+            rollout "$project" "$component" "$current" \
+                || die "$mode of '$project/$component' failed, and so did putting the release before it back: the component may be down. Its logs: sudo docker compose -p $project logs $component."
             die "$mode of '$project/$component' failed and was rolled back."
         fi
         echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) failed $component $(tr '\n' ' ' <<<"$lines")" >> "$state/history"
@@ -1062,44 +1264,9 @@ cmd_deploy() {
 
 cmd_rollback() {
     [ "$#" -ge 2 ] || die "usage: katap rollback <project> <component> [<image@sha256:…> [migrate=<image@sha256:…>]]"
-    local project="$1" component="$2"
-    shift 2
-    require_component "$project" "$component"
-
-    # env= (from ssh-dispatch) travels through to release; the rest name images.
-    local passthrough=() images=() arg
-    for arg in "$@"; do
-        case "$arg" in env=*) passthrough+=("$arg") ;; *) images+=("$arg") ;; esac
-    done
-    set -- "${images[@]}"
-
-    if [ "$#" -eq 0 ]; then
-        # The release deployed before the one now serving. Only `deploy` entries
-        # count: walking back from the newest deploy of the serving image, so a second
-        # rollback goes further back instead of returning to what was rolled away from.
-        local cu now line entry=() target=() found=false
-        cu="$(upper "$component")"
-        now="$(file_get "$(images_file "$project")" "IMAGE_$cu")"
-        [ -n "$now" ] || die "'$project/$component' has no release serving."
-        while IFS= read -r line; do
-            read -ra entry <<<"$line"
-            [ "${entry[1]:-}" = deploy ] && [ "${entry[2]:-}" = "$component" ] || continue
-            if [ "$found" = false ]; then
-                [ "${entry[3]#IMAGE_"$cu"=}" != "$now" ] || found=true
-                continue
-            fi
-            [ "${entry[3]#IMAGE_"$cu"=}" != "$now" ] || continue
-            target=("${entry[@]}")
-            break
-        done < <(tac "$(state_dir "$project")/history" 2>/dev/null || true)
-        [ "${#target[@]}" -gt 0 ] || die "no earlier release of '$project/$component' to roll back to."
-
-        set -- "${target[3]#IMAGE_"$cu"=}"
-        [ "${#target[@]}" -lt 5 ] || set -- "$1" "migrate=${target[4]#IMAGE_"${cu}"_MIGRATE=}"
-        log "rolling back to $1."
-    fi
-
-    release rollback "$project" "$component" "$@" "${passthrough[@]}"
+    # Without an image, release() picks the target once it holds the project lock,
+    # so a deploy finishing meanwhile is what it rolls back from.
+    release rollback "$@"
 }
 
 # --- run / cron -----------------------------------------------------------------
@@ -1114,6 +1281,14 @@ cmd_run() {
     local services
     services="$(compose "$project" --profile '*' config --services)"
     grep -qxF -- "$service" <<<"$services" || die "project '$project' has no service '$service'."
+    # A component with no release yet has no image, only the template's placeholder
+    # (an older template's was a Docker Hub name): never run, never pulled.
+    local images
+    images="$(compose "$project" --profile '*' config --images "$service")" \
+        || die "project '$project': the compose files do not render."
+    if grep -qE '^(registry\.invalid/|(docker\.io/)?katap/unreleased:)' <<<"$images"; then
+        die "'$service' belongs to a component of '$project' that has no release yet; deploy it first."
+    fi
     if [ "${1:-}" = --no-deps-run ]; then
         shift
         compose "$project" run --rm --no-deps "$service" "$@"
@@ -1122,7 +1297,34 @@ cmd_run() {
     compose "$project" run --rm "$service" "$@"
 }
 
-released() { grep -qE "^IMAGE_$(upper "$2")=" "$(images_file "$1")"; }
+# One key of a project's images.env. A file that cannot be read is fatal: read as
+# empty, every component would look unreleased, and go without its backups.
+image_get() {
+    local file line status=0
+    file="$(images_file "$1")"
+    line="$(grep -E -m 1 "^$2=" "$file")" || status=$?
+    [ "$status" -le 1 ] || die "could not read $file."
+    printf '%s' "${line#*=}"
+}
+
+# Prints an images.env without one component's lines (<COMPONENT> uppercased).
+# Dies when it cannot be read: read as empty, a rewrite of the file would drop
+# every other component's release.
+other_releases() {
+    local status=0
+    grep -vE "^IMAGE_$2(_MIGRATE)?=" "$1" || status=$?
+    [ "$status" -le 1 ] || die "could not read $1; nothing was changed."
+}
+
+# Whether a component has a release serving. Not through image_get: inside $( ),
+# its refusal would end only that subshell and read as "no release".
+released() {
+    local file status=0
+    file="$(images_file "$1")"
+    grep -qE "^IMAGE_$(upper "$2")=" "$file" || status=$?
+    [ "$status" -le 1 ] || die "could not read $file."
+    return "$status"
+}
 
 cron_project() {
     local project="$1" component service
@@ -1176,10 +1378,13 @@ backup_component() {
         return 1
     fi
 
+    require_count KATAP_BACKUP_KEEP
     dir="$KATAP_SRV/backups/$project"
     mkdir -p "$dir"
     chmod 700 "$dir"
     file="$dir/$component-$(date -u +%Y%m%dT%H%M%SZ)-$reason.dump"
+    # Removed however this process ends, so an interrupted dump leaves nothing behind.
+    CLEANUP+=("$file.partial")
 
     log "dumping $project/$service to $file."
     # A dump waiting on a lock (a migration's ALTER TABLE) gives up instead of
@@ -1213,13 +1418,30 @@ backup_component() {
     done
 
     if [ -n "${KATAP_RCLONE_REMOTE:-}" ]; then
-        if ! command -v rclone >/dev/null || ! rclone copy "$file" "$KATAP_RCLONE_REMOTE/$project/" \
-            || ! rclone copy "$file.images" "$KATAP_RCLONE_REMOTE/$project/"; then
+        require_duration KATAP_RCLONE_TIMEOUT
+        if ! command -v rclone >/dev/null \
+            || ! timeout -k 10s "$KATAP_RCLONE_TIMEOUT" rclone copy "$file" "$KATAP_RCLONE_REMOTE/$project/" \
+            || ! timeout -k 10s "$KATAP_RCLONE_TIMEOUT" rclone copy "$file.images" "$KATAP_RCLONE_REMOTE/$project/"; then
             log "$project/$component: the off-host copy failed; $file is on this host only."
-            # A deploy is not held hostage by the backup remote; the nightly run is.
-            [ "$reason" = predeploy ] || return 1
+            # A deploy or a restore is not held hostage by the backup remote, since
+            # its dump is on this host; the nightly run is.
+            case "$reason" in predeploy|prerestore) ;; *) return 1 ;; esac
         fi
     fi
+}
+
+# The nightly backup of one project, run in a subshell of its own by cmd_backup.
+backup_project() {
+    local project="$1" component status=0
+    # A subshell runs no EXIT trap of its parent: its own removes what it left.
+    CLEANUP=()
+    trap cleanup EXIT
+    lock_project "$project" 1800
+    for component in $(components_of "$project"); do
+        released "$project" "$component" || continue
+        backup_component "$project" "$component" scheduled || status=1
+    done
+    exit "$status"
 }
 
 cmd_backup() {
@@ -1234,15 +1456,7 @@ cmd_backup() {
     # Every project is attempted whatever another one does; the exit status says
     # whether any failed.
     for project in "${projects[@]}"; do
-        if ! (
-            lock_project "$project" 1800
-            status=0
-            for component in $(components_of "$project"); do
-                released "$project" "$component" || continue
-                backup_component "$project" "$component" scheduled || status=1
-            done
-            exit "$status"
-        ); then
+        if ! ( backup_project "$project" ); then
             log "the backup of '$project' failed."
             failed=1
         fi
@@ -1259,8 +1473,14 @@ cmd_restore() {
     local project="$1" component="$2" dump="$3"
     require_component "$project" "$component"
     [ "$5" = "$project" ] || die "--confirm must repeat the project name."
+    # Checked before anything stops: the safety dump depends on them.
+    require_count KATAP_BACKUP_KEEP
+    [ -z "${KATAP_RCLONE_REMOTE:-}" ] || require_duration KATAP_RCLONE_TIMEOUT
     [ -s "$dump" ] || die "no dump at $dump."
     [ -s "$dump.images" ] || die "no $dump.images: the release that wrote this dump is unknown."
+    # Dumps are named <component>-<time>-<reason>.dump: another component's data
+    # would replace this one's.
+    [[ "$(basename "$dump")" == "$component"-* ]] || die "$(basename "$dump") is not a dump of '$component' (its name starts with the component's)."
 
     local service cu lines
     service="$(conf_get "$project" "$component" backup)"
@@ -1281,9 +1501,15 @@ cmd_restore() {
     ensure_images "$lines"
 
     psql_admin() { compose "$project" exec -T "$service" psql -X -q -v ON_ERROR_STOP=1 -U postgres -d postgres "$@"; }
-    local rollout_services current
+    local rollout_services current state candidate
     rollout_services="$(conf_get "$project" "$component" rollout)"
     current="$(images_file "$project")"
+    # The state the restore will record, built while nothing has changed yet.
+    state="$(state_dir "$project")"
+    candidate="$(mktemp "$state/images.XXXXXX")"
+    CLEANUP+=("$candidate")
+    other_releases "$current" "$cu" > "$candidate"
+    printf '%s\n' "$lines" >> "$candidate"
 
     # Stopped before the safety dump, so no write lands after it and is lost.
     # shellcheck disable=SC2086 # a list of service names
@@ -1300,19 +1526,16 @@ cmd_restore() {
     psql_admin -v db=app_restore < "$KATAP_ROOT/lib/app-database.sql" >/dev/null || abandon "could not create the restore database"
     compose "$project" exec -T "$service" pg_restore -U postgres -d app_restore --single-transaction --exit-on-error <&6 \
         || abandon "the restore failed"
-    psql_admin -c 'DROP DATABASE app WITH (FORCE)' -c 'ALTER DATABASE app_restore RENAME TO app' >/dev/null \
-        || die "the swap failed: the restored data is in database app_restore; rename it to app by hand, then 'katap rollback'."
+    # Until the old database is dropped, a failure leaves the data as it was.
+    psql_admin -c 'DROP DATABASE app WITH (FORCE)' >/dev/null || abandon "could not drop the database to replace it"
 
-    # From here the data is the dump's, so the state records the dump's release
-    # whatever happens next.
-    local state candidate
-    state="$(state_dir "$project")"
-    candidate="$(mktemp "$state/images.XXXXXX")"
-    CLEANUP+=("$candidate")
-    grep -vE "^IMAGE_${cu}(_MIGRATE)?=" "$current" > "$candidate" || true
-    printf '%s\n' "$lines" >> "$candidate"
+    # From here the data is the dump's, so the state records the dump's release, and
+    # the history the restore, whatever happens next: what a rollback may go back to
+    # is then cut as the restore requires.
     mv "$candidate" "$current"
     echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) restore $component $(tr '\n' ' ' <<<"$lines")from $(basename "$dump")" >> "$state/history"
+    psql_admin -c 'ALTER DATABASE app_restore RENAME TO app' >/dev/null \
+        || die "the restored data is in database app_restore, and renaming it to app failed; $rollout_services are stopped. Rename it by hand (as postgres: ALTER DATABASE app_restore RENAME TO app), then start the release it holds: katap rollback $project $component $(sed -E "s/^IMAGE_${cu}_MIGRATE=/migrate=/; s/^IMAGE_${cu}=//" <<<"$lines" | tr '\n' ' ')"
 
     # Queued jobs and cached state (permissions, sessions) describe the data that was
     # just replaced. Cleared before anything starts, so no worker runs a job for a row
@@ -1503,6 +1726,8 @@ cmd_apply() {
         for key in "${JSON_KEYS[@]}"; do
             [ "$(conf_get "$project" "$component" "$key")" = "${WANTED[$id/$key]}" ] || pairs+=("$key")
         done
+        ! grep -qE '^(source_repo|provenance)=' "$(conf_file "$project" "$component")" 2>/dev/null \
+            || pairs+=("remove v1's source_repo and provenance")
         [ "${#pairs[@]}" -eq 0 ] || plan+=("update $id: ${pairs[*]}")
     done
     if [ "${#plan[@]}" -gt 0 ]; then
@@ -1588,6 +1813,10 @@ cmd_apply() {
     # writing a site block must not leave it unloaded once the next run has
     # nothing left to create. A no-op while the edge is down; validated first.
     edge_reload || die "the edge rejected the sites; the previous configuration keeps serving. Fix site.caddy and run 'katap edge reload'."
+    # From now on katap.json is this host's list of what deploys, even once it
+    # lists nothing (see release).
+    mkdir -p "$KATAP_SRV/state"
+    : > "$KATAP_APPLIED"
     apply_report
 }
 
@@ -1673,6 +1902,11 @@ key_binding() { printf 'restrict,command="%s/bin/katap ssh-dispatch %s %s %s"' "
 # whichever tool path wrote it. Names are [a-z0-9-], so they are regex-safe.
 key_pattern() { printf 'ssh-dispatch %s %s %s" ' "$1" "$2" "$3"; }
 
+# Matches a v1 key bound to <component> together with others (api,web).
+shared_key_pattern() {
+    printf 'ssh-dispatch %s %s ([a-z0-9-]+,)+%s(,[a-z0-9-]+)*"|ssh-dispatch %s %s %s(,[a-z0-9-]+)+"' "$1" "$2" "$3" "$1" "$2" "$3"
+}
+
 # Rewrites the deploy user's authorized_keys under a lock: every line matching
 # <drop> (an extended regex) removed, then <add> appended when given. Built in the
 # file's own directory and renamed, so sshd never reads half of it; a read error
@@ -1699,17 +1933,41 @@ rewrite_authorized_keys() {
 # component only, and prints the private half once, with the other values the
 # repository's workflow needs. Nothing of the private key stays on this host.
 cmd_deploy_key() {
-    local replace=false args=() arg
+    local replace=false revoke=false args=() arg
     for arg in "$@"; do
         case "$arg" in
             --replace) replace=true ;;
+            --revoke) revoke=true ;;
             *) args+=("$arg") ;;
         esac
     done
-    [ "${#args[@]}" -eq 2 ] || die "usage: katap deploy-key <project> <component> [--replace]"
+    if [ "${#args[@]}" -ne 2 ] || { [ "$replace" = true ] && [ "$revoke" = true ]; }; then
+        die "usage: katap deploy-key <project> <component> [--replace | --revoke]"
+    fi
     local project="${args[0]}" component="${args[1]}"
     require_owner deploy-key
     require_component "$project" "$component"
+
+    if [ "$revoke" = true ]; then
+        local env pattern shared found=false
+        env="$(conf_get "$project" "$component" environment)"
+        pattern="$(key_pattern "$env" "$project" "$component")"
+        shared="$(shared_key_pattern "$env" "$project" "$component")"
+        if grep -qE "$pattern" "$KATAP_AUTHORIZED_KEYS" 2>/dev/null; then
+            rewrite_authorized_keys "$pattern"
+            found=true
+        fi
+        # A v1 key bound to several components deploys this one too. It is the
+        # operator's to remove, since it still speaks for the others; until then
+        # nothing here may say the component's access is withdrawn.
+        if grep -nE "$shared" "$KATAP_AUTHORIZED_KEYS" 2>/dev/null | cut -d: -f1 | sed 's/^/line /' | grep . >&2; then
+            die "an older key in $KATAP_AUTHORIZED_KEYS (the line(s) above) is bound to $project/$component together with other components and still deploys it; remove it by hand, then make keys for the others with katap deploy-key."
+        fi
+        [ "$found" = true ] || die "$project/$component has no $env deploy key."
+        echo "The $env deploy key of $project/$component no longer works (a deploy it already"
+        echo "started finishes). Delete its secrets and variables from the repository too."
+        return
+    fi
     load_projects_file
     [ -n "$WANTED_HOST" ] || die "set host (this server's public IPv4 address) in $KATAP_PROJECTS_FILE first."
 
@@ -1736,18 +1994,16 @@ cmd_deploy_key() {
     rewrite_authorized_keys "$(key_pattern "$environment" "$project" "$component")" "$binding $(cat "$work/key.pub")"
     # A v1 key bound to several components also deploys this one; it is the
     # operator's to remove, since it still speaks for the others.
-    if grep -qE "ssh-dispatch $environment $project ([a-z0-9-]+,)*$component(,[a-z0-9-]+)+\"|ssh-dispatch $environment $project ([a-z0-9-]+,)+$component\"" "$file"; then
+    if grep -qE "$(shared_key_pattern "$environment" "$project" "$component")" "$file"; then
         echo "Note: an older key in $file is bound to $project/$component together with other"
         echo "components (ssh-dispatch $environment $project <a>,<b>). It still deploys this one; remove that line once"
         echo "each of those components has its own key."
         echo
     fi
 
-    local prefix=KATAP_ release='' url='' domains
-    [ "$environment" = production ] || prefix=KATAP_STAGING_
-    if [ -f "$KATAP_RELEASE_FILE" ]; then
-        release="$(file_get "$KATAP_RELEASE_FILE" commit) # $(file_get "$KATAP_RELEASE_FILE" tag)"
-    fi
+    local prefix=KATAP_ branch=main tag='' url='' domains
+    [ "$environment" = production ] || { prefix=KATAP_STAGING_; branch=staging; }
+    [ ! -f "$KATAP_RELEASE_FILE" ] || tag="$(file_get "$KATAP_RELEASE_FILE" tag)"
     domains="$(conf_get "$project" "$component" domains)"
     # A wildcard names no host to check.
     [ -z "$domains" ] || [[ "$domains" == \** ]] || url="https://${domains%% *}$(conf_get "$project" "$component" smoke_path)"
@@ -1756,8 +2012,9 @@ cmd_deploy_key() {
 A $environment deploy key for $project/$component is authorised on this server. It
 can deploy and roll back $project/$component and nothing else.
 
-Add these as repository secrets in GitHub: open the repository, then
-Settings → Secrets and variables → Actions → New repository secret.
+In GitHub, open the repository, then Settings → Secrets and variables → Actions.
+
+On the Secrets tab, add three repository secrets:
 
 ${prefix}SSH_KEY   (every line, including the BEGIN and END lines)
 $(cat "$work/key")
@@ -1771,22 +2028,30 @@ $WANTED_HOST $hostkey
 The private key above is shown once and is not kept on this server. Clear
 your terminal once it is saved in GitHub.
 
-Then add this step to the repository's workflow, in a job after the one that
-builds and pushes the image, with permissions: packages: read (see
-docs/deploying.md and examples/github-workflow.yml):
+On the Variables tab, add these repository variables:
 
-      - uses: jaylordibe/katap@${release:-<commit of the Katap release this server runs>}
-        with:
-          host: \${{ secrets.${prefix}HOST }}
-          known-hosts: \${{ secrets.${prefix}KNOWN_HOSTS }}
-          ssh-key: \${{ secrets.${prefix}SSH_KEY }}
-          project: $project
-          component: $component
-          image: \${{ needs.build.outputs.image }}
 EOF
-    [ -z "$(conf_get "$project" "$component" image_migrate)" ] \
-        || echo "          migrate-image: \${{ needs.build.outputs.migrate-image }}"
-    [ -z "$url" ] || echo "          url: $url"
+    printf '%-26s %s\n' "${prefix}PROJECT" "$project" "${prefix}COMPONENT" "$component"
+    [ -z "$url" ] || printf '%-26s %s\n' "${prefix}URL" "$url"
+    cat <<EOF
+
+The repository's workflow then deploys every push to $branch, once it has Katap's
+deploy jobs: copy examples/github-workflow.yml from Katap into .github/workflows/,
+or, in a repository made from laravel-api or nestjs-api, add its two deploy jobs
+to publish-image.yml and set the variable PUBLISH_ENABLED to true
+(docs/deploying.md).
+EOF
+    if [ -n "$(conf_get "$project" "$component" image_migrate)" ]; then
+        cat <<EOF
+
+$project/$component also deploys a migrate image: in both deploy jobs, uncomment
+the migrate-image line (and, in a copy of the example, the publish job's migrate
+build and its migrate-image output).
+EOF
+    fi
+    # A request's form never changes within a major version (docs/updating.md), so
+    # the workflow's pin need not match this server's release.
+    [ -z "$tag" ] || echo "This server runs Katap $tag; the workflow's jaylordibe/katap pin may be any ${tag%%.*} release."
 }
 
 # Removes components that were never deployed: a typo in katap.json, or one
@@ -1812,7 +2077,14 @@ remove_site_block() {
         content="${content/"$block"/}"
         # Drop the blank lines the removal leaves at either end.
         content="$(printf '%s\n' "$content" | sed -e '/./,$!d' | tac | sed -e '/./,$!d' | tac)"
-        printf '%s' "$content${content:+$'\n'}" > "$site"
+        # Written beside it and renamed over it: the edge reads this file, and a
+        # failed write must not leave the other components' blocks truncated.
+        local tmp
+        tmp="$(mktemp "$site.XXXXXX")"
+        CLEANUP+=("$tmp")
+        printf '%s' "$content${content:+$'\n'}" > "$tmp"
+        chmod --reference="$site" "$tmp"
+        mv "$tmp" "$site"
     else
         echo "Note: $project/$component's block in $site was edited after apply wrote it; remove it by hand."
     fi
@@ -1842,7 +2114,23 @@ cmd_remove() {
         mapfile -t components < <(components_of "$project")
     fi
 
-    [ ! -f "$KATAP_PROJECTS_FILE" ] || load_projects_file
+    # Only whether katap.json still lists it: the file's other checks (a domain
+    # claimed twice, say) are about what apply creates, and must not stop the
+    # removal of the typo that caused them.
+    if [ -f "$KATAP_PROJECTS_FILE" ]; then
+        jq -e . "$KATAP_PROJECTS_FILE" >/dev/null 2>&1 || die "$KATAP_PROJECTS_FILE does not parse; fix it first."
+        local listed
+        for component in "${components[@]}"; do
+            # 1 is "not listed"; anything else is a file of an unexpected shape.
+            listed=0
+            jq -e --arg p "$project" --arg c "$component" '(.projects // {})[$p][$c] != null' "$KATAP_PROJECTS_FILE" >/dev/null 2>&1 || listed=$?
+            case "$listed" in
+                0) die "$project/$component is in $KATAP_PROJECTS_FILE; remove it there first, or the next apply creates it again." ;;
+                1) ;;
+                *) die "$KATAP_PROJECTS_FILE is not a projects file katap can read; fix it first." ;;
+            esac
+        done
+    fi
     lock_project "$project"
     local state history containers volumes
     state="$(state_dir "$project")"
@@ -1853,8 +2141,6 @@ cmd_remove() {
     volumes="$("$KATAP_DOCKER" volume ls --filter "label=com.docker.compose.project=$project" --format '{{.Label "com.docker.compose.volume"}}')" \
         || die "could not list $project's volumes; nothing was removed."
     for component in "${components[@]}"; do
-        [ -z "${WANTED[$project/$component/type]+set}" ] \
-            || die "$project/$component is in $KATAP_PROJECTS_FILE; remove it there first, or the next apply creates it again."
         ! released "$project" "$component" || die "$project/$component has a release serving; it was deployed, so this command will not remove it."
         ! awk -v c="$component" '$3 == c { found = 1 } END { exit !found }' "$history" 2>/dev/null \
             || die "$project/$component has been deployed, or a deploy was attempted (see $history); this command will not remove it."
@@ -1910,7 +2196,8 @@ cmd_remove() {
 
 # --- images ---------------------------------------------------------------------
 
-# The image repositories <project>... name, one per line.
+# The image repositories of these projects: the ones their .conf files name, and
+# the ones their history does (a repository a component moved away from).
 repo_names() {
     local p c
     for p in "$@"; do
@@ -1918,20 +2205,20 @@ repo_names() {
             conf_get "$p" "$c" image; echo
             conf_get "$p" "$c" image_migrate; echo
         done
+        { grep -oE 'IMAGE_[A-Z0-9_]+=[^ @]+@' "$(state_dir "$p")/history" 2>/dev/null || true; } | sed 's/^[^=]*=//; s/@$//'
     done | sed '/^$/d' | sort -u
 }
 
 # Removes images of Katap's components that no release needs any more. Kept: what
-# serves now, a deploy in progress, the last $KATAP_RELEASES_KEPT deploys of each
-# component (rollback targets), and every release a kept database dump records
+# serves now, a deploy in progress, each component's newest release and the
+# $KATAP_RELEASES_KEPT before it (rollback targets), and every release a kept database dump records
 # (restore targets). Each project is locked without waiting: a busy one is
 # skipped, and every image of its repositories kept, so housekeeping never holds
 # up a deploy or a scheduled job. Images of anything else on the host are left
 # alone; dangling layers are pruned.
 cmd_images() {
     [ "${1:-}" = prune ] && [ "$#" -eq 1 ] || die "usage: katap images prune"
-    [[ "$KATAP_RELEASES_KEPT" =~ ^[0-9]{1,4}$ ]] && [ "$KATAP_RELEASES_KEPT" -ge 1 ] \
-        || die "KATAP_RELEASES_KEPT must be a whole number of at least 1 (it is '$KATAP_RELEASES_KEPT')."
+    require_count KATAP_RELEASES_KEPT
     local project projects=() locked=() busy=() fds=() fd
     mapfile -t projects < <(all_projects)
     for project in "${projects[@]}"; do
@@ -1956,8 +2243,12 @@ cmd_images() {
         for project in "${locked[@]}"; do
             cat "$(state_dir "$project")"/images.* 2>/dev/null || true
             for component in $(components_of "$project"); do
-                awk -v c="$component" '$2 == "deploy" && $3 == c { $1 = $2 = $3 = ""; print }' \
-                    "$(state_dir "$project")/history" 2>/dev/null | tail -n "$KATAP_RELEASES_KEPT" | tr ' ' '\n'
+                # The newest release on the line a rollback walks, and
+                # KATAP_RELEASES_KEPT distinct ones before it, each counted by its
+                # runtime image as a rollback counts it.
+                release_lineage "$project" "$component" | tac \
+                    | awk -v n="$((KATAP_RELEASES_KEPT + 1))" '!seen[$1]++ && ++k <= n' \
+                    | tr ' ' '\n'
             done
             for f in "$KATAP_SRV/backups/$project"/*.dump.images; do [ ! -f "$f" ] || cat "$f"; done
         done | sed -n 's/^IMAGE_[A-Z0-9_]*=//p' | sort -u
@@ -1980,6 +2271,11 @@ cmd_images() {
 #   restrict,command="/srv/katap/bin/katap ssh-dispatch <environment> <project> <component>[,...]"
 # It admits exactly `deploy` and `rollback` of those components; every argument is
 # validated again by them. `katap deploy-key` writes that line.
+#
+# The request's form (its words, and the login on standard input) is a contract
+# with every Katap action of this major version: it never changes within one, so
+# any v2 action deploys to any v2 server (docs/updating.md). A change to it is a
+# new major version.
 cmd_ssh_dispatch() {
     # The binding comes from the key's forced command, never from the request.
     local environment="${1:-}" bound_project="${2:-}" bound_components="${3:-}"

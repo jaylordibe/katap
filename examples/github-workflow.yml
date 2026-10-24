@@ -1,22 +1,29 @@
 # An application repository's workflow: build the image, push it to GitHub's
-# registry, deploy it with Katap. Copy it to .github/workflows/ in the
-# repository, set the three values marked CHANGE, and add the secrets that
-# `katap deploy-key <project> <component>` printed on the server.
+# registry, deploy it with Katap. Copy it to .github/workflows/ unchanged, then
+# add the secrets and variables `katap deploy-key <project> <component>` printed
+# on the server. Nothing in this file names your server or your project.
 #
 # The build is GitHub's standard one ("Publishing Docker images" in GitHub's
 # docs): the repository's own Dockerfile, pushed to ghcr.io under the commit.
-# Only the last step is Katap's. A repository that already builds its image in
-# its own workflow keeps that, and adds only the deploy job below.
+# Only the deploy jobs are Katap's. A repository that already builds its image in
+# its own workflow keeps that, and adds the two deploy jobs below to it: they fit
+# wherever the build job is named `publish` and outputs the pushed digest as
+# `image` (laravel-api's and nestjs-api's publish-image.yml do; a nestjs-api
+# uncomments the jobs' migrate-image line).
+#
+# A push to main deploys production once the KATAP_PROJECT variable is set; a
+# push to staging deploys staging once KATAP_STAGING_PROJECT is set. Until then
+# the image is built and pushed, and nothing is deployed.
 
 name: Build and deploy
 
 on:
   push:
-    branches: [main]
+    branches: [main, staging]
   workflow_dispatch:
 
-# One release at a time, in push order: a later push never deploys before an
-# earlier one has finished.
+# One release at a time per branch, in push order: a later push never deploys
+# before an earlier one has finished.
 concurrency:
   group: deploy-${{ github.ref }}
   cancel-in-progress: false
@@ -24,7 +31,7 @@ concurrency:
 permissions: {}
 
 jobs:
-  build:
+  publish:
     name: Build, scan and push
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -33,6 +40,8 @@ jobs:
       packages: write
     outputs:
       image: ${{ steps.name.outputs.image }}@${{ steps.build.outputs.digest }}
+      # A nestjs-api: uncomment, with its build step below and the deploy jobs' migrate-image.
+      # migrate-image: ${{ steps.name.outputs.image }}-migrate@${{ steps.migrate.outputs.digest }}
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -61,7 +70,7 @@ jobs:
           tags: ${{ steps.name.outputs.image }}:sha-${{ github.sha }}
           # A frontend that bakes values in at build time takes them here, e.g.:
           # build-args: |
-          #   PUBLIC_API_URL=https://api.example.com
+          #   PUBLIC_API_URL=${{ vars.PUBLIC_API_URL }}
 
       # A fixable HIGH or CRITICAL vulnerability stops the release here.
       - name: Scan the pushed image
@@ -85,26 +94,52 @@ jobs:
       #     target: migrate
       #     push: true
       #     tags: ${{ steps.name.outputs.image }}-migrate:sha-${{ github.sha }}
-      # and adds to the job's outputs:
-      #   migrate-image: ${{ steps.name.outputs.image }}-migrate@${{ steps.migrate.outputs.digest }}
 
+  # Each deploy job is its own job so that it holds only packages: read: the
+  # server pulls with this job's token, and gets no more than it may do.
   deploy:
-    name: Deploy
-    needs: build
+    name: Deploy to production
+    needs: publish
+    # !cancelled() and the result: a job skipped further up (a test job some
+    # branches skip) must not skip the deploy of a publish that succeeded.
+    if: ${{ !cancelled() && needs.publish.result == 'success' && github.ref == 'refs/heads/main' && vars.KATAP_PROJECT != '' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
       packages: read
     steps:
       - name: Deploy with Katap
-        # CHANGE: the commit `katap deploy-key` printed, the release your server runs.
-        uses: jaylordibe/katap@0000000000000000000000000000000000000000 # vX.Y.Z
+        # Pinned by commit: this step receives the deploy key. Dependabot's
+        # github-actions updates, when the repository has them on, move it to each
+        # new Katap release; any release of your server's major version works.
+        uses: jaylordibe/katap@316f59b4ecaee13ddafe638eb24aa4cd99fc39b1 # v2.0.0
         with:
           host: ${{ secrets.KATAP_HOST }}
           known-hosts: ${{ secrets.KATAP_KNOWN_HOSTS }}
           ssh-key: ${{ secrets.KATAP_SSH_KEY }}
-          project: example # CHANGE: the project in /srv/katap.json
-          component: api # CHANGE: the component in /srv/katap.json
-          image: ${{ needs.build.outputs.image }}
-          # migrate-image: ${{ needs.build.outputs.migrate-image }}   # nestjs-api
-          # url: https://api.example.com/api/health/readiness         # checked after the deploy
+          project: ${{ vars.KATAP_PROJECT }}
+          component: ${{ vars.KATAP_COMPONENT }}
+          image: ${{ needs.publish.outputs.image }}
+          # migrate-image: ${{ needs.publish.outputs.migrate-image }}   # a nestjs-api
+          url: ${{ vars.KATAP_URL }}
+
+  deploy-staging:
+    name: Deploy to staging
+    needs: publish
+    if: ${{ !cancelled() && needs.publish.result == 'success' && github.ref == 'refs/heads/staging' && vars.KATAP_STAGING_PROJECT != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      packages: read
+    steps:
+      - name: Deploy with Katap
+        uses: jaylordibe/katap@316f59b4ecaee13ddafe638eb24aa4cd99fc39b1 # v2.0.0
+        with:
+          host: ${{ secrets.KATAP_STAGING_HOST }}
+          known-hosts: ${{ secrets.KATAP_STAGING_KNOWN_HOSTS }}
+          ssh-key: ${{ secrets.KATAP_STAGING_SSH_KEY }}
+          project: ${{ vars.KATAP_STAGING_PROJECT }}
+          component: ${{ vars.KATAP_STAGING_COMPONENT }}
+          image: ${{ needs.publish.outputs.image }}
+          # migrate-image: ${{ needs.publish.outputs.migrate-image }}   # a nestjs-api
+          url: ${{ vars.KATAP_STAGING_URL }}

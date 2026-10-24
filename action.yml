@@ -2,16 +2,17 @@ name: Katap deploy
 description: Deploy a published container image to a Katap server, through that application's restricted SSH key.
 author: jaylordibe
 
-# Used from an application repository's own workflow, inside the GitHub
-# environment that holds that application's deploy key:
+# Used from an application repository's own workflow, with the deploy key and the
+# server's address in that repository's secrets (examples/github-workflow.yml):
 #
 #   - uses: jaylordibe/katap@<commit of a release> # vX.Y.Z
 #
 # Pin it by commit, never by a tag: this action receives the deploy key, and a
 # tag can be moved. It runs no other action, so that commit is all the code it
 # runs. The server, not this action, decides what may deploy: the key's binding
-# and the image repository come from its own settings. `katap deploy-key` on the
-# server prints this step with its values filled in.
+# and the image repository come from its own settings. The deploy jobs of
+# examples/github-workflow.yml hold this step, fed by the repository secrets and
+# variables `katap deploy-key` prints.
 
 inputs:
   host:

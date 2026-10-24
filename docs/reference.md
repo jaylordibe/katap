@@ -31,7 +31,7 @@ On the server:
 | `/srv/state/<project>/` | What is serving, and the history |
 | `/srv/backups/<project>/` | Database dumps |
 | `/srv/edge/` | This server's `edge.env` and Cloudflare certificates |
-| `/etc/katap/katap.env` | Host settings: the GitHub token, backup and timing options |
+| `/etc/katap/katap.env` | Host settings: the backup remote, retention and time limits (each one is described in the file) |
 | `/etc/katap/release` | The installed release (`tag=`, `commit=`) |
 
 ## The project contract
@@ -46,6 +46,9 @@ On the server:
 - **Never privileged**, host networking, the host PID namespace or the Docker socket.
 - **No fixed `hostname:`**, and every service a `.conf` names exists.
 - **The `.conf` agrees with `/srv/katap.json`** for every component it declares.
+
+It also warns, without refusing, about a service that keeps the `NET_RAW`
+capability: add `cap_drop: [NET_RAW]` to it, as the templates do.
 
 ## What each template expects from an image
 

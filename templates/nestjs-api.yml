@@ -22,13 +22,14 @@ x-__C__-logging: &__C__-logging
 
 services:
   __C__:
-    image: ${IMAGE___CU__:-katap/unreleased:none}
+    image: ${IMAGE___CU__:-registry.invalid/katap/unreleased@sha256:0000000000000000000000000000000000000000000000000000000000000000}
     env_file:
       - ${KATAP_SECRETS}/__C__.env
     environment:
       QUEUE_WORKER_ENABLED: 'true'
     restart: unless-stopped
     logging: *__C__-logging
+    cap_drop: [NET_RAW]
     security_opt:
       - no-new-privileges:true
     mem_limit: 512m
@@ -56,13 +57,14 @@ services:
           - ${KATAP_PROJECT}-__C__
 
   __C__-migrate:
-    image: ${IMAGE___CU___MIGRATE:-katap/unreleased:none}
+    image: ${IMAGE___CU___MIGRATE:-registry.invalid/katap/unreleased@sha256:0000000000000000000000000000000000000000000000000000000000000000}
     env_file:
       - ${KATAP_SECRETS}/__C__.env
     profiles: [predeploy]
     restart: 'no'
     init: true
     logging: *__C__-logging
+    cap_drop: [NET_RAW]
     security_opt:
       - no-new-privileges:true
     depends_on:
@@ -71,6 +73,7 @@ services:
 
   __C__-db:
     image: postgres:18.6@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336
+    cap_drop: [NET_RAW]
     restart: unless-stopped
     logging: *__C__-logging
     shm_size: 256mb
@@ -94,6 +97,7 @@ services:
 
   __C__-redis:
     image: redis:8.6.7-alpine@sha256:ac2da09bc822f325a9f68f533120b86fa39c1b8db46b3aa7c1bbea7fdfd4fcba
+    cap_drop: [NET_RAW]
     restart: unless-stopped
     logging: *__C__-logging
     env_file:

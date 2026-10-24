@@ -20,12 +20,13 @@ x-__C__-logging: &__C__-logging
     max-file: '3'
 
 x-__C__-app: &__C__-app
-  image: ${IMAGE___CU__:-katap/unreleased:none}
+  image: ${IMAGE___CU__:-registry.invalid/katap/unreleased@sha256:0000000000000000000000000000000000000000000000000000000000000000}
   env_file:
     - ${KATAP_SECRETS}/__C__.env
   # One-shot runtimes install no SIGTERM handler as PID 1; an init forwards it.
   init: true
   logging: *__C__-logging
+  cap_drop: [NET_RAW]
   security_opt:
     - no-new-privileges:true
   depends_on:
@@ -105,6 +106,7 @@ services:
 
   __C__-db:
     image: postgres:18.6@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336
+    cap_drop: [NET_RAW]
     restart: unless-stopped
     logging: *__C__-logging
     shm_size: 256mb
@@ -131,6 +133,7 @@ services:
 
   __C__-redis:
     image: redis:8.6.7-alpine@sha256:ac2da09bc822f325a9f68f533120b86fa39c1b8db46b3aa7c1bbea7fdfd4fcba
+    cap_drop: [NET_RAW]
     restart: unless-stopped
     logging: *__C__-logging
     env_file:

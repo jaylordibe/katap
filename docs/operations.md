@@ -6,7 +6,7 @@ every project; `docker` needs `sudo` from your own account.
 | Task | Command |
 |---|---|
 | Add a project or component | Add it to `/srv/katap.json` (as root), then `katap apply`; see [The projects file](projects-file.md) |
-| Roll back | `katap rollback shop api`: back to the release before the one serving; run it again to go further back. The last 5 deploys of each component stay on the server (`KATAP_RELEASES_KEPT`), so rolling back to them needs no registry; further back, a private image needs a registry login (see [Troubleshooting](troubleshooting.md#deploying)). It never runs migrations backwards, so keep migrations expand-only |
+| Roll back | `katap rollback shop api`: back to the release before the one serving; run it again to go further back. The newest release of each component and the 5 before it stay on the server (`KATAP_RELEASES_KEPT`), so rolling back to them needs no registry; further back, a private image needs a registry login (see [Troubleshooting](troubleshooting.md#deploying)). It never runs migrations backwards, so keep migrations expand-only. It never goes forward, past the release serving: deploy that one instead |
 | One-off command | `katap run shop api-artisan <args>`: as the application user, never root |
 | Logs / status | `sudo docker compose -p shop logs -f api` · `sudo docker ps --filter label=com.docker.compose.project=shop` (running containers only; check every expected service appears) |
 | Back up now | `katap backup shop`. Also nightly, by timer; 14 of each kind are kept per component (`KATAP_BACKUP_KEEP`) |
@@ -28,7 +28,11 @@ refuses to run while the tool has local modifications.
 before every deploy) dumps **each component's PostgreSQL database** to
 `/srv/backups/<project>/`. Each dump has a `.images` file beside it that records the
 release serving at the time. The newest 14 of each kind (`scheduled`, `predeploy`,
-`prerestore`) are kept per component (`KATAP_BACKUP_KEEP`).
+`prerestore`) are kept per component (`KATAP_BACKUP_KEEP`), and so is every
+release a kept dump records, so a restore needs no registry. Each dump records the
+release of every component of its project, so at the defaults up to 42 dumps per
+database (14 of each kind) keep their releases on the disk. Set
+`KATAP_BACKUP_KEEP` lower on a small disk.
 
 It does not cover:
 - Redis (queues, caches, sessions);

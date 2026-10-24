@@ -200,6 +200,23 @@ check "katap add writes the project under the host directory, nothing into the t
 
 check "laravel-api + spa meet the project contract" katap check shop
 check "nestjs-api + spa + node-ssr meet the project contract" katap check blog
+drops_net_raw() {
+    local p
+    for p in "$@"; do
+        rendered "$p" | jq -e '[.services[] | (.cap_drop // []) | index("NET_RAW")] | all' >/dev/null || return 1
+    done
+}
+no_net_raw_warning() { local out; out="$(katap check "$@" 2>&1)" && ! grep -qF 'keep NET_RAW' <<<"$out"; }
+check "every template's every service drops NET_RAW (no forged traffic on a shared network)" drops_net_raw shop blog
+check "…so katap check has nothing to warn about" no_net_raw_warning shop blog
+check "no template's placeholder image can be pulled from anywhere" \
+    bash -c "! grep -hoE ':-[^}]+}' '$REPO'/templates/*.yml | grep -vE '^:-registry\.invalid/katap/unreleased@sha256:0{64}}\$'"
+cp "$K/srv/projects/shop/api.yml" "$WORK/api.yml.before"
+sed -i '/cap_drop: \[NET_RAW\]/d' "$K/srv/projects/shop/api.yml"
+check_out="$(katap check shop 2>&1)" && check_rc=0 || check_rc=$?
+check "a compose file from an older template that keeps NET_RAW is warned about, naming its services, and still passes" \
+    bash -c "[ $check_rc = 0 ] && grep -qF 'keep NET_RAW' <<<\"\$1\" && grep -qE '(^| )api-worker ' <<<\"\$1\"" _ "$check_out"
+cp "$WORK/api.yml.before" "$K/srv/projects/shop/api.yml"
 
 shop_config="$(rendered shop)"
 check "laravel worker stop grace period >= 75s (HORIZON_TIMEOUT + 15s)" \
@@ -410,7 +427,7 @@ cat > "$WORK/image-docker" <<EOF
 #!/usr/bin/env bash
 case "\$1" in
     image) [ "\$2" = inspect ] && echo "inspect \$3" >> "$WORK/image.log" && grep -qxF -- "\$3" "$WORK/present"; exit ;;
-    login) echo "login config=\${DOCKER_CONFIG:-} args=\$* stdin=\$(cat)" >> "$WORK/image.log"; exit 0 ;;
+    login) echo "login config=\${DOCKER_CONFIG:-} args=\$* stdin=\$(cat)" >> "$WORK/image.log"; [ -z "\${FAKE_LOGIN_FAIL:-}" ]; exit ;;
     pull)
         if [ -n "\${DOCKER_CONFIG:-}" ] && [ -d "\$DOCKER_CONFIG" ]; then dir=exists; else dir=none; fi
         echo "pull config=\${DOCKER_CONFIG:-} dir=\$dir args=\$*" >> "$WORK/image.log"
@@ -447,6 +464,9 @@ check "…which is gone once the deploy ends" \
     bash -c "cfg=\$(sed -n 's/^login config=\([^ ]*\) .*/\1/p' '$WORK/image.log'); [ ! -e \"\$cfg\" ]"
 check "the token is never an argument of anything" bash -c "! sed 's/ stdin=.*//' '$WORK/image.log' | grep -qF '$TOKEN_GHS'"
 check "the login file is read once and removed" test ! -e "$WORK/login"
+refuses "a registry login that fails stops the deploy" "could not log in to ghcr.io" \
+    ideploy FAKE_LOGIN_FAIL=1 KATAP_REGISTRY_FILE="$(login_file octocat "$TOKEN_GHS")" -- shop api "$D64"
+check "…before any pull" bash -c "! grep -q '^pull' '$WORK/image.log'"
 set_conf shop api image registry.example.com/acme/shop-api
 ideploy KATAP_REGISTRY_FILE="$(login_file octocat "$TOKEN_GHS")" -- shop api "registry.example.com/acme/shop-api@$(digest 1)" >/dev/null 2>&1 || true
 check "an image on another registry never receives the GitHub token" \
@@ -464,6 +484,7 @@ kprune() { env KATAP_SRV="$K/srv" KATAP_SETTINGS="$K/katap.env" KATAP_DOCKER=/bi
 refuses "a settings value is unquoted and trimmed, and the last line for a key wins" "(it is 'abc')" kprune
 refuses "…and the environment wins over the file" "(it is 'zz')" kprune KATAP_RELEASES_KEPT=zz
 refuses "keeping no earlier release is refused: a rollback would need the registry" "at least 1" kprune KATAP_RELEASES_KEPT=0
+refuses "a count with a leading zero is refused (it would be read as octal)" "at least 1" kprune KATAP_RELEASES_KEPT=08
 rm -f "$K/katap.env"
 
 # --- ssh-dispatch ---------------------------------------------------------------
@@ -698,10 +719,18 @@ before="$(tree_sum)"
 : > "$WORK/edge.log"
 again="$(applies 2>&1)"
 check "a second apply changes nothing" test "$before" = "$(tree_sum)"
+check "apply leaves the mark that katap.json now governs this server's deploys" test -e "$K/srv/state/.applied"
 printf 'source_repo=acme/shop-api\nprovenance=attested\n' >> "$K/srv/projects/shop/api.conf"
 v1_out="$(applies 2>&1)"
 check "apply removes Katap v1's source_repo and provenance from a .conf, and says so" \
     bash -c "! grep -qE '^(source_repo|provenance)=' '$K/srv/projects/shop/api.conf' && grep -qF 'removed v1' <<<\"\$1\"" _ "$v1_out"
+printf 'source_repo=acme/shop-api\nprovenance=attested\n' >> "$K/srv/projects/shop/api.conf"
+v1_conf="$(sha256sum < "$K/srv/projects/shop/api.conf")"
+refuses "…but only once it has shown that and been confirmed: with no terminal and no --yes it refuses" "no terminal to confirm on" \
+    env KATAP_DOCKER="$WORK/edge-recorder" KATAP_SRV="$K/srv" KATAP_SETTINGS="$K/katap.env" setsid "$K/bin/katap" apply
+check "…naming the change in its preview, and leaving the file as it was" \
+    bash -c "[ '$v1_conf' = \"\$(sha256sum < '$K/srv/projects/shop/api.conf')\" ] && grep -qF \"remove v1's source_repo and provenance\" <<<\"\$(env KATAP_DOCKER='$WORK/edge-recorder' KATAP_SRV='$K/srv' KATAP_SETTINGS='$K/katap.env' setsid '$K/bin/katap' apply 2>&1)\""
+applies >/dev/null 2>&1
 before="$(tree_sum)"
 check "…creates nothing" lacks "$again" "Created:"
 check "…and has nothing to preview, so asks nothing" lacks "$again" "katap apply will:"
@@ -720,6 +749,16 @@ rm -f "$K/srv/projects/shop/extra."* "$K/srv/secrets/shop/extra."*
 sed -i '/^# extra (spa)$/,$d' "$K/srv/projects/shop/site.caddy"
 projects_json "$SHOP_JSON"
 check "…and still reloads the edge, so a site an interrupted run wrote is served" grep -q 'ps -q caddy' "$WORK/edge.log"
+# A change to a component that exists is previewed and confirmed like a creation:
+# image= decides which repository may deploy it.
+projects_json "$(jq '.projects.shop.api.image = "ghcr.io/acme/other-api"' <<<"$SHOP_JSON")"
+before="$(tree_sum)"
+refuses "a change to an existing component with no terminal, and no --yes, is refused" "no terminal to confirm on" \
+    env KATAP_DOCKER="$WORK/edge-recorder" KATAP_SRV="$K/srv" KATAP_SETTINGS="$K/katap.env" setsid "$K/bin/katap" apply
+no_out="$(tty_apply n 2>&1 || true)"
+check "…is previewed, naming the key it changes" says "$no_out" "update shop/api: image"
+check "…and answering no changes nothing" test "$before" = "$(tree_sum)"
+projects_json "$SHOP_JSON"
 
 # The operator's own edits survive: only the keys katap.json owns are written.
 sed -i 's|^rollout=.*|rollout=api api-worker|; s|^smoke_path=.*|smoke_path=/api/health/live|' "$K/srv/projects/shop/api.conf"
@@ -883,8 +922,10 @@ section "the Katap action (action/deploy.sh, stub docker and ssh)"
 check "the action runs no other action (nothing to pin but itself)" bash -c "! grep -qE '^\s*uses:' '$REPO/action.yml'"
 check "the example workflow pins the Katap action by commit, never by tag" \
     grep -qE '^\s+uses: jaylordibe/katap@[0-9a-f]{40} ' "$REPO/examples/github-workflow.yml"
-check "…and gives its deploy job no write permission at all" \
-    bash -c "sed -n '/^  deploy:/,\$p' '$REPO/examples/github-workflow.yml' | grep -A2 '^    permissions:' | grep -qxF '      packages: read' && ! sed -n '/^  deploy:/,\$p' '$REPO/examples/github-workflow.yml' | grep -qE ': write'"
+check "…and gives its deploy jobs no write permission at all" \
+    bash -c "[ \"\$(sed -n '/^  deploy:/,\$p' '$REPO/examples/github-workflow.yml' | grep -A1 '^    permissions:' | grep -cxF '      packages: read')\" = 2 ] && ! sed -n '/^  deploy:/,\$p' '$REPO/examples/github-workflow.yml' | grep -qE ': write'"
+check "…and deploys only the branch of each environment, only once its variables are set" \
+    bash -c "grep -qF \"github.ref == 'refs/heads/main' && vars.KATAP_PROJECT != '' }}\" '$REPO/examples/github-workflow.yml' && grep -qF \"github.ref == 'refs/heads/staging' && vars.KATAP_STAGING_PROJECT != '' }}\" '$REPO/examples/github-workflow.yml'"
 cat > "$STUBS/docker" <<'STUB'
 #!/usr/bin/env bash
 # `docker login …` and `docker buildx imagetools inspect <ref> --format …`.
@@ -936,6 +977,23 @@ sed -n 's/^stdin=//p' "$WORK/ssh.log" > "$WORK/stdin-from-action"
 STDIN="$WORK/stdin-from-action" dispatch "deploy shop api $D64" >/dev/null 2>&1 || true
 check "the server accepts exactly the login the action sends" \
     bash -c "[ \"\$(cat '$WORK/dispatched-login' 2>/dev/null)\" = 'octocat $TOKEN_GHS' ]"
+# Any action of this major version deploys to any server of it: v2.0.0's own
+# deploy.sh, run as it was released, is accepted by this dispatcher.
+if git -c safe.directory="$REPO" -C "$REPO" cat-file -e v2.0.0:action/deploy.sh 2>/dev/null; then
+    mkdir -p "$WORK/action-v2.0.0/action"
+    git -c safe.directory="$REPO" -C "$REPO" show v2.0.0:action/deploy.sh > "$WORK/action-v2.0.0/action/deploy.sh"
+    rm -f "$WORK/ssh.log"
+    env KATAP_DOCKER="$STUBS/docker" KATAP_SSH="$STUBS/ssh" STUB_DOCKER_LOG="$WORK/stub-docker.log" SSH_LOG="$WORK/ssh.log" \
+        KATAP_HOST=server.test KATAP_SSH_KEY="$(cat "$WORK/hostkey")" KATAP_KNOWN_HOSTS="$KNOWN" \
+        KATAP_PROJECT=shop KATAP_COMPONENT=api KATAP_IMAGE="$D64" KATAP_REGISTRY_TOKEN="$TOKEN_GHS" KATAP_REGISTRY_USER=octocat \
+        bash "$WORK/action-v2.0.0/action/deploy.sh" >/dev/null 2>&1 || true
+    sed -n 's/^stdin=//p' "$WORK/ssh.log" > "$WORK/stdin-v2.0.0"
+    STDIN="$WORK/stdin-v2.0.0" dispatch "$(sed -n 's/^request=//p' "$WORK/ssh.log")" >/dev/null 2>&1 || true
+    check "v2.0.0's action is accepted by this server, request and login alike" \
+        bash -c "[ \"\$(cat '$WORK/dispatched' 2>/dev/null)\" = \"\$(printf '%s\\n' deploy shop api '$D64' env=production)\" ] && [ \"\$(cat '$WORK/dispatched-login' 2>/dev/null)\" = 'octocat $TOKEN_GHS' ]"
+else
+    not_ok "v2.0.0's action is accepted by this server" "the v2.0.0 tag is not in this checkout"
+fi
 act KATAP_REGISTRY_TOKEN="$TOKEN_GHS" KATAP_REGISTRY_USER=octocat_acme >/dev/null 2>&1 || true
 check "an Enterprise Managed User's login is sent too" grep -qxF "stdin=registry octocat_acme $TOKEN_GHS" "$WORK/ssh.log"
 for user in 'a b' 'x;id' '-x'; do
@@ -996,14 +1054,15 @@ check "…and none of it is kept on this host" bash -c "! grep -rlF 'OPENSSH PRI
 check "…not even in a temporary directory" bash -c "[ -z \"\$(ls -A '$WORK/key-tmp')\" ]"
 check "it prints the other two secrets, from this server's own settings and host key" \
     says "$key_out" KATAP_HOST KATAP_KNOWN_HOSTS "203.0.113.10 $(cut -d' ' -f1-2 "$WORK/serverkey.pub")"
-# shellcheck disable=SC2016 # the workflow's own ${{ }} syntax, printed literally
-check "…and the workflow step, pinned to the server's release, with this component filled in" \
-    says "$key_out" "uses: jaylordibe/katap@$(printf 'c%.0s' $(seq 1 40)) # v2.0.0" "project: shop" "component: api" 'ssh-key: ${{ secrets.KATAP_SSH_KEY }}' "url: https://api.shop.test/api/health/ready"
-# shellcheck disable=SC2016 # the workflow's own ${{ }} syntax, printed literally
-check "…taking the image from the build job, as the example workflow names it" \
-    bash -c "grep -qF 'image: \${{ needs.build.outputs.image }}' '$REPO/examples/github-workflow.yml'"
-# shellcheck disable=SC2016 # the workflow's own ${{ }} syntax, printed literally
-check "…in the step it prints" says "$key_out" 'image: ${{ needs.build.outputs.image }}'
+check "…and the two variables naming this component, and the URL checked after a deploy" \
+    bash -c "grep -qE '^KATAP_PROJECT +shop\$' <<<\"\$1\" && grep -qE '^KATAP_COMPONENT +api\$' <<<\"\$1\" && grep -qE '^KATAP_URL +https://api.shop.test/api/health/ready\$' <<<\"\$1\"" _ "$key_out"
+check "…and which major version the workflow's pin may be" says "$key_out" "This server runs Katap v2.0.0" "may be any v2 release"
+# The secrets and variables the example workflow reads are exactly the ones
+# deploy-key tells you to add: one list, checked here, never two that drift.
+workflow_names() { sed -n "/^  $1:/,/^  [a-z-]*:\$/p" "$REPO/examples/github-workflow.yml" | grep -oE '(secrets|vars)\.KATAP_[A-Z_]+' | sed 's/^[a-z]*\.//' | sort -u; }
+printed_names() { grep -oE '^KATAP_[A-Z_]+' <<<"$1" | sort -u; }
+check "every secret and variable the example's production deploy job reads is one deploy-key prints, and no other" \
+    test "$(workflow_names deploy)" = "$(printed_names "$key_out")"
 
 refuses "a second key for the same component is refused without --replace" "already has a production deploy key" dkey shop api
 echo 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOperatorsOwnKeyOperatorsOwnKeyOperatorsOwn admin@laptop' >> "$AK"
@@ -1012,17 +1071,44 @@ dkey shop api --replace >/dev/null 2>&1
 check "--replace swaps the key: the old one stops working at once" \
     bash -c "[ \"\$(grep -c ssh-dispatch '$AK')\" = 1 ] && [ \"\$(grep ssh-dispatch '$AK')\" != '$first' ]"
 check "…and every line it does not own is kept" grep -qF 'admin@laptop' "$AK"
-check "…rewritten in its own directory, never through /tmp" bash -c "[ -z \"\$(ls -A '$WORK/key-tmp')\" ] && ! ls '$(dirname "$AK")'/.authorized_keys.* 2>/dev/null"
+mkdir -p "$WORK/mktemp-bin"
+printf '#!/usr/bin/env bash\necho "$*" >> "%s/mktemp.log"\nexec %s "$@"\n' "$WORK" "$(command -v mktemp)" > "$WORK/mktemp-bin/mktemp"
+chmod +x "$WORK/mktemp-bin/mktemp"
+: > "$WORK/mktemp.log"
+PATH="$WORK/mktemp-bin:$PATH" dkey shop api --replace >/dev/null 2>&1
+check "…rewritten in its own directory, so the rename is atomic and nothing passes through /tmp" \
+    bash -c "grep -qxF '$(dirname "$AK")/.authorized_keys.XXXXXX' '$WORK/mktemp.log' && ! ls '$(dirname "$AK")'/.authorized_keys.* 2>/dev/null"
 sed -i '/admin@laptop/d' "$AK"
 dkey shop web >/dev/null 2>&1
 check "another component gets a key of its own, beside the first" test "$(wc -l < "$AK")" = 2
+revoke_out="$(dkey shop web --revoke 2>&1)"
+check "--revoke withdraws a component's key, and only that one" \
+    bash -c "! grep -q 'ssh-dispatch production shop web\"' '$AK' && grep -q 'ssh-dispatch production shop api\"' '$AK'"
+check "…and says to delete its secrets from the repository" says "$revoke_out" "no longer works"
+refuses "…and says so when there is none to withdraw" "has no production deploy key" dkey shop web --revoke
+refuses "--replace and --revoke together are refused" "usage" dkey shop web --replace --revoke
+echo 'restrict,command="/srv/katap/bin/katap ssh-dispatch production shop api,web" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIV1V1V1V1V1V1V1V1V1V1V1V1V1V1V1V1V1V1V1V1V1V katap v1' >> "$AK"
+revoke_v1="$(dkey shop web --revoke 2>&1 || true)"
+check "--revoke never says a key no longer works while a v1 key bound to several components still deploys it" \
+    bash -c "grep -qF 'still deploys it' <<<\"\$1\" && ! grep -qF 'no longer works' <<<\"\$1\"" _ "$revoke_v1"
+sed -i '/katap v1$/d' "$AK"
+dkey shop web >/dev/null 2>&1
+echo 'restrict,command="/srv/katap/bin/katap ssh-dispatch production shop api,web" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIV1V1V1V1V1V1V1V1V1V1V1V1V1V1V1V1V1V1V1V1V1V katap v1' >> "$AK"
+refuses "--revoke with the component's own key and a v1 key: refused, naming the v1 key" "still deploys it" dkey shop web --revoke
+check "…having removed its own key, and left the v1 key for the operator" \
+    bash -c "! grep -q 'ssh-dispatch production shop web\"' '$AK' && grep -q 'katap v1\$' '$AK'"
+refuses "…whichever place the component has in the v1 key's list" "still deploys it" dkey shop api --revoke
+sed -i '/katap v1$/d' "$AK"
+dkey shop api >/dev/null 2>&1
+dkey shop web >/dev/null 2>&1
 projects_json "$(jq '.projects.blog.api.environment = "staging"' <<<"$SHOP_JSON")"
 applies >/dev/null 2>&1
 stg_out="$(dkey blog api 2>&1 || true)"
 check "a staging key is bound to staging" grep -qF 'ssh-dispatch staging blog api"' "$AK"
-# shellcheck disable=SC2016 # the workflow's own ${{ }} syntax, printed literally
-check "…and all three of its secrets named so they never collide with production's" \
-    says "$stg_out" KATAP_STAGING_SSH_KEY KATAP_STAGING_HOST KATAP_STAGING_KNOWN_HOSTS 'host: ${{ secrets.KATAP_STAGING_HOST }}' 'known-hosts: ${{ secrets.KATAP_STAGING_KNOWN_HOSTS }}'
+check "…and its secrets and variables named so they never collide with production's" \
+    says "$stg_out" KATAP_STAGING_SSH_KEY KATAP_STAGING_HOST KATAP_STAGING_KNOWN_HOSTS KATAP_STAGING_PROJECT KATAP_STAGING_COMPONENT "every push to staging"
+check "…exactly the ones the example's staging deploy job reads" \
+    test "$(workflow_names deploy-staging)" = "$(printed_names "$stg_out")"
 echo 'restrict,command="/srv/katap/bin/katap ssh-dispatch production shop api,web" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIV1V1V1V1V1V1V1V1V1V1V1V1V1V1V1V1V1V1V1V1V1V katap v1' >> "$AK"
 v1_out="$(dkey shop web --replace 2>&1 || true)"
 check "a v1 key bound to several components is named, not silently left deploying" says "$v1_out" "bound to shop/web together with other"
@@ -1127,10 +1213,25 @@ check "…without running provision" test ! -e "$WORK/provisioned"
 unchanged() { [ "$(git -C "$INST/katap" rev-parse HEAD)" = "$1" ] && [ "$(cat "$INST/release")" = "$2" ] && [ ! -e "$WORK/provisioned" ]; }
 head_before="$(git -C "$INST/katap" rev-parse HEAD)"; rec_before="$(cat "$INST/release")"
 latest_is v2.0.0
-refuses "re-running the installer never moves to a new major version on its own" "a new major version that changes how deploys work" installs
+refuses "re-running the installer never moves to a new major version on its own" "of another major version, which changes how deploys work" installs
 check "…and that refusal changed nothing" unchanged "$head_before" "$rec_before"
+latest_is v1.4.0
+check "an unnamed run within the same major version upgrades to the latest release" installs
+check "…to its commit" test "$(git -C "$INST/katap" rev-parse HEAD)" = "$(tag_commit v1.4.0)"
+# v1.0.0 was cloned by hand: a checkout with no release record.
+latest_is v2.0.0
+mv "$INST/release" "$WORK/release.kept"
+refuses "a checkout with no release record is read from its tag, so it never crosses a major version unnamed" \
+    "of another major version" installs
+git -C "$INST/katap" -c user.email=t@t -c user.name=t commit -q --allow-empty -m 'not a release'
+untagged="$(git -C "$INST/katap" rev-parse HEAD)"
+refuses "…and one at no release tag is never moved without --version" "no release record" installs
+check "…which left it where it was" test "$(git -C "$INST/katap" rev-parse HEAD)" = "$untagged"
+git -C "$INST/katap" checkout -q --detach "$(tag_commit v1.4.0)"
+mv "$WORK/release.kept" "$INST/release"
 latest_is v1.1.0
 check "a new major version installs when it is named" installs --version v2.0.0
+refuses "an unnamed run never moves back across a major version either" "of another major version" installs
 check "going back to an earlier release works the same way" installs --version v1.2.0
 check "a lightweight release tag installs at its commit" installs --version v1.4.0
 check "…exactly" test "$(git -C "$INST/katap" rev-parse HEAD)" = "$(tag_commit v1.4.0)"
@@ -1189,8 +1290,13 @@ cat > "$WORK/fake-docker" <<STUB
 # Records every call; renders compose config with the real docker; fakes the rest.
 echo "\$*" >> "$WORK/fake.log"
 project=''
+envfile=''
 prev=''
-for arg in "\$@"; do [ "\$prev" = --project-name ] && project="\$arg"; prev="\$arg"; done
+for arg in "\$@"; do
+    [ "\$prev" = --project-name ] && project="\$arg"
+    [ "\$prev" = --env-file ] && envfile="\$arg"
+    prev="\$arg"
+done
 case " \$* " in
     *" image inspect "*) [ "\${FAKE_PRESENT:-}" = 1 ] && exit 0; exit 1 ;;
     *" image ls "*) printf '%s\n' \${FAKE_IMAGES:-}; exit 0 ;;
@@ -1205,9 +1311,21 @@ case " \$* " in
     *" config "*) exec docker "\$@" ;;
     *" ps -a "*) [ -n "\${FAKE_DOCKER_DOWN:-}" ] && exit 1; printf '%s\n' \${FAKE_PS:-}; exit 0 ;;
     *" volume ls "*) [ -n "\${FAKE_DOCKER_DOWN:-}" ] && exit 1; printf '%s\n' \${FAKE_VOLUMES:-}; exit 0 ;;
-    *" up -d --wait"*) [ -n "\${FAKE_UP_FAIL:-}" ] && exit 1; exit 0 ;;
+    *" up -d --wait"*)
+        [ -n "\${FAKE_UP_FAIL:-}" ] && exit 1
+        # Only the release that names this digest fails to become healthy.
+        [ -n "\${FAKE_UP_FAIL_DIGEST:-}" ] && grep -qF "\$FAKE_UP_FAIL_DIGEST" "\$envfile" && exit 1
+        exit 0 ;;
+    *" run --rm -T --name "*)
+        [ -n "\${FAKE_RUN_EXIT:-}" ] && exit "\$FAKE_RUN_EXIT"
+        # A client that ignores TERM, so only the KILL after the grace stops it.
+        [ -n "\${FAKE_RUN_IGNORE_TERM:-}" ] && trap '' TERM
+        exec sleep "\${FAKE_RUN_SLEEP:-0}" ;;
+    *"RENAME TO app"*) [ -n "\${FAKE_RENAME_FAIL:-}" ] && exit 1; exit 0 ;;
+    *"DROP DATABASE app WITH"*) [ -n "\${FAKE_DROP_FAIL:-}" ] && exit 1; exit 0 ;;
+    *" exec -T caddy cat "*) [ -z "\${FAKE_CADDYFILE:-}" ] || cat "\$FAKE_CADDYFILE"; exit 0 ;;
     *" ps -q "*) [ -n "\${FAKE_DB_DOWN:-}" ] || echo fake-container-id ;;
-    *" pg_dump "*) [ "\$project" = "\${FAKE_DUMP_FAIL:-}" ] && exit 1; echo PGDMP-fake ;;
+    *" pg_dump "*) [ "\$project" = "\${FAKE_DUMP_FAIL:-}" ] && exit 1; echo PGDMP-fake; exec sleep "\${FAKE_DUMP_SLEEP:-0}" ;;
 esac
 exit 0
 STUB
@@ -1230,15 +1348,194 @@ check "a rollback to an image still on this host needs no registry at all" \
     env FAKE_PRESENT=1 FAKE_PULL_FAIL=1 KATAP_DOCKER="$WORK/fake-docker" KATAP_SRV="$K/srv" "$K/bin/katap" rollback shop api
 check "…and pulled nothing" bash -c "! grep -q ' pull ' '$WORK/fake.log'"
 echo "IMAGE_API=$(rel 11)" > "$K/srv/state/shop/images.env"
-refuses "a rollback names only a release this host has deployed" "was never deployed here" \
+refuses "a rollback names only a release this host has deployed" "never deployed here" \
     fake rollback shop api "$(rel 99)"
 printf '{"projects": ' > "$K/srv/katap.json"
-refuses "a rollback never depends on katap.json (a half-edited one leaves the way back open)" "was never deployed here" \
+refuses "a rollback never depends on katap.json (a half-edited one leaves the way back open)" "never deployed here" \
     fake rollback shop api "$(rel 99)"
 refuses "…while a deploy is held until it is fixed" "fix it and run 'katap apply'" fake deploy shop api "$D64"
 rm -f "$K/srv/katap.json"
 echo "IMAGE_API=$(rel 10)" > "$K/srv/state/shop/images.env"
 refuses "the first release has nothing before it" "no earlier release" fake rollback shop api
+
+# A rollback goes back only: never forward past the release serving, whose
+# migrations a later release's would build on.
+{
+    echo "2026-01-01T00:00:00Z deploy api IMAGE_API=$(rel 10) "
+    echo "2026-01-02T00:00:00Z deploy api IMAGE_API=$(rel 11) "
+    echo "2026-01-03T00:00:00Z deploy api IMAGE_API=$(rel 12) "
+    echo "2026-01-04T00:00:00Z restore api IMAGE_API=$(rel 11) from api-x-scheduled.dump"
+} > "$K/srv/state/shop/history"
+echo "IMAGE_API=$(rel 11)" > "$K/srv/state/shop/images.env"
+: > "$WORK/fake.log"
+refuses "after a restore, a rollback to a release deployed later is refused (its migrations are not in the data)" \
+    "deploy it instead of rolling back" env FAKE_PRESENT=1 KATAP_DOCKER="$WORK/fake-docker" KATAP_SRV="$K/srv" "$K/bin/katap" rollback shop api "$(rel 12)"
+check "…and nothing was started" bash -c "! grep -q ' up ' '$WORK/fake.log'"
+check "a rollback to a release deployed before the one serving is allowed" \
+    env FAKE_PRESENT=1 KATAP_DOCKER="$WORK/fake-docker" KATAP_SRV="$K/srv" "$K/bin/katap" rollback shop api "$(rel 10)"
+check "…and records it" bash -c "tail -n 1 '$K/srv/state/shop/history' | grep -qE ' rollback api IMAGE_API=$(rel 10) '"
+refuses "a staging key cannot roll back a production component" "this key deploys staging only" \
+    env FAKE_PRESENT=1 KATAP_DOCKER="$WORK/fake-docker" KATAP_SRV="$K/srv" "$K/bin/katap" rollback shop api env=staging
+
+# The release serving deployed again before a restore of a dump from its first
+# time: what ran in between is cut off by the dump's own time.
+{
+    echo "2026-01-01T00:00:00Z deploy api IMAGE_API=$(rel 10) "
+    echo "2026-01-02T00:00:00Z deploy api IMAGE_API=$(rel 11) "
+    echo "2026-01-03T00:00:00Z rollback api IMAGE_API=$(rel 10) "
+    echo "2026-01-04T00:00:00Z deploy api IMAGE_API=$(rel 10) "
+    echo "2026-01-05T00:00:00Z restore api IMAGE_API=$(rel 10) from api-20260101T120000Z-scheduled.dump"
+} > "$K/srv/state/shop/history"
+echo "IMAGE_API=$(rel 10)" > "$K/srv/state/shop/images.env"
+refuses "a restore cuts off what was deployed after its dump, even when the release it put back was deployed again" \
+    "deploy it instead of rolling back" env FAKE_PRESENT=1 KATAP_DOCKER="$WORK/fake-docker" KATAP_SRV="$K/srv" "$K/bin/katap" rollback shop api "$(rel 11)"
+refuses "…and a bare rollback finds nothing before it" "no earlier release" \
+    env FAKE_PRESENT=1 KATAP_DOCKER="$WORK/fake-docker" KATAP_SRV="$K/srv" "$K/bin/katap" rollback shop api
+{
+    echo "2026-01-01T00:00:00Z deploy api IMAGE_API=$(rel 10) "
+    echo "2026-01-02T00:00:00Z deploy api IMAGE_API=$(rel 11) "
+    echo "2026-01-03T00:00:00Z restore api IMAGE_API=$(rel 10) from api-20260102T000000Z-predeploy.dump"
+} > "$K/srv/state/shop/history"
+echo "IMAGE_API=$(rel 10)" > "$K/srv/state/shop/images.env"
+refuses "a deploy in the same second as the dump came after it, so the restore cuts it off" "deploy it instead of rolling back" \
+    env FAKE_PRESENT=1 KATAP_DOCKER="$WORK/fake-docker" KATAP_SRV="$K/srv" "$K/bin/katap" rollback shop api "$(rel 11)"
+{
+    echo "2026-01-01T00:00:00Z deploy api IMAGE_API=$(rel 10) "
+    echo "2026-01-02T00:00:00Z deploy api IMAGE_API=$(rel 11) "
+    echo "2026-01-11T00:00:00Z restore api IMAGE_API=$(rel 30) from api-20260110T000000Z-scheduled.dump"
+} > "$K/srv/state/shop/history"
+echo "IMAGE_API=$(rel 30)" > "$K/srv/state/shop/images.env"
+refuses "a dump from another server (a release never run here) cuts off everything before it" "no earlier release" \
+    env FAKE_PRESENT=1 KATAP_DOCKER="$WORK/fake-docker" KATAP_SRV="$K/srv" "$K/bin/katap" rollback shop api
+refuses "…a named release too" "deploy it instead of rolling back" \
+    env FAKE_PRESENT=1 KATAP_DOCKER="$WORK/fake-docker" KATAP_SRV="$K/srv" "$K/bin/katap" rollback shop api "$(rel 11)"
+
+# A release with a migrate image rolls back whole, never half.
+m() { printf 'ghcr.io/acme/shop-api-migrate@sha256:%064d' "$1"; }
+{
+    echo "2026-01-01T00:00:00Z deploy api IMAGE_API=$(rel 10) IMAGE_API_MIGRATE=$(m 10) "
+    echo "2026-01-02T00:00:00Z deploy api IMAGE_API=$(rel 11) IMAGE_API_MIGRATE=$(m 11) "
+} > "$K/srv/state/shop/history"
+printf 'IMAGE_API=%s\nIMAGE_API_MIGRATE=%s\n' "$(rel 11)" "$(m 11)" > "$K/srv/state/shop/images.env"
+refuses "a rollback naming the runtime image without its migrate image is refused" "with that migrate image" \
+    env FAKE_PRESENT=1 KATAP_DOCKER="$WORK/fake-docker" KATAP_SRV="$K/srv" "$K/bin/katap" rollback shop api "$(rel 10)"
+check "a bare rollback puts back the runtime and migrate images of one release" \
+    env FAKE_PRESENT=1 KATAP_DOCKER="$WORK/fake-docker" KATAP_SRV="$K/srv" "$K/bin/katap" rollback shop api
+check "…both of them" bash -c "grep -qxF 'IMAGE_API=$(rel 10)' '$K/srv/state/shop/images.env' && grep -qxF 'IMAGE_API_MIGRATE=$(m 10)' '$K/srv/state/shop/images.env'"
+{
+    echo "2026-01-01T00:00:00Z deploy api IMAGE_API=$(rel 10) "
+    echo "2026-01-02T00:00:00Z deploy api IMAGE_API=$(rel 11) "
+    echo "2026-01-03T00:00:00Z deploy api IMAGE_API=$(rel 12) "
+    echo "2026-01-04T00:00:00Z restore api IMAGE_API=$(rel 11) from api-x-scheduled.dump"
+} > "$K/srv/state/shop/history"
+
+# A component whose repository moved still rolls back to what it served before.
+echo "IMAGE_API=$(rel 11)" > "$K/srv/state/shop/images.env"
+cp "$K/srv/projects/shop/api.conf" "$WORK/api.conf.before"
+sed -i 's|^image=.*|image=ghcr.io/acme/moved-api|' "$K/srv/projects/shop/api.conf"
+check "a rollback to a release of the component's previous repository works" \
+    env FAKE_PRESENT=1 KATAP_DOCKER="$WORK/fake-docker" KATAP_SRV="$K/srv" "$K/bin/katap" rollback shop api "$(rel 10)"
+refuses "…while a deploy from it is refused" "is not this component's repository" fake deploy shop api "$D64"
+cp "$WORK/api.conf.before" "$K/srv/projects/shop/api.conf"
+
+# A bare rollback picks its target once it holds the lock: a deploy that finishes
+# meanwhile is the one it rolls back from.
+echo "IMAGE_API=$(rel 12)" > "$K/srv/state/shop/images.env"
+echo "2026-01-05T00:00:00Z deploy api IMAGE_API=$(rel 12) " >> "$K/srv/state/shop/history"
+exec 5>"$K/srv/state/shop/.lock"
+flock 5
+# fd 5 closed in the child: it must wait on this shell's lock, not hold it.
+( exec 5>&-; env FAKE_PRESENT=1 KATAP_DOCKER="$WORK/fake-docker" KATAP_SRV="$K/srv" "$K/bin/katap" rollback shop api >"$WORK/rolling.log" 2>&1 ) &
+rolling=$!
+# Until the rollback says it is waiting on the project's lock.
+for _ in $(seq 1 100); do grep -qF 'waiting for another operation' "$WORK/rolling.log" 2>/dev/null && break; sleep 0.1; done
+check "the bare rollback waits on the project's lock, and says so" grep -qF "waiting for another operation on 'shop'" "$WORK/rolling.log"
+echo "2026-01-06T00:00:00Z deploy api IMAGE_API=$(rel 13) " >> "$K/srv/state/shop/history"
+echo "IMAGE_API=$(rel 13)" > "$K/srv/state/shop/images.env"
+exec 5>&-
+wait "$rolling" || true
+check "a rollback waiting on a deploy goes back from the release that deploy put live" \
+    grep -qxF "IMAGE_API=$(rel 12)" "$K/srv/state/shop/images.env"
+
+# The automatic rollback: a release that never becomes healthy is replaced by the
+# one before it, and the state still names that one.
+echo "IMAGE_API=$(rel 11)" > "$K/srv/state/shop/images.env"
+: > "$WORK/fake.log"
+refuses "a release that never becomes healthy is rolled back to the one before it" "failed and was rolled back" \
+    env FAKE_UP_FAIL_DIGEST="$(digest 1)" KATAP_DOCKER="$WORK/fake-docker" KATAP_SRV="$K/srv" "$K/bin/katap" deploy shop api "$D64"
+check "…by starting the release before it again" test "$(grep -c ' up -d --wait' "$WORK/fake.log")" -ge 2
+check "…which the state still names" grep -qxF "IMAGE_API=$(rel 11)" "$K/srv/state/shop/images.env"
+check "…and the failed release is recorded" bash -c "tail -n 1 '$K/srv/state/shop/history' | grep -qE ' failed api IMAGE_API=$D64'"
+failed_before="$(grep -c ' failed api ' "$K/srv/state/shop/history")"
+refuses "when the release before it does not come back either, the deploy says the component may be down" \
+    "and so did putting the release before it back" \
+    env FAKE_UP_FAIL=1 KATAP_DOCKER="$WORK/fake-docker" KATAP_SRV="$K/srv" "$K/bin/katap" deploy shop api "$D64"
+check "…and still records the failed release" test "$(grep -c ' failed api ' "$K/srv/state/shop/history")" = "$((failed_before + 1))"
+
+# A migration that never finishes is cut off, so the project's lock is freed.
+: > "$WORK/fake.log"
+started=$SECONDS
+refuses "a pre-deploy service that runs past KATAP_PREDEPLOY_TIMEOUT is stopped and the deploy refused" "did not finish within 1s" \
+    env KATAP_PREDEPLOY_TIMEOUT=1s FAKE_RUN_SLEEP=20 KATAP_DOCKER="$WORK/fake-docker" KATAP_SRV="$K/srv" "$K/bin/katap" deploy shop api "$D64"
+check "…within the limit, not after the migration" test "$((SECONDS - started))" -lt 15
+check "…its container removed by name" grep -qE '^rm -f shop-api-migrate-predeploy-[0-9]+$' "$WORK/fake.log"
+check "…the release serving left as it was" grep -qxF "IMAGE_API=$(rel 11)" "$K/srv/state/shop/images.env"
+check "…run with no terminal, so an admin's own terminal can never stall it" grep -qE ' run --rm -T --name shop-api-migrate-predeploy-[0-9]+ api-migrate' "$WORK/fake.log"
+: > "$WORK/fake.log"
+refuses "a migration killed at once (out of memory: 137) is a failure, not a timeout" "api-migrate failed (exit 137)" \
+    env FAKE_RUN_EXIT=137 KATAP_DOCKER="$WORK/fake-docker" KATAP_SRV="$K/srv" "$K/bin/katap" deploy shop api "$D64"
+: > "$WORK/fake.log"
+refuses "a KATAP_PREDEPLOY_TIMEOUT that is not a duration is refused" "must be a duration" \
+    env KATAP_PREDEPLOY_TIMEOUT=soon KATAP_DOCKER="$WORK/fake-docker" KATAP_SRV="$K/srv" "$K/bin/katap" deploy shop api "$D64"
+check "…before anything is pulled or dumped" bash -c "! grep -qE '(^| )pull |pg_dump' '$WORK/fake.log'"
+for bad in 0 09m 2d; do
+    refuses "a KATAP_PREDEPLOY_TIMEOUT of '$bad' is refused (no limit, octal, or not timeout's)" "must be a duration" \
+        env KATAP_PREDEPLOY_TIMEOUT="$bad" KATAP_DOCKER="$WORK/fake-docker" KATAP_SRV="$K/srv" "$K/bin/katap" deploy shop api "$D64"
+done
+: > "$WORK/fake.log"
+refuses "a deploy with a backup remote and a KATAP_RCLONE_TIMEOUT that is not a duration is refused" "must be a duration" \
+    env KATAP_RCLONE_REMOTE=remote:bucket KATAP_RCLONE_TIMEOUT=1d KATAP_DOCKER="$WORK/fake-docker" KATAP_SRV="$K/srv" "$K/bin/katap" deploy shop api "$D64"
+check "…before anything is pulled or dumped" bash -c "! grep -qE '(^| )pull |pg_dump' '$WORK/fake.log'"
+check "…while a rollback, which uses neither, still works" \
+    env KATAP_PREDEPLOY_TIMEOUT=soon FAKE_PRESENT=1 KATAP_DOCKER="$WORK/fake-docker" KATAP_SRV="$K/srv" "$K/bin/katap" rollback shop api "$(rel 11)"
+echo "IMAGE_API=$(rel 11)" > "$K/srv/state/shop/images.env"
+: > "$WORK/fake.log"
+refuses "a pre-deploy client that ignores TERM is killed, and the deploy still reports the deadline" "did not finish within 1s" \
+    env KATAP_PREDEPLOY_TIMEOUT=1s KATAP_KILL_AFTER=1s FAKE_RUN_IGNORE_TERM=1 FAKE_RUN_SLEEP=20 KATAP_DOCKER="$WORK/fake-docker" KATAP_SRV="$K/srv" "$K/bin/katap" deploy shop api "$D64"
+check "…and its container is removed" grep -qE '^rm -f shop-api-migrate-predeploy-[0-9]+$' "$WORK/fake.log"
+
+# An images.env every read of fails is never taken for an empty one: that would
+# drop the other components' releases from it.
+# A grep that fails every read of that one file, as an I/O error would.
+mkdir -p "$WORK/eio-bin"
+# shellcheck disable=SC2016 # the stub's own $@ and $last, written literally
+printf '#!/usr/bin/env bash\nfor a in "$@"; do last="$a"; done\n[ "$last" != %q ] || { echo "grep: $last: Input/output error" >&2; exit 2; }\nexec %s "$@"\n' \
+    "$K/srv/state/shop/images.env" "$(command -v grep)" > "$WORK/eio-bin/grep"
+chmod +x "$WORK/eio-bin/grep"
+eio_fake() { PATH="$WORK/eio-bin:$PATH" fake "$@"; }
+images_before="$(cat "$K/srv/state/shop/images.env")"
+refuses "a deploy refuses an images.env it cannot read" "could not read" eio_fake deploy shop api "$D64"
+check "…and leaves it as it was" test "$images_before" = "$(cat "$K/srv/state/shop/images.env")"
+refuses "…and so does the nightly backup, instead of skipping the component" "could not read" eio_fake backup shop
+
+# A component deleted from katap.json stops deploying; its way back stays open.
+projects_json '{"host": "203.0.113.10", "projects": {"other": {"web": {"type": "spa", "repo": "acme/other-web"}}}}'
+refuses "a component deleted from katap.json no longer deploys, whoever holds its key" "no longer deploys" fake deploy shop api "$D64"
+check "…while it still rolls back" env FAKE_PRESENT=1 KATAP_DOCKER="$WORK/fake-docker" KATAP_SRV="$K/srv" "$K/bin/katap" rollback shop api "$(rel 10)"
+projects_json '{"host": "203.0.113.10", "projects": {}}'
+# This server's components were made by hand; the marker is what apply leaves.
+: > "$K/srv/state/.applied"
+refuses "once apply has run, removing the last project from katap.json stops its deploys too" "no longer deploys" fake deploy shop api "$D64"
+rm -f "$K/srv/state/.applied"
+fake deploy shop api "$D64" >/dev/null 2>&1 || true
+check "on a server where apply never ran, a file that lists no project leaves components made by hand deploying" \
+    bash -c "tail -n 1 '$K/srv/state/shop/history' | grep -qE ' deploy api IMAGE_API=$D64'"
+rm -f "$K/srv/katap.json"
+echo "IMAGE_API=$(rel 10)" > "$K/srv/state/shop/images.env"
+
+# A component with no release yet has nothing to run: its image is a placeholder.
+refuses "katap run refuses a service of a component with no release" "has no release yet" fake run shop web
+check "…and pulls and starts nothing" bash -c "! grep -qE ' (run|pull) ' '$WORK/fake.log'"
 
 history_before="$(cat "$K/srv/state/shop/history")"
 : > "$K/srv/state/shop/images.env"
@@ -1259,7 +1556,7 @@ check "katap run finds a service whatever line compose prints it on" \
 : > "$WORK/fake.log"
 refuses "a released component whose database is down is not deployed without a dump" "the pre-deploy dump failed" \
     env FAKE_DB_DOWN=1 KATAP_DOCKER="$WORK/fake-docker" KATAP_SRV="$K/srv" "$K/bin/katap" deploy shop api "$D64"
-check "…and no migration ran" bash -c "! grep -q 'run --rm api-migrate' '$WORK/fake.log'"
+check "…and no migration ran" bash -c "! grep -qE ' run .*api-migrate' '$WORK/fake.log'"
 check "katap cron runs each scheduler without starting its dependencies" fake cron shop
 check "…as 'run --rm --no-deps api-scheduler'" grep -q 'run --rm --no-deps api-scheduler' "$WORK/fake.log"
 exec 5>"$K/srv/state/shop/.lock"
@@ -1294,6 +1591,67 @@ refuses "a restore that cannot get its release back is refused before anything s
     env FAKE_PULL_FAIL=1 KATAP_DOCKER="$WORK/fake-docker" KATAP_SRV="$K/srv" "$K/bin/katap" restore shop2 api "$dump" --confirm shop2
 check "…so nothing was stopped and no data was touched" bash -c "! grep -qE ' stop | pg_restore | DROP ' '$WORK/fake.log'"
 
+# A keep count of 0 would delete every dump, the one just taken included.
+dumps_before="$(find "$K/srv/backups/shop2" -name '*.dump' | sort)"
+refuses "a KATAP_BACKUP_KEEP below 1 is refused before a dump is taken" "KATAP_BACKUP_KEEP" \
+    env KATAP_BACKUP_KEEP=0 KATAP_DOCKER="$WORK/fake-docker" KATAP_SRV="$K/srv" "$K/bin/katap" backup shop2
+check "…and every dump is still there" test "$dumps_before" = "$(find "$K/srv/backups/shop2" -name '*.dump' | sort)"
+: > "$WORK/fake.log"
+refuses "…and so is a restore with it, before anything stops" "KATAP_BACKUP_KEEP" \
+    env KATAP_BACKUP_KEEP=0 FAKE_PRESENT=1 KATAP_DOCKER="$WORK/fake-docker" KATAP_SRV="$K/srv" "$K/bin/katap" restore shop2 api "$dump" --confirm shop2
+check "…which stopped nothing" bash -c "! grep -q ' stop ' '$WORK/fake.log'"
+: > "$WORK/fake.log"
+refuses "a restore with a KATAP_RCLONE_TIMEOUT that is not a duration is refused before anything stops" "must be a duration" \
+    env KATAP_RCLONE_REMOTE=remote:bucket KATAP_RCLONE_TIMEOUT=1d FAKE_PRESENT=1 KATAP_DOCKER="$WORK/fake-docker" KATAP_SRV="$K/srv" "$K/bin/katap" restore shop2 api "$dump" --confirm shop2
+check "…and stopped nothing either" bash -c "! grep -q ' stop ' '$WORK/fake.log'"
+mkdir -p "$WORK/rclone-fail-bin"
+printf '#!/usr/bin/env bash\nexit 1\n' > "$WORK/rclone-fail-bin/rclone"
+chmod +x "$WORK/rclone-fail-bin/rclone"
+restore_out="$(env PATH="$WORK/rclone-fail-bin:$PATH" KATAP_RCLONE_REMOTE=remote:bucket FAKE_PRESENT=1 KATAP_DOCKER="$WORK/fake-docker" KATAP_SRV="$K/srv" \
+    "$K/bin/katap" restore shop2 api "$dump" --confirm shop2 2>&1)" && restore_rc=0 || restore_rc=$?
+check "a restore whose safety dump could not be copied off the host still restores (the dump is on the host)" \
+    bash -c "[ $restore_rc = 0 ] && grep -qF 'the off-host copy failed' <<<\"\$1\" && ! grep -qF 'the database is unchanged' <<<\"\$1\"" _ "$restore_out"
+refuses "a restore refuses a dump of another component (its data would replace this one's)" "is not a dump of 'web'" \
+    env FAKE_PRESENT=1 KATAP_DOCKER="$WORK/fake-docker" KATAP_SRV="$K/srv" "$K/bin/katap" restore shop2 web "$dump" --confirm shop2
+restore_state() { cat "$K/srv/state/shop2/images.env" "$K/srv/state/shop2/history"; }
+state_before="$(restore_state)"
+refuses "a restore that cannot drop the old database leaves everything as it was" "the database is unchanged" \
+    env FAKE_DROP_FAIL=1 FAKE_PRESENT=1 KATAP_DOCKER="$WORK/fake-docker" KATAP_SRV="$K/srv" "$K/bin/katap" restore shop2 api "$dump" --confirm shop2
+check "…its release state and history included" test "$state_before" = "$(restore_state)"
+echo "IMAGE_API=$(rel 11)" > "$K/srv/state/shop2/images.env"
+swap_out="$(env FAKE_RENAME_FAIL=1 FAKE_PRESENT=1 KATAP_DOCKER="$WORK/fake-docker" KATAP_SRV="$K/srv" \
+    "$K/bin/katap" restore shop2 api "$dump" --confirm shop2 2>&1)" && swap_rc=0 || swap_rc=$?
+check "a restore whose rename fails after the drop says so, and what to run" \
+    bash -c "[ $swap_rc != 0 ] && grep -qF 'renaming it to app failed' <<<\"\$1\" && grep -qF 'katap rollback shop2 api ' <<<\"\$1\"" _ "$swap_out"
+check "…having already recorded the dump's release and the restore, so the way back is cut as a restore requires" \
+    bash -c "[ \"\$(sed -n 's/^IMAGE_API=//p' '$K/srv/state/shop2/images.env')\" = \"\$(sed -n 's/^IMAGE_API=//p' '$dump.images')\" ] && tail -n 1 '$K/srv/state/shop2/history' | grep -qE ' restore api IMAGE_API=.* from $(basename "$dump")\$'"
+[ -e "$K/srv/secrets/shop2" ] || cp -R "$K/srv/secrets/shop" "$K/srv/secrets/shop2"
+read -ra printed_args <<<"$(sed -n 's/.*katap rollback shop2 api //p' <<<"$swap_out")"
+check "…and the command it prints is accepted" \
+    env FAKE_PRESENT=1 KATAP_DOCKER="$WORK/fake-docker" KATAP_SRV="$K/srv" "$K/bin/katap" rollback shop2 api "${printed_args[@]}"
+
+# An interrupted nightly dump leaves no partial file behind.
+rm -f "$K/srv/backups/shop2/"*.partial
+( exec setsid env FAKE_DUMP_SLEEP=30 KATAP_DOCKER="$WORK/fake-docker" KATAP_SRV="$K/srv" KATAP_SETTINGS="$K/katap.env" "$K/bin/katap" backup shop2 >/dev/null 2>&1 ) &
+dumping=$!
+for _ in $(seq 1 100); do compgen -G "$K/srv/backups/shop2/*.partial" >/dev/null && break; sleep 0.1; done
+check "a nightly dump in progress writes a partial file" compgen -G "$K/srv/backups/shop2/*.partial"
+kill -TERM -- "-$dumping" 2>/dev/null || true
+wait "$dumping" 2>/dev/null || true
+check "…which is removed when the run is stopped (as systemd stops it at its time limit)" \
+    bash -c "! compgen -G '$K/srv/backups/shop2/*.partial' >/dev/null"
+
+# A backup remote that hangs is cut off: the nightly run fails instead of holding
+# the project's lock until the unit's own limit.
+mkdir -p "$WORK/rclone-bin"
+printf '#!/usr/bin/env bash\nexec sleep 30\n' > "$WORK/rclone-bin/rclone"
+chmod +x "$WORK/rclone-bin/rclone"
+started=$SECONDS
+refuses "an off-host copy past KATAP_RCLONE_TIMEOUT fails the nightly run" "the off-host copy failed" \
+    env PATH="$WORK/rclone-bin:$PATH" KATAP_RCLONE_REMOTE=remote:bucket KATAP_RCLONE_TIMEOUT=1s \
+        KATAP_DOCKER="$WORK/fake-docker" KATAP_SRV="$K/srv" "$K/bin/katap" backup shop2
+check "…within its limit" test "$((SECONDS - started))" -lt 20
+
 # Image retention: only images of Katap's own components, only those no release needs.
 {
     echo "2026-02-01T00:00:00Z deploy api IMAGE_API=$(rel 20) "
@@ -1304,12 +1662,56 @@ echo "IMAGE_API=$(rel 22)" > "$K/srv/state/shop2/images.env"
 echo "IMAGE_API=$(rel 19)" > "$dump.images"
 : > "$WORK/fake.log"
 FAKE_IMAGES="$(rel 18) $(rel 19) $(rel 20) $(rel 21) $(rel 22) docker.io/library/postgres@sha256:$(printf '%064d' 5)" \
-    KATAP_RELEASES_KEPT=2 KATAP_DOCKER="$WORK/fake-docker" KATAP_SRV="$K/srv" "$K/bin/katap" images prune >/dev/null 2>&1
+    KATAP_RELEASES_KEPT=1 KATAP_DOCKER="$WORK/fake-docker" KATAP_SRV="$K/srv" "$K/bin/katap" images prune >/dev/null 2>&1
 check "images prune removes a release no rollback or restore needs" \
     bash -c "grep -qF 'image rm $(rel 18)' '$WORK/fake.log' && grep -qF 'image rm $(rel 20)' '$WORK/fake.log'"
-check "…keeps what serves, the last KATAP_RELEASES_KEPT deploys, and every release a kept dump records" \
+check "…keeps what serves, the newest release and KATAP_RELEASES_KEPT before it, and every release a kept dump records" \
     bash -c "! grep -qE 'image rm ($(rel 19)|$(rel 21)|$(rel 22))' '$WORK/fake.log'"
 check "…and never touches another image on the host" bash -c "! grep -q 'image rm docker.io/library/postgres' '$WORK/fake.log'"
+# A release deployed again counts once: redeploying the serving one never pushes
+# the release before it out of the rollback window.
+{
+    echo "2026-02-01T00:00:00Z deploy api IMAGE_API=$(rel 20) IMAGE_API_MIGRATE=$(rel 40) "
+    echo "2026-02-02T00:00:00Z deploy api IMAGE_API=$(rel 21) IMAGE_API_MIGRATE=$(rel 41) "
+    for _ in 1 2 3; do echo "2026-02-03T00:00:00Z deploy api IMAGE_API=$(rel 22) IMAGE_API_MIGRATE=$(rel 42) "; done
+} > "$K/srv/state/shop2/history"
+printf 'IMAGE_API=%s\nIMAGE_API_MIGRATE=%s\n' "$(rel 22)" "$(rel 42)" > "$K/srv/state/shop2/images.env"
+: > "$WORK/fake.log"
+FAKE_IMAGES="$(rel 20) $(rel 21) $(rel 22) $(rel 40) $(rel 41) $(rel 42)" \
+    KATAP_RELEASES_KEPT=1 KATAP_DOCKER="$WORK/fake-docker" KATAP_SRV="$K/srv" "$K/bin/katap" images prune >/dev/null 2>&1
+check "images prune counts a release deployed again once, so the one before it stays" \
+    bash -c "! grep -qE 'image rm ($(rel 21)|$(rel 22))' '$WORK/fake.log' && grep -qF 'image rm $(rel 20)' '$WORK/fake.log'"
+check "…and keeps a kept release's migrate image with it" \
+    bash -c "! grep -qE 'image rm ($(rel 41)|$(rel 42))' '$WORK/fake.log' && grep -qF 'image rm $(rel 40)' '$WORK/fake.log'"
+echo "IMAGE_API=$(rel 22)" > "$K/srv/state/shop2/images.env"
+# The window follows the line a rollback walks: after a restore, the releases it
+# cut off go, and the ones before the restored release stay.
+{
+    echo "2026-01-01T00:00:00Z deploy api IMAGE_API=$(rel 20) "
+    echo "2026-01-02T00:00:00Z deploy api IMAGE_API=$(rel 21) "
+    echo "2026-01-03T00:00:00Z deploy api IMAGE_API=$(rel 22) "
+    echo "2026-01-04T00:00:00Z deploy api IMAGE_API=$(rel 23) "
+    echo "2026-01-05T00:00:00Z restore api IMAGE_API=$(rel 21) from api-20260102T120000Z-scheduled.dump"
+} > "$K/srv/state/shop2/history"
+echo "IMAGE_API=$(rel 21)" > "$K/srv/state/shop2/images.env"
+: > "$WORK/fake.log"
+FAKE_IMAGES="$(rel 20) $(rel 21) $(rel 22) $(rel 23)" \
+    KATAP_RELEASES_KEPT=1 KATAP_DOCKER="$WORK/fake-docker" KATAP_SRV="$K/srv" "$K/bin/katap" images prune >/dev/null 2>&1
+check "after a restore, images prune keeps the release a rollback goes back to, not the ones the restore cut off" \
+    bash -c "! grep -qE 'image rm ($(rel 20)|$(rel 21))' '$WORK/fake.log' && grep -qF 'image rm $(rel 23)' '$WORK/fake.log'"
+echo "IMAGE_API=$(rel 22)" > "$K/srv/state/shop2/images.env"
+# A repository the component moved away from is still Katap's to prune.
+moved() { printf 'ghcr.io/acme/old-api@sha256:%064d' "$1"; }
+{
+    echo "2026-01-01T00:00:00Z deploy api IMAGE_API=$(moved 1) "
+    echo "2026-01-02T00:00:00Z deploy api IMAGE_API=$(moved 2) "
+    echo "2026-02-03T00:00:00Z deploy api IMAGE_API=$(rel 22) "
+} > "$K/srv/state/shop2/history"
+: > "$WORK/fake.log"
+FAKE_IMAGES="$(moved 1) $(moved 2) $(rel 22)" \
+    KATAP_RELEASES_KEPT=1 KATAP_DOCKER="$WORK/fake-docker" KATAP_SRV="$K/srv" "$K/bin/katap" images prune >/dev/null 2>&1
+check "images prune removes old releases of a repository the component moved away from, keeping the rollback window" \
+    bash -c "grep -qF 'image rm $(moved 1)' '$WORK/fake.log' && ! grep -qE 'image rm ($(moved 2)|$(rel 22))' '$WORK/fake.log'"
 exec 5>"$K/srv/state/shop2/.lock"
 flock 5
 : > "$WORK/fake.log"
@@ -1352,8 +1754,25 @@ rm -f "$K/srv/secrets/typo/api.db.env"
 printf '%s\n' 'restrict,command="/srv/katap/bin/katap ssh-dispatch production typo api" ssh-ed25519 AAAA katap typo/api production' \
     'restrict,command="/srv/katap/bin/katap ssh-dispatch production typo apiv2" ssh-ed25519 BBBB katap typo/apiv2 production' \
     'ssh-ed25519 CCCC admin@laptop' > "$WORK/rm-ak"
+printf '%s\n' "2026-03-01T00:00:00Z failed api IMAGE_API=$(rel 30) " > "$K/srv/state/typo/history"
+refuses "remove refuses a component whose only deploy failed (it may have created data)" "a deploy was attempted" \
+    fake remove typo api --confirm typo
+: > "$K/srv/state/typo/history"
+projects_json "$(jq '.projects.typo = {"api": .projects.shop.api}' <<<"$SHOP_JSON")"
+refuses "remove refuses a component katap.json still lists (apply would create it again)" "remove it there first" \
+    fake remove typo api --confirm typo
+projects_json '{"projects": {"typo": ["api"]}}'
+refuses "…and a katap.json of another shape, rather than read it as not listing it" "not a projects file katap can read" \
+    fake remove typo api --confirm typo
+# The typo's fix lists the domain under the right name while the typo still has
+# it: the removal must not be held by the very conflict it resolves.
+projects_json "$SHOP_JSON"
+chmod 640 "$K/srv/projects/typo/site.caddy"
+site_inode="$(stat -c %i "$K/srv/projects/typo/site.caddy")"
 check "a component that never ran is removed, with its site block (another component's volume blocks nothing)" \
     bash -c "FAKE_VOLUMES='apiv2-db' KATAP_AUTHORIZED_KEYS='$WORK/rm-ak' KATAP_DOCKER='$WORK/fake-docker' KATAP_SRV='$K/srv' '$K/bin/katap' remove typo api --confirm typo >/dev/null 2>&1 && [ ! -e '$K/srv/projects/typo/api.conf' ] && ! grep -q '^# api (' '$K/srv/projects/typo/site.caddy' && grep -q '^# web (spa)' '$K/srv/projects/typo/site.caddy'"
+check "…site.caddy replaced by a rename, keeping its mode (a failed write never truncates it)" \
+    bash -c "[ \"\$(stat -c %i '$K/srv/projects/typo/site.caddy')\" != '$site_inode' ] && [ \"\$(stat -c %a '$K/srv/projects/typo/site.caddy')\" = 640 ]"
 check "…and its deploy key, and only its own" \
     bash -c "! grep -q 'typo api\"' '$WORK/rm-ak' && grep -q 'typo apiv2\"' '$WORK/rm-ak' && grep -q admin@laptop '$WORK/rm-ak'"
 check "…and a project left empty is removed whole" \
@@ -1392,8 +1811,23 @@ check "…and only then tells each nestjs-api to trust Cloudflare's headers, nam
 cp "$K/srv/edge/certs/origin.pem" "$WORK/first.pem"
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 30 -subj /CN=rotated \
     -keyout "$WORK/rotated.key" -out "$WORK/rotated.pem" >/dev/null 2>&1
+: > "$WORK/fake.log"
 kedge FAKE_UP_FAIL=1 "$K/bin/katap" edge cloudflare "$WORK/rotated.pem" "$WORK/rotated.key" >/dev/null 2>&1 || true
 check "a rotation the edge does not start with puts the previous certificate back" cmp -s "$WORK/first.pem" "$K/srv/edge/certs/origin.pem"
+check "…and recreates the edge with it, since nothing else in its configuration changed" \
+    test "$(grep -c 'up -d --wait --force-recreate caddy' "$WORK/fake.log")" = 2
+: > "$WORK/fake.log"
+kedge "$K/bin/katap" edge cloudflare "$WORK/rotated.pem" "$WORK/rotated.key" >/dev/null 2>&1
+check "a rotation in Cloudflare mode recreates the edge, so it serves the new certificate" \
+    bash -c "cmp -s '$WORK/rotated.pem' '$K/srv/edge/certs/origin.pem' && grep -qF 'up -d --wait --force-recreate caddy' '$WORK/fake.log'"
+
+# An upgrade replaces the Caddyfile; the running edge keeps the one it started with.
+: > "$WORK/fake.log"
+kedge FAKE_CADDYFILE="$K/edge/Caddyfile" "$K/bin/katap" edge up >/dev/null 2>&1
+check "edge up leaves a running edge alone when its Caddyfile is current" bash -c "! grep -q force-recreate '$WORK/fake.log'"
+printf '# an older release\n' > "$WORK/old-Caddyfile"
+kedge FAKE_CADDYFILE="$WORK/old-Caddyfile" "$K/bin/katap" edge up >/dev/null 2>&1
+check "…and recreates it when the Caddyfile it serves is not the release's" grep -qF 'up -d --wait --force-recreate caddy' "$WORK/fake.log"
 refuses "an edge that does not start in acme mode is put back in Cloudflare mode" "back in cloudflare mode" \
     kedge FAKE_UP_FAIL=1 "$K/bin/katap" edge acme
 check "…with every application already distrusting Cloudflare's headers" \

@@ -26,29 +26,43 @@ The `nestjs-api` and `laravel-api` templates are written for those two starter
 repositories; an arbitrary NestJS or Laravel image does not meet their contract.
 More detail: [What each template expects from an image](reference.md#what-each-template-expects-from-an-image).
 
-## 2. Build and push
+## 2. The workflow
 
-A repository that already builds and pushes its image in GitHub Actions keeps
-that, unchanged. One that does not copies
-[`examples/github-workflow.yml`](../examples/github-workflow.yml) to
-`.github/workflows/`. It is GitHub's standard workflow from
-[Publishing Docker images](https://docs.github.com/en/actions/tutorials/publish-packages/publish-docker-images):
-- checkout, Buildx, log in to GHCR with the job's own token;
-- `docker/build-push-action`, tagged with the commit;
-- a vulnerability scan that stops the release on a fixable HIGH or CRITICAL finding.
+The repository's workflow builds and pushes the image, then deploys it with one
+pinned `jaylordibe/katap` step. Use whichever fits:
 
-Katap then needs the **digest** the build pushed. `docker/build-push-action`
-gives it as `steps.<id>.outputs.digest`; pass it on as a job output, as the
-example does (`image: ghcr.io/<owner>/<repo>@<digest>`).
-
-A `nestjs-api` builds its `migrate` target too, from the same commit, and passes
-that digest as well. The example shows how.
+- **A repository made from laravel-api or nestjs-api** already builds, scans and
+  pushes in `.github/workflows/publish-image.yml`. Add the example's `deploy` and
+  `deploy-staging` jobs at the end of that file, as they are (a nestjs-api
+  uncomments their `migrate-image` line), and set the repository variable
+  `PUBLISH_ENABLED` to `true`. Its `publish` job outputs the pushed digests the
+  jobs read; a copy made before it did takes those `outputs:` lines from the
+  starter's current `publish-image.yml`.
+- **Any other repository** copies
+  [`examples/github-workflow.yml`](../examples/github-workflow.yml) to
+  `.github/workflows/`, unchanged (a nestjs-api-style image uncomments its migrate
+  lines). It is GitHub's standard workflow from
+  [Publishing Docker images](https://docs.github.com/en/actions/tutorials/publish-packages/publish-docker-images),
+  plus the deploy jobs:
+  - checkout, Buildx, log in to GHCR with the job's own token;
+  - `docker/build-push-action`, tagged with the commit;
+  - a vulnerability scan that stops the release on a fixable HIGH or CRITICAL finding.
+- **Any repository that already builds and pushes its image** keeps its build
+  job, makes it output the pushed digest (`docker/build-push-action` gives it as
+  `steps.<id>.outputs.digest`; output `image: ghcr.io/<owner>/<repo>@<digest>`),
+  and adds the example's `deploy` and `deploy-staging` jobs with `needs:` and
+  `needs.<job>` set to that job's name.
 
 The image goes to `ghcr.io/<owner>/<repository>`, lowercased: that is the image
 Katap expects for a component's `repo`, unless `image` in `/srv/katap.json`
 says otherwise.
 
-## 3. The deploy key and secrets
+Nothing in the workflow names your server or project: those come from the
+repository's secrets and variables. A push to `main` deploys production; a push to
+`staging` deploys staging, each only once its variables are set. Until then the
+workflow builds and pushes, and deploys nothing.
+
+## 3. The deploy key, secrets and variables
 
 *On the server:*
 
@@ -57,51 +71,39 @@ katap deploy-key shop api
 ```
 
 It makes a key that can deploy and roll back `shop/api`, and nothing else, and
-prints three repository secrets (run it as shown: through the `katap` command,
-the key is authorised for the `deploy` user):
-- `KATAP_SSH_KEY`: the private key, every line;
-- `KATAP_HOST`: the server's address;
-- `KATAP_KNOWN_HOSTS`: the server's host key, so the workflow never trusts an unknown host.
+prints what to add in the repository, under **Settings → Secrets and variables →
+Actions**:
 
-Add them in the repository: **Settings → Secrets and variables → Actions → New
-repository secret**. The private key is shown once; the server keeps only its
-public half.
+| Kind | Name | Value |
+|---|---|---|
+| Secret | `KATAP_SSH_KEY` | The private key, every line |
+| Secret | `KATAP_HOST` | The server's address |
+| Secret | `KATAP_KNOWN_HOSTS` | The server's host key, so the workflow never trusts an unknown host |
+| Variable | `KATAP_PROJECT` | `shop` |
+| Variable | `KATAP_COMPONENT` | `api` |
+| Variable | `KATAP_URL` | Optional: a public URL checked after each deploy |
 
-A **staging** component's secrets are printed as `KATAP_STAGING_SSH_KEY`,
-`KATAP_STAGING_HOST` and `KATAP_STAGING_KNOWN_HOSTS`, so one repository can hold
-both environments, on one server or two.
+Run it as shown, through the `katap` command: the key is authorised for the
+`deploy` user. The private key is shown once; the server keeps only its public
+half.
 
-Adding secrets needs admin access to the repository. A repository owned by
-another GitHub account, such as a startup's shared account, has that account add
-them.
+A **staging** component's are named `KATAP_STAGING_…` (`KATAP_STAGING_SSH_KEY`,
+`KATAP_STAGING_PROJECT`, and so on), so one repository can hold both
+environments, on one server or two.
+
+Adding secrets and variables needs admin access to the repository. A repository
+owned by another GitHub account, such as a startup's shared account, has that
+account add them.
 
 ## 4. The deploy step
 
-`katap deploy-key` prints the step with your project, component, release and
-URL filled in:
+Each deploy job in [`examples/github-workflow.yml`](../examples/github-workflow.yml)
+holds one `jaylordibe/katap` step. Its inputs are the repository's secrets and
+variables of step 3, and the image the `publish` job pushed, by digest.
 
-```yaml
-      - uses: jaylordibe/katap@<commit of your server's release> # vX.Y.Z
-        with:
-          host: ${{ secrets.KATAP_HOST }}
-          known-hosts: ${{ secrets.KATAP_KNOWN_HOSTS }}
-          ssh-key: ${{ secrets.KATAP_SSH_KEY }}
-          project: shop
-          component: api
-          image: ${{ needs.build.outputs.image }}
-          migrate-image: ${{ needs.build.outputs.migrate-image }}   # nestjs-api only
-          url: https://api.example.com/api/health/readiness         # checked after the deploy
-```
-
-Put it in a job that runs after the build, with `permissions: packages: read`.
-
-- **Pin it by commit,** never by a tag: it receives the deploy key, and a tag can be moved. Move the pin only after your server runs that release: see [Updating Katap](updating.md).
-- **Private images need nothing extra.** The step hands the server this job's own GitHub token, on the SSH connection's input, for the one pull. It is never stored, and it expires with the job. Keep the deploy step in its own job with `permissions: packages: read`, as the example does: the server receives what the token may do.
+- **Pinned by commit,** never by a tag: the step receives the deploy key, and a tag can be moved. With Dependabot's `github-actions` updates on (a `.github/dependabot.yml`), the pin moves to each new Katap release; any release of your server's major version works with it (`katap deploy-key` names the major). See [Updating Katap](updating.md).
+- **Private images need nothing extra.** The step hands the server its job's own GitHub token, on the SSH connection's input, for the one pull. It is never stored, and it expires with the job. Each deploy job holds only `permissions: packages: read`: the server receives what the token may do.
 - **The deploy keeps running on the server** if the workflow is cancelled or the connection drops. Its log is in `/srv/state/.dispatch/<project>/`.
-
-Each push to `main` then deploys production. For staging, deploy from a
-`staging` branch to a component with `"environment": "staging"` in
-`/srv/katap.json`, using the `KATAP_STAGING_*` secrets.
 
 ## First deploy
 

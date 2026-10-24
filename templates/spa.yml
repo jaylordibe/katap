@@ -11,9 +11,10 @@
 
 services:
   __C__:
-    image: ${IMAGE___CU__:-katap/unreleased:none}
+    image: ${IMAGE___CU__:-registry.invalid/katap/unreleased@sha256:0000000000000000000000000000000000000000000000000000000000000000}
     restart: unless-stopped
     mem_limit: 128m
+    cap_drop: [NET_RAW]
     security_opt:
       - no-new-privileges:true
     logging:

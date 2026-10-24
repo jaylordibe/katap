@@ -43,8 +43,23 @@ reachable() {
         -c "curl -sS --max-time 5 -o /dev/null http://$1"
 }
 
+# Whether this Docker runs a katap-edge this suite did not start (its own publishes
+# EDGE_HTTPS_PORT): someone's own edge, which the teardown would remove with its
+# certificates.
+e2e_foreign_edge() {
+    local id
+    for id in $(docker ps -aq --filter label=com.docker.compose.project=katap-edge); do
+        docker inspect --format '{{json .HostConfig.PortBindings}}' "$id" | grep -qF "\"HostPort\":\"$EDGE_HTTPS_PORT\"" || return 0
+    done
+    return 1
+}
+
 e2e() {
     [ -d "$E2E_LARAVEL_API" ] || { not_ok "end to end" "no laravel-api checkout at $E2E_LARAVEL_API"; return; }
+    if e2e_foreign_edge; then
+        not_ok "end to end" "this Docker runs a katap-edge the suite did not start; stop it first, since the suite would replace it"
+        return
+    fi
     e2e_teardown
 
     # --- Images, published by digest ---------------------------------------------
@@ -195,8 +210,11 @@ EOF
 
     # --- A healthy container whose smoke check fails is rolled back ------------
     # (the smoke check, not only the container healthcheck, decides a deploy)
+    # The smoke text set here fails every release, so putting the one before it
+    # back fails its smoke check too, and the deploy says so; its containers are
+    # back all the same, which the checks below prove.
     set_conf e2e api smoke_body never-in-the-readiness-body
-    refuses "a release whose smoke check fails is rolled back" "failed and was rolled back" \
+    refuses "a release whose smoke check fails is rolled back" "failed, and so did putting the release before it back" \
         env SMOKE_ATTEMPTS=2 SMOKE_INTERVAL_SECONDS=1 KATAP_SRV="$K/srv" "$K/bin/katap" deploy e2e api "$ref1"
     set_conf e2e api smoke_body '"status":"ready"'
     check "…and the release before it is still recorded" grep -qxF "IMAGE_API=$ref2" "$K/srv/state/e2e/images.env"
@@ -234,10 +252,11 @@ EOF
     cp "$dump" "$WORK/orphan.dump"
     refuses "restore refuses a dump whose release is unknown" "the release that wrote this dump is unknown" \
         katap restore e2e api "$WORK/orphan.dump" --confirm e2e
-    printf 'not a dump' > "$WORK/broken.dump"
-    cp "$dump.images" "$WORK/broken.dump.images"
+    # Named as a dump of api, so the restore reaches the data itself.
+    printf 'not a dump' > "$WORK/api-broken.dump"
+    cp "$dump.images" "$WORK/api-broken.dump.images"
     refuses "a dump that cannot be restored fails loudly" "the restore failed; the database is unchanged" \
-        katap restore e2e api "$WORK/broken.dump" --confirm e2e
+        katap restore e2e api "$WORK/api-broken.dump" --confirm e2e
     check "…and changes nothing" test "$(psql_app -tA -c 'SELECT count(*) FROM katap_e2e_after_dump')" = 1
     check "…and the API serves again" ready
 

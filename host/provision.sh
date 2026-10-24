@@ -189,8 +189,14 @@ if [ ! -f /etc/katap/katap.env ]; then
 # Dumps kept per component and kind (default 14).
 # KATAP_BACKUP_KEEP=14
 #
-# Earlier releases kept per component for rollback (default 5).
+# Earlier releases kept per component for rollback, besides the newest (default 5).
 # KATAP_RELEASES_KEPT=5
+#
+# How long each of a deploy's one-shot services (migrations) may run before it is
+# stopped (default 15m), and each off-host copy of a dump (default 1h).
+# Durations: 90s, 15m, 1h.
+# KATAP_PREDEPLOY_TIMEOUT=15m
+# KATAP_RCLONE_TIMEOUT=1h
 #
 # Seconds a deploy key waits after its last dispatch before it may
 # dispatch again (default 60).
