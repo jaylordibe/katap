@@ -22,6 +22,10 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # Every release tag: the suite runs earlier releases' actions against
+          # this server (one major version, one request form).
+          fetch-depth: 0
       - name: Run the suite
         run: tests/run.sh
 
