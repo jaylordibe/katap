@@ -20,6 +20,15 @@ PORT=literal:3000
 API_BASE_URL=literal:https://{domain}/api
 WEB_BASE_URL=frontend:url
 CORS_ORIGIN=frontend:origins
+# The project's name: namespaces the application's Redis keys, and the issuer
+# and audience of its tokens.
+SERVICE_NAME=literal:{project}
+# The connection DATABASE_URL names, piece by piece: the application validates both.
+DB_USER=literal:app
+DB_PASSWORD=same:APP_DB_PASSWORD
+DB_HOST=literal:__C__-db
+DB_PORT=literal:5432
+DB_NAME=literal:app
 DATABASE_URL=literal:postgresql://app:{secret:APP_DB_PASSWORD}@__C__-db:5432/app?schema=public
 REDIS_HOST=literal:__C__-redis
 REDIS_PORT=literal:6379

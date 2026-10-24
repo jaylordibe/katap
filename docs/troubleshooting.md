@@ -48,6 +48,7 @@
 | Action fails: is not on ghcr.io / known-hosts is empty | The image is on another registry, or the `KATAP_KNOWN_HOSTS` secret is missing | Set the action's `registry` input; add the secret `katap deploy-key` printed |
 | Action fails: Permission denied (publickey) | The `KATAP_SSH_KEY` secret is not the key the server has, or was pasted without its first or last line | Replace it: `katap deploy-key <project> <component> --replace` |
 | Deploy fails and rolls back | The new release never became healthy, or failed its smoke check | `docker compose -p <project> logs --tail=200 <service>` |
+| A nestjs-api never becomes healthy: its log says `SERVICE_NAME`, `DB_USER` … is required | A component created before Katap v2.0.2, whose settings lack the six the template now generates | `katap env <project> <component>`: add `SERVICE_NAME=<project>`, `DB_USER=app`, `DB_PASSWORD=` the `APP_DB_PASSWORD` in `/srv/secrets/<project>/<component>.db.env`, `DB_HOST=<component>-db`, `DB_PORT=5432`, `DB_NAME=app` |
 | Deploy fails: … and so did putting the release before it back | The previous release did not come back healthy either | The component may be down: its logs, then `katap rollback <project> <component>` |
 
 ## Serving

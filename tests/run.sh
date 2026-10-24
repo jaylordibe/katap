@@ -132,6 +132,15 @@ check "shellcheck: every script" shellcheck -x "$REPO/bin/katap" "$REPO"/lib/*.s
 
 check "every link and anchor in README.md and docs/ resolves, and every docs reference in the code names a real heading" \
     python3 "$REPO/tests/check_docs.py" "$REPO"
+# Every setting nestjs-api always requires at boot (src/config/env.validation.ts,
+# a `.required()` with no condition) is one the template generates or marks
+# required: a key missing here means a nestjs-api that never starts.
+if [ -f "$REPO/../nestjs-api/src/config/env.validation.ts" ]; then
+    check "the nestjs-api template provides every setting nestjs-api always requires" \
+        python3 "$REPO/tests/check_nestjs_settings.py" "$REPO/../nestjs-api/src/config/env.validation.ts" "$REPO/templates/nestjs-api.env.spec"
+else
+    not_ok "the nestjs-api template provides every setting nestjs-api always requires" "no nestjs-api checkout beside this one"
+fi
 check "laravel-api and nestjs-api never mention Katap (they publish images; how they are deployed is not theirs)" \
     bash -c "for r in laravel-api nestjs-api; do [ ! -d '$REPO/../'\$r ] || ! grep -rIil katap '$REPO/../'\$r --exclude-dir=.git --exclude-dir=node_modules --exclude-dir=vendor || exit 1; done"
 
@@ -326,6 +335,10 @@ for _ in $(seq 1 "$nest_runs"); do
     [[ "$(env_get "$app" DATABASE_URL)" == "postgresql://app:$(env_get "$K/srv/secrets/blog/api.db.env" APP_DB_PASSWORD)@api-db:5432/app?schema=public" ]] || nest_failures+="DATABASE_URL"$'\n'
     [[ "$(env_get "$app" REDIS_URL)" == "redis://default:$(env_get "$K/srv/secrets/blog/api.redis.env" REDIS_PASSWORD)@api-redis:6379" ]] || nest_failures+="REDIS_URL"$'\n'
     [[ "$(env_get "$app" JWT_SECRET)" =~ ^[0-9a-f]{96}$ ]] || nest_failures+="JWT_SECRET"$'\n'
+    # The same connection piece by piece, which the application also validates.
+    [ "$(env_get "$app" DB_USER)/$(env_get "$app" DB_HOST):$(env_get "$app" DB_PORT)/$(env_get "$app" DB_NAME)" = app/api-db:5432/app ] || nest_failures+="DB_*"$'\n'
+    [ "$(env_get "$app" DB_PASSWORD)" = "$(env_get "$K/srv/secrets/blog/api.db.env" APP_DB_PASSWORD)" ] || nest_failures+="DB_PASSWORD"$'\n'
+    [ "$(env_get "$app" SERVICE_NAME)" = blog ] || nest_failures+="SERVICE_NAME"$'\n'
 done
 if [ -z "$nest_failures" ]; then ok "nestjs-api secrets are well-formed in $nest_runs fresh runs"; else not_ok "nestjs-api secrets are well-formed in $nest_runs fresh runs" "$(sort <<<"$nest_failures" | uniq -c)"; fi
 check "nestjs-api trusts exactly the edge's fixed address" \
