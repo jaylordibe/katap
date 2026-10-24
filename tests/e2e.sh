@@ -83,15 +83,14 @@ e2e() {
     # This host's edge settings, overriding the tool's defaults.
     mkdir -p "$K/srv/edge"
     echo TLS_MODE=internal > "$K/srv/edge/edge.env"
-    # The images come from the local registry, and were built locally, so no
-    # GitHub attestation exists for them: the host is told so.
+    # The images come from a local registry; a deploy pulls them by digest.
     jq -n --arg api "$REG/katap-e2e/laravel-api" --arg web "$REG/katap-e2e/spa" '{
         host: "127.0.0.1",
         projects: {e2e: {
-            api: {type: "laravel-api", repo: "katap-e2e/laravel-api", image: $api, provenance: "none", domains: ["api.e2e.test"]},
-            web: {type: "spa", repo: "katap-e2e/spa", image: $web, provenance: "none", domains: ["www.e2e.test"]}
+            api: {type: "laravel-api", repo: "katap-e2e/laravel-api", image: $api, domains: ["api.e2e.test"]},
+            web: {type: "spa", repo: "katap-e2e/spa", image: $web, domains: ["www.e2e.test"]}
         }}}' > "$K/srv/katap.json"
-    check "katap apply defines the project from katap.json" katap apply
+    check "katap apply defines the project from katap.json" katap apply --yes
     local env="$K/srv/secrets/e2e/api.env"
     check "…the API's frontend and CORS origins taken from the web component" \
         bash -c "grep -qxF APP_FRONTEND_URL=https://www.e2e.test '$env' && grep -qxF CORS_ALLOWED_ORIGINS=https://www.e2e.test '$env'"
@@ -157,6 +156,10 @@ EOF
     check "a forged X-Forwarded-For does not reach the application" bash -c "[ -n '$echoed' ] && ! grep -q '6\.6\.6\.6' <<<'$echoed'"
     check "the application receives exactly one client address" \
         test "$(grep -ciE '^X-Forwarded-For: [0-9a-f.:]+.?$' <<<"$echoed")" = 1
+    local cf_echoed
+    cf_echoed="$(edge echo.e2e.test -H 'CF-Connecting-IP: 7.7.7.7' https://echo.e2e.test/ || true)"
+    check "a client-sent CF-Connecting-IP never reaches the application outside Cloudflare mode" \
+        bash -c "grep -q '^GET / ' <<<'$cf_echoed' && ! grep -qi '^Cf-Connecting-Ip:' <<<'$cf_echoed'"
     check "the application is told the request was HTTPS" grep -qiE '^X-Forwarded-Proto: https' <<<"$echoed"
     client_ip="$(grep -i '^X-Forwarded-For:' <<<"$echoed" | awk '{print $2}' | tr -d '\r' || true)"
     edge api.e2e.test -H 'X-Forwarded-For: 6.6.6.6' -o /dev/null https://api.e2e.test/up || true

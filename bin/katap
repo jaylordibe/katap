@@ -10,10 +10,16 @@
 # <component>.conf of deploy settings, and site.caddy. Secrets live under
 # /srv/secrets, never in a repository.
 #
-#   katap apply                                          create what /srv/katap.json declares
+#   katap apply [--yes]                                  create what /srv/katap.json declares
+#   katap env <project> <component>                      edit a component's settings
+#   katap deploy-key <project> <component> [--replace]   make its restricted deploy key
+#   katap remove <project> [<component>] --confirm <project>
+#                                                        remove what was never deployed
 #   katap add <project> <type> <component> [domain...]   define one component by hand
 #   katap secrets <project> <component>                  generate its secrets ONCE
 #   katap edge up|reload                                 start the shared edge / reload its config
+#   katap edge cloudflare [<origin.pem> <origin.key>]    serve behind Cloudflare's proxy
+#   katap edge acme                                      back to Let's Encrypt
 #   katap deploy <project> <component> <image@sha256:…> [migrate=<image@sha256:…>]
 #   katap rollback <project> <component> [<image@sha256:…> [migrate=<image@sha256:…>]]
 #   katap run <project> <service> [args...]              one-off command in a one-shot service
@@ -21,9 +27,9 @@
 #   katap backup --all | <project>                       database dumps (systemd timer)
 #   katap restore <project> <component> <dump> --confirm <project>
 #   katap check [<project>...]                           enforce the project contract
+#   katap images prune                                   remove images no release needs
 #   katap ssh-dispatch <environment> <project> <component>[,<component>...]
 #                                                        forced command of an app's deploy key
-#   katap release-info                                   what connect.sh reads (JSON)
 #
 # Host layout (KATAP_SRV, default /srv):
 #   katap.json                                             the projects apply creates
@@ -34,7 +40,7 @@
 #   state/<project>/history                                every deploy and rollback
 #   state/.dispatch/<project>/                             each CI dispatch's log
 #   backups/<project>/<component>-<time>-<reason>.dump
-# Host settings: /etc/katap/katap.env (KATAP_GH_TOKEN, KATAP_RCLONE_REMOTE, ...).
+# Host settings: /etc/katap/katap.env (KATAP_RCLONE_REMOTE, KATAP_BACKUP_KEEP, ...).
 # The installed release: /etc/katap/release (tag= and commit=, written by install.sh).
 #
 # Nothing here ever regenerates a secret, drops a database or volume, or runs a
@@ -53,15 +59,14 @@ fi
 KATAP_ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 
 # Host settings. The systemd units and ssh-dispatch reach the same values: a
-# dispatched deploy needs the GitHub token and the backup remote too. Read as
-# data, never sourced, and only these keys; the environment wins. This is the
-# file's only reader (the systemd units do not load it), so its rules are these:
-# the last line for a key wins, surrounding whitespace and one pair of quotes
-# are removed. Not exported: every katap process reads it itself, and nothing
-# else needs the token.
+# dispatched deploy needs the backup remote too. Read as data, never sourced,
+# and only these keys; the environment wins. This is the file's only reader (the
+# systemd units do not load it), so its rules are these: the last line for a key
+# wins, surrounding whitespace and one pair of quotes are removed. Not exported:
+# every katap process reads it itself.
 KATAP_SETTINGS="${KATAP_SETTINGS:-/etc/katap/katap.env}"
 if [ -r "$KATAP_SETTINGS" ]; then
-    for _key in KATAP_GH_TOKEN KATAP_GH_TIMEOUT KATAP_RCLONE_REMOTE KATAP_BACKUP_KEEP KATAP_CRON_TIMEOUT KATAP_DISPATCH_COOLDOWN; do
+    for _key in KATAP_RCLONE_REMOTE KATAP_BACKUP_KEEP KATAP_CRON_TIMEOUT KATAP_DISPATCH_COOLDOWN KATAP_RELEASES_KEPT; do
         if [ -z "${!_key:-}" ] && _line="$(grep -E "^${_key}=" "$KATAP_SETTINGS" | tail -n 1)"; then
             _line="${_line#*=}"
             _line="${_line%$'\r'}"
@@ -76,16 +81,33 @@ if [ -r "$KATAP_SETTINGS" ]; then
     unset _key _line
 fi
 
+# The registry login of one dispatched deploy: ssh-dispatch writes it to a 0600
+# file it alone created and passes the path. It is read once and the file
+# removed at once, and it is never exported: no child process but the one
+# `docker login` that reads it on standard input ever sees it.
+REGISTRY_USER=''
+REGISTRY_TOKEN=''
+if [ -n "${KATAP_REGISTRY_FILE:-}" ]; then
+    if [ -f "$KATAP_REGISTRY_FILE" ]; then
+        IFS=' ' read -r REGISTRY_USER REGISTRY_TOKEN < "$KATAP_REGISTRY_FILE" || true
+        rm -f "$KATAP_REGISTRY_FILE"
+    fi
+    unset KATAP_REGISTRY_FILE
+fi
+
 KATAP_SRV="${KATAP_SRV:-/srv}"
 KATAP_PROJECTS="${KATAP_PROJECTS:-$KATAP_SRV/projects}"
 KATAP_PROJECTS_FILE="${KATAP_PROJECTS_FILE:-$KATAP_SRV/katap.json}"
 KATAP_RELEASE_FILE="${KATAP_RELEASE_FILE:-/etc/katap/release}"
 KATAP_HOST_KEY_FILE="${KATAP_HOST_KEY_FILE:-/etc/ssh/ssh_host_ed25519_key.pub}"
-# Test seams: the docker and gh binaries, and the program ssh-dispatch hands over to.
+# Test seams: the docker binary, the program ssh-dispatch hands over to, and the
+# deploy user's authorized_keys.
 KATAP_DOCKER="${KATAP_DOCKER:-docker}"
-KATAP_GH="${KATAP_GH:-gh}"
 KATAP_SELF="${KATAP_SELF:-$KATAP_ROOT/bin/katap}"
+KATAP_AUTHORIZED_KEYS="${KATAP_AUTHORIZED_KEYS:-$HOME/.ssh/authorized_keys}"
 KATAP_BACKUP_KEEP="${KATAP_BACKUP_KEEP:-14}"
+# Earlier releases kept per component, so a rollback never needs the registry.
+KATAP_RELEASES_KEPT="${KATAP_RELEASES_KEPT:-5}"
 
 # Runs lib/smoke-check.sh on a project network. Pinned like every other image.
 CURL_IMAGE='curlimages/curl:8.22.0@sha256:58adaa4e8dca9c988bae2aba4ab3434a0bb2da16bbe3f92dec39ec7785166777'
@@ -93,6 +115,11 @@ CURL_IMAGE='curlimages/curl:8.22.0@sha256:58adaa4e8dca9c988bae2aba4ab3434a0bb2da
 PROJECT_RE='^[a-z][a-z0-9-]{0,29}$'
 # No hyphen: the component name becomes part of an environment variable name.
 COMPONENT_RE='^[a-z][a-z0-9]{0,19}$'
+# The registry login a deploy may carry: a GitHub user (or app bot, or Enterprise
+# Managed User) and a GitHub Actions job token. action/deploy.sh sends exactly
+# these; tests/run.sh checks the two copies are the same.
+REGISTRY_USER_RE='^[A-Za-z0-9][A-Za-z0-9_-]{0,99}(\[bot\])?$'
+JOB_TOKEN_RE='^ghs_[A-Za-z0-9]{20,255}$'
 DOMAIN_RE='^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$'
 # owner/name, as GitHub allows: no dots in the owner, and a name that is not only dots.
 REPO_RE='^[A-Za-z0-9-]+/[A-Za-z0-9_.-]*[A-Za-z0-9_-][A-Za-z0-9_.-]*$'
@@ -105,7 +132,13 @@ die() { echo "katap: $*" >&2; exit 1; }
 
 # Temporary paths removed on exit, however the command ends.
 CLEANUP=()
-cleanup() { [ "${#CLEANUP[@]}" -eq 0 ] || rm -rf -- "${CLEANUP[@]}"; }
+# Set while a pasted secret is read with echo off, so an interrupted paste still
+# gives the terminal its echo back.
+TTY_ECHO_OFF=false
+cleanup() {
+    [ "$TTY_ECHO_OFF" = false ] || stty echo < /dev/tty 2>/dev/null || true
+    [ "${#CLEANUP[@]}" -eq 0 ] || rm -rf -- "${CLEANUP[@]}"
+}
 trap cleanup EXIT
 log() { echo "katap: $*" >&2; }
 
@@ -265,7 +298,7 @@ cmd_add() {
     cat <<EOF
 Added $type component '$component' to project '$project' ($dir).
 Next:
-  1. In $dir/$component.conf, set image= and source_repo= (and image_migrate= if present).
+  1. In $dir/$component.conf, set image= (and image_migrate= if present).
   2. katap secrets $project $component, then fill every empty required value.
   3. katap check $project$( [ "$#" -eq 0 ] || printf ', then katap edge reload to serve %s' "$*").
 EOF
@@ -652,10 +685,148 @@ cmd_edge() {
         reload)
             edge_reload || die "the edge rejected its configuration; the previous one keeps serving."
             ;;
+        cloudflare)
+            shift
+            require_owner "edge cloudflare"
+            edge_cloudflare "$@"
+            ;;
+        acme)
+            [ "$#" -eq 1 ] || die "usage: katap edge acme"
+            edge_acme
+            ;;
         *)
-            die "usage: katap edge up|reload"
+            die "usage: katap edge up|reload|cloudflare|acme"
             ;;
     esac
+}
+
+# Sets KEY=value in an env file: the first line for the key is replaced, later
+# ones dropped, a missing one appended. Written whole and renamed, keeping the
+# file's mode; any failure leaves the file as it was and returns 1.
+set_env_key() {
+    local file="$1" key="$2" setting="$3" tmp
+    tmp="$(mktemp "$file.XXXXXX")" || return 1
+    CLEANUP+=("$tmp")
+    KATAP_LINE="$key=$setting" awk -v k="$key" '
+        index($0, k "=") == 1 { if (!done) { print ENVIRON["KATAP_LINE"]; done = 1 }; next }
+        { print }
+        END { if (!done) print ENVIRON["KATAP_LINE"] }
+    ' "$file" > "$tmp" || return 1
+    chmod --reference="$file" "$tmp" 2>/dev/null || true
+    mv "$tmp" "$file" || return 1
+}
+
+# Every nestjs-api component's TRUST_CLOUDFLARE_HEADERS, set to <value>. The
+# components whose running release needs a deploy to pick it up are left in
+# TRUST_CHANGED. Dies on the first file it cannot write.
+TRUST_CHANGED=()
+set_cloudflare_trust() {
+    local trust="$1" project component file
+    TRUST_CHANGED=()
+    for project in $(all_projects); do
+        for component in $(components_of "$project"); do
+            [ "$(conf_get "$project" "$component" type)" = nestjs-api ] || continue
+            file="$(secrets_dir "$project")/$component.env"
+            if [ ! -f "$file" ] || ! grep -q '^TRUST_CLOUDFLARE_HEADERS=' "$file"; then continue; fi
+            [ "$(file_get "$file" TRUST_CLOUDFLARE_HEADERS)" != "$trust" ] || continue
+            set_env_key "$file" TRUST_CLOUDFLARE_HEADERS "$trust" \
+                || die "could not write $file; TRUST_CLOUDFLARE_HEADERS is unchanged there."
+            TRUST_CHANGED+=("$project/$component")
+        done
+    done
+}
+
+# Reads one PEM block from the terminal: every line up to its END line. A private
+# key is read without echo, so it never lands in the terminal's scrollback.
+read_pem() {
+    local what="$1" secret="${2:-}" line pem=''
+    printf 'Paste the %s, then press Enter:\n' "$what" > /dev/tty
+    if [ -n "$secret" ]; then TTY_ECHO_OFF=true; stty -echo < /dev/tty 2>/dev/null || true; fi
+    while IFS= read -r line < /dev/tty; do
+        pem+="$line"$'\n'
+        [[ "$line" != -----END\ * ]] || break
+    done
+    [ -z "$secret" ] || { stty echo < /dev/tty 2>/dev/null || true; TTY_ECHO_OFF=false; printf '(received)\n' > /dev/tty; }
+    printf '%s' "$pem"
+}
+
+# Behind Cloudflare's proxy: the edge serves a Cloudflare Origin CA certificate,
+# admits only Cloudflare (its origin-pull client certificate and address ranges),
+# and takes the client address from CF-Connecting-IP. Applications are told to
+# trust Cloudflare's headers only once the edge admits nobody else.
+edge_cloudflare() {
+    local certs="$KATAP_SRV/edge/certs" cert key work name
+    work="$(mktemp -d)"
+    CLEANUP+=("$work")
+    chmod 700 "$work"
+    case "$#" in
+        2)
+            cp -- "$1" "$work/origin.pem" || die "cannot read $1 (the deploy user reads it; put it somewhere it can, or paste it: katap edge cloudflare)."
+            cp -- "$2" "$work/origin.key" || die "cannot read $2 (the deploy user reads it; put it somewhere it can, or paste it: katap edge cloudflare)."
+            ;;
+        0)
+            { : < /dev/tty; } 2>/dev/null || die "no terminal to paste on; run: katap edge cloudflare <origin.pem> <origin.key>"
+            read_pem "Origin Certificate (from Cloudflare: SSL/TLS → Origin Server → Create Certificate)" > "$work/origin.pem"
+            read_pem "Private Key that came with it" secret > "$work/origin.key"
+            ;;
+        *) die "usage: katap edge cloudflare [<origin.pem> <origin.key>]" ;;
+    esac
+    cert="$(openssl x509 -in "$work/origin.pem" -noout -pubkey 2>/dev/null)" || die "that is not a PEM certificate; nothing was changed."
+    key="$(openssl pkey -in "$work/origin.key" -pubout 2>/dev/null)" || die "that is not a PEM private key; nothing was changed."
+    [ "$cert" = "$key" ] || die "the private key does not belong to the certificate; nothing was changed."
+
+    # The files in use are kept aside until the edge has started with the new ones.
+    mkdir -p "$certs" "$work/previous"
+    for name in origin.pem origin.key cf-origin-pull-ca.pem; do
+        [ ! -f "$certs/$name" ] || cp -p -- "$certs/$name" "$work/previous/$name"
+    done
+    install -m 0644 "$work/origin.pem" "$certs/origin.pem"
+    install -m 0600 "$work/origin.key" "$certs/origin.key"
+    install -m 0644 "$KATAP_ROOT/edge/cloudflare-origin-pull-ca.pem" "$certs/cf-origin-pull-ca.pem"
+
+    local edge_env="$KATAP_SRV/edge/edge.env" before
+    [ -f "$edge_env" ] || (umask 022 && : > "$edge_env")
+    before="$(edge_get TLS_MODE)"
+    set_env_key "$edge_env" TLS_MODE cloudflare || die "could not write $edge_env; nothing else was changed."
+    if ! edge_compose up -d --wait; then
+        for name in origin.pem origin.key cf-origin-pull-ca.pem; do
+            if [ -f "$work/previous/$name" ]; then cp -p -- "$work/previous/$name" "$certs/$name"; else rm -f -- "${certs:?}/$name"; fi
+        done
+        set_env_key "$edge_env" TLS_MODE "${before:-acme}" || true
+        edge_compose up -d --wait || true
+        die "the edge did not start in Cloudflare mode; it is back in ${before:-acme} mode with its previous certificate."
+    fi
+    set_cloudflare_trust true
+    echo "The edge now admits only Cloudflare. Turn on SSL/TLS → Origin Server →"
+    echo "Authenticated Origin Pulls → Global, and set SSL/TLS encryption to Full (strict)."
+    if [ "${#TRUST_CHANGED[@]}" -gt 0 ]; then
+        echo "Set TRUST_CLOUDFLARE_HEADERS=true for these; it takes effect on their next deploy:"
+        printf '  %s\n' "${TRUST_CHANGED[@]}"
+    fi
+}
+
+# Back to Let's Encrypt. Applications stop trusting Cloudflare's headers first,
+# and the edge strips them outside Cloudflare mode: once it admits everyone, a
+# client could otherwise set its own address.
+edge_acme() {
+    local edge_env="$KATAP_SRV/edge/edge.env" before
+    set_cloudflare_trust false
+    [ -f "$edge_env" ] || (umask 022 && : > "$edge_env")
+    before="$(edge_get TLS_MODE)"
+    set_env_key "$edge_env" TLS_MODE acme || die "could not write $edge_env; the edge is unchanged."
+    if ! edge_compose up -d --wait; then
+        # Back to the mode that was serving. Applications already distrust
+        # Cloudflare's headers, which is safe in either mode.
+        set_env_key "$edge_env" TLS_MODE "${before:-acme}" || true
+        edge_compose up -d --wait || true
+        die "the edge did not start in acme mode; it is back in ${before:-acme} mode. Check: docker compose -p katap-edge logs caddy"
+    fi
+    echo "The edge now gets its certificates from Let's Encrypt."
+    if [ "${#TRUST_CHANGED[@]}" -gt 0 ]; then
+        echo "Set TRUST_CLOUDFLARE_HEADERS=false for these; it takes effect on their next deploy"
+        echo "(the edge already removes Cloudflare's headers from every request):"
+        printf '  %s\n' "${TRUST_CHANGED[@]}"
+    fi
 }
 
 # --- deploy / rollback ----------------------------------------------------------
@@ -762,71 +933,40 @@ require_clean_tool() {
         || die "$KATAP_ROOT is at ${head:0:12}, not the release install.sh installed (${recorded:0:12}, $KATAP_RELEASE_FILE); run install.sh again."
 }
 
-# The source commit one image was built from, per a build-provenance attestation
-# made by <source_repo>'s own publish workflow on one of the allowed branches.
-# Dies, naming what gh said, when no branch verifies: a refused verification and
-# an unreachable GitHub (or an expired token) must not read as the same thing.
-# Each call is bounded, so a stalled GitHub cannot hold the deploy forever.
-attested_commit() {
-    local ref="$1" source_repo="$2" environment="$3" err="$4" branch out status=0 said=''
-    local branches=(refs/heads/main)
-    [ "$environment" = production ] || branches+=(refs/heads/staging)
-    for branch in "${branches[@]}"; do
-        status=0
-        out="$(GH_TOKEN="$KATAP_GH_TOKEN" timeout --kill-after=10 "${KATAP_GH_TIMEOUT:-60}" \
-            "$KATAP_GH" attestation verify "oci://$ref" --repo "$source_repo" \
-            --signer-workflow "$source_repo/.github/workflows/publish-image.yml" \
-            --source-ref "$branch" --deny-self-hosted-runners --format json 2>"$err")" || status=$?
-        if [ "$status" -eq 0 ]; then
-            jq -r '[.[].verificationResult.signature.certificate.sourceRepositoryDigest // empty][0] // ""' <<<"$out"
-            return 0
+# Makes every image of <lines> (IMAGE_X=<repository>@sha256:… lines) present on
+# this host, pulling only what is missing. An image already here is never pulled
+# again: it is addressed by digest, so its content is the content that was
+# deployed, and a rollback or a restore works with the registry unreachable.
+# A pull from ghcr.io uses the registry login ssh-dispatch received for this
+# deploy, when there is one, in a Docker config made for these pulls alone and
+# removed afterwards. A pull without one (a rollback or restore run by hand) uses
+# the deploy user's own Docker login, if someone made one. Each registry call
+# has a deadline, so a stalled registry never holds the project's lock for long.
+PULL_TIMEOUT=900
+ensure_images() {
+    local lines="$1" ref config=''
+    while IFS= read -r ref; do
+        ref="${ref#*=}"
+        [ -n "$ref" ] || continue
+        ! "$KATAP_DOCKER" image inspect "$ref" >/dev/null 2>&1 || continue
+        log "pulling $ref."
+        if [ -n "$REGISTRY_TOKEN" ] && [ "${ref%%/*}" = ghcr.io ]; then
+            if [ -z "$config" ]; then
+                config="$(mktemp -d)"
+                CLEANUP+=("$config")
+                chmod 700 "$config"
+                printf '%s' "$REGISTRY_TOKEN" \
+                    | DOCKER_CONFIG="$config" timeout -k 30 "$PULL_TIMEOUT" "$KATAP_DOCKER" login ghcr.io --username "$REGISTRY_USER" --password-stdin >/dev/null 2>&1 \
+                    || die "could not log in to ghcr.io with this deploy's token; nothing was changed."
+            fi
+            DOCKER_CONFIG="$config" timeout -k 30 "$PULL_TIMEOUT" "$KATAP_DOCKER" pull --quiet "$ref" >/dev/null \
+                || die "could not pull $ref; nothing was changed."
+        else
+            timeout -k 30 "$PULL_TIMEOUT" "$KATAP_DOCKER" pull --quiet "$ref" >/dev/null \
+                || die "could not pull $ref; nothing was changed. A private image no longer on this host needs a registry login first: sudo -u deploy docker login ghcr.io (a token with read:packages), then docker logout ghcr.io afterwards."
         fi
-        [ "$status" -ne 124 ] && [ "$status" -ne 137 ] \
-            || die "GitHub did not answer the provenance check of $ref within ${KATAP_GH_TIMEOUT:-60}s; nothing was changed."
-        said+="${said:+; }${branch#refs/heads/}: $(tail -n 1 "$err")"
-    done
-    die "could not verify that $ref was built by $source_repo's publish workflow on ${branches[*]#refs/heads/}; nothing was changed. gh said: $said"
-}
-
-# Refuses a release whose images this host cannot trace to the component's own
-# publish workflow. Runs on the host because the deploy key now sits in the
-# application's CI: whoever holds it could send any digest of the repository.
-verify_release() {
-    local project="$1" component="$2" lines="$3"
-    local provenance source_repo environment line ref commit first=''
-    provenance="$(conf_get "$project" "$component" provenance)"
-    source_repo="$(conf_get "$project" "$component" source_repo)"
-    environment="$(conf_get "$project" "$component" environment)"
-    case "${provenance:-attested}" in
-        none)
-            log "WARNING: $project/$component sets provenance=none: anything pushed to its image repository can be deployed."
-            return 0
-            ;;
-        attested) ;;
-        *) die "$project/$component: provenance= must be 'attested' or 'none'." ;;
-    esac
-    [[ "$source_repo" =~ $REPO_RE ]] && [ "$source_repo" != OWNER/REPO ] \
-        || die "set source_repo= (owner/repository) in $(conf_file "$project" "$component")."
-    [ -n "${KATAP_GH_TOKEN:-}" ] \
-        || die "set KATAP_GH_TOKEN in $KATAP_SETTINGS: the host verifies build provenance before deploying."
-    [[ "${KATAP_GH_TIMEOUT:-60}" =~ ^[0-9]{1,9}$ ]] || die "KATAP_GH_TIMEOUT must be whole seconds (it is '$KATAP_GH_TIMEOUT')."
-    command -v "$KATAP_GH" >/dev/null || die "the GitHub CLI (gh) is not installed; run host/provision.sh again."
-
-    # attested_commit runs in a subshell: the file for gh's messages is made here,
-    # where the exit trap removes it.
-    local err
-    err="$(mktemp)"
-    CLEANUP+=("$err")
-    while IFS= read -r line; do
-        ref="${line#*=}"
-        commit="$(attested_commit "$ref" "$source_repo" "$environment" "$err")" || exit 1
-        # The schema step must come from the same commit as the code that runs on
-        # it. Fails closed: a pair that cannot be compared is not deployed.
-        [[ "$commit" =~ ^[0-9a-f]{40}$ ]] || die "could not read the source commit of $ref from its attestation; nothing was changed."
-        [ -n "$first" ] || first="$commit"
-        [ "$commit" = "$first" ] || die "the images of this release were built from different commits ($first, $commit); nothing was changed."
     done <<<"$lines"
-    log "verified: built by $source_repo at ${first:0:12}."
+    [ -z "$config" ] || rm -rf "$config"
 }
 
 # deploy: pull → pre-deploy dump → predeploy one-shots → rollout → smoke → record.
@@ -863,9 +1003,6 @@ release() {
     lines="$(release_lines "$project" "$component" "$@")"
     cu="$(upper "$component")"
 
-    # Before anything is pulled: the host, not the caller, decides what may run.
-    [ "$mode" != deploy ] || verify_release "$project" "$component" "$lines"
-
     if [ "$mode" = rollback ]; then
         # Only to a release this host has served: a rollback skips the dump and the
         # migrations, so it must never be a way to put a new image live.
@@ -886,12 +1023,7 @@ release() {
     grep -vE "^IMAGE_${cu}(_MIGRATE)?=" "$current" > "$candidate" || true
     printf '%s\n' "$lines" >> "$candidate"
 
-    local ref
-    while IFS= read -r ref; do
-        ref="${ref#*=}"
-        log "pulling $ref."
-        "$KATAP_DOCKER" pull --quiet "$ref" >/dev/null || die "could not pull $ref; nothing was changed."
-    done <<<"$lines"
+    ensure_images "$lines"
 
     if [ "$mode" = deploy ]; then
         backup_component "$project" "$component" predeploy || die "the pre-deploy dump failed; nothing was changed."
@@ -911,6 +1043,7 @@ release() {
             echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) failed $component $(tr '\n' ' ' <<<"$lines")" >> "$state/history"
             die "$mode of '$project/$component' failed and was rolled back."
         fi
+        echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) failed $component $(tr '\n' ' ' <<<"$lines")" >> "$state/history"
         die "$mode of '$project/$component' failed; there is no earlier release to roll back to."
     fi
 
@@ -1143,10 +1276,9 @@ cmd_restore() {
     lock_project "$project"
     [ -n "$(compose "$project" ps -q --status running "$service" 2>/dev/null)" ] || die "$service is not running."
 
-    local ref
-    while IFS= read -r ref; do
-        "$KATAP_DOCKER" pull --quiet "${ref#*=}" >/dev/null || die "could not pull ${ref#*=}; nothing was changed."
-    done <<<"$lines"
+    # Before anything is stopped: a release this host no longer has, and cannot
+    # pull, refuses the restore with the data untouched.
+    ensure_images "$lines"
 
     psql_admin() { compose "$project" exec -T "$service" psql -X -q -v ON_ERROR_STOP=1 -U postgres -d postgres "$@"; }
     local rollout_services current
@@ -1205,7 +1337,7 @@ site_serves() {
 
 # The .conf keys katap.json owns. apply writes them; every other key, the compose
 # file, site.caddy and the secrets stay the operator's after the first apply.
-JSON_KEYS=(image image_migrate source_repo environment domains provenance)
+JSON_KEYS=(image image_migrate environment domains)
 
 # Reads $KATAP_PROJECTS_FILE (or the file given) into WANTED[<project>/<component>/<key>] (type and the
 # JSON_KEYS), WANTED_LIST (<project>/<component>, in file order) and WANTED_HOST.
@@ -1222,7 +1354,7 @@ load_projects_file() {
     [ -f "$file" ] || die "no $file; write it first (docs/projects-file.md)."
     rows="$(jq -r '
         def fail($m): "error\u001f\($m)";
-        def allowed: ["type", "repo", "domains", "environment", "provenance", "image"];
+        def allowed: ["type", "repo", "domains", "environment", "image"];
         if type != "object" then fail("the file must be one JSON object")
         elif ((keys - ["host", "projects"]) | length) > 0 then fail("unknown key(s) \((keys - ["host", "projects"]) | join(", ")); expected host and projects")
         elif ([.. | strings, (objects | keys[]) | select(test("[[:space:][:cntrl:]]"))] | length) > 0 then fail("a name or value contains whitespace or a control character")
@@ -1234,21 +1366,22 @@ load_projects_file() {
                 if (.value | type) != "object" then fail("project \($p) must be an object of components")
                 else .value | to_entries[] | .key as $c | .value as $v |
                     if ($v | type) != "object" then fail("\($p)/\($c) must be an object")
+                    elif ($v | has("provenance")) then fail("\($p)/\($c): provenance is no longer a setting (Katap v2 checks no attestations); remove it")
                     elif ((($v | keys) - allowed) | length) > 0 then fail("\($p)/\($c): unknown key(s) \((($v | keys) - allowed) | join(", "))")
                     elif ([$v.type, $v.repo] | any(type != "string")) then fail("\($p)/\($c): type and repo are required")
-                    elif ([$v.environment, $v.provenance, $v.image] | any(. != null and type != "string")) then fail("\($p)/\($c): environment, provenance and image are strings")
+                    elif ([$v.environment, $v.image] | any(. != null and type != "string")) then fail("\($p)/\($c): environment and image are strings")
                     elif (($v.domains // []) | (type != "array") or any(.[]; type != "string")) then fail("\($p)/\($c): domains must be a list of names")
                     elif ([($v.domains // [])[] | select(test($domain_re) | not)] | length) > 0 then fail("\($p)/\($c): invalid domain '"'"'\([($v.domains // [])[] | select(test($domain_re) | not)][0])'"'"'")
-                    else ["component", $p, $c, $v.type, $v.repo, ($v.image // ""), ($v.environment // "production"), ($v.provenance // "attested"), (($v.domains // []) | join(" "))] | join("\u001f")
+                    else ["component", $p, $c, $v.type, $v.repo, ($v.image // ""), ($v.environment // "production"), (($v.domains // []) | join(" "))] | join("\u001f")
                     end
                 end)
         end' --arg domain_re "$DOMAIN_RE" "$file" 2>&1)" || die "$file is not valid JSON: $rows"
 
-    local kind project component type repo image environment provenance domains d id list
+    local kind project component type repo image environment domains d id list
     declare -A owner=() binding=()
     # The unit separator, not a tab: empty fields (no image, no domains) must not
     # collapse into each other, as runs of whitespace separators do.
-    while IFS=$'\x1f' read -r kind project component type repo image environment provenance domains; do
+    while IFS=$'\x1f' read -r kind project component type repo image environment domains; do
         case "$kind" in
             error) die "$file: $project" ;;
             host)
@@ -1269,7 +1402,6 @@ load_projects_file() {
         [ -n "$image" ] || image="ghcr.io/$(tr '[:upper:]' '[:lower:]' <<<"$repo")"
         [[ "$image" =~ $IMAGE_RE ]] || die "$file: $id: image must be a lowercase repository without a tag or digest."
         case "$environment" in production|staging) ;; *) die "$file: $id: environment must be production or staging." ;; esac
-        case "$provenance" in attested|none) ;; *) die "$file: $id: provenance must be attested or none." ;; esac
         # Split without globbing: a pattern such as *.example.com must reach the
         # check, not expand to nothing (nullglob) and skip it.
         read -ra list <<<"$domains"
@@ -1279,8 +1411,8 @@ load_projects_file() {
             owner[$d]="$id"
         done
         [ -z "${WANTED[$id/type]+set}" ] || die "$file: $id appears twice."
-        # One GitHub environment holds one component's deploy key and names: two
-        # components of one repository in one environment would overwrite each other.
+        # A repository's secrets hold one deploy key per environment: two components
+        # of one repository in one environment would need the same secret names.
         d="$(tr '[:upper:]' '[:lower:]' <<<"$repo")/$environment"
         [ -z "${binding[$d]+set}" ] || die "$file: ${binding[$d]} and $id are both $repo in $environment; a repository deploys one component per environment."
         binding[$d]="$id"
@@ -1292,9 +1424,7 @@ load_projects_file() {
         WANTED[$id/image]="$image"
         WANTED[$id/image_migrate]=''
         ! grep -q '^image_migrate=' "$KATAP_ROOT/templates/$type.conf" || WANTED[$id/image_migrate]="$image-migrate"
-        WANTED[$id/source_repo]="$repo"
         WANTED[$id/environment]="$environment"
-        WANTED[$id/provenance]="$provenance"
         WANTED[$id/domains]="$domains"
     done <<<"$rows"
 
@@ -1339,15 +1469,52 @@ set_conf_keys() {
     mv "$tmp" "$file"
 }
 
-cmd_apply() {
-    [ "$#" -eq 0 ] || die "usage: katap apply   (reads $KATAP_PROJECTS_FILE)"
-    # Everything apply creates must belong to whoever runs deploys, cron and
-    # backups: run as root, it would leave a project the deploy user cannot open.
+# Everything apply creates, and the deploy keys deploy-key and remove write, must
+# belong to whoever runs deploys, cron and backups: run as root, apply would leave
+# a project the deploy user cannot open, and a key would land in root's
+# authorized_keys.
+require_owner() {
     [ -d "$KATAP_PROJECTS" ] && [ -O "$KATAP_PROJECTS" ] \
-        || die "run apply as the owner of $KATAP_PROJECTS: sudo -u deploy $KATAP_ROOT/bin/katap apply"
+        || die "run $1 as the owner of $KATAP_PROJECTS: katap $1 (or sudo -u deploy $KATAP_ROOT/bin/katap $1)"
+}
+
+cmd_apply() {
+    local yes=false
+    case "${1:-}" in
+        --yes) yes=true; shift ;;
+    esac
+    [ "$#" -eq 0 ] || die "usage: katap apply [--yes]   (reads $KATAP_PROJECTS_FILE)"
+    require_owner apply
     load_projects_file
 
     local id project component key created=() updated=() drift=() pairs list umask_before
+
+    # What this run will create or change, shown before anything is written: a
+    # typo in a project name is caught here, not after it became a directory.
+    local plan=()
+    for id in "${WANTED_LIST[@]}"; do
+        project="${id%%/*}"
+        component="${id#*/}"
+        if [ ! -f "$(conf_file "$project" "$component")" ]; then
+            plan+=("create $id (${WANTED[$id/type]})${WANTED[$id/domains]:+, serving ${WANTED[$id/domains]}}")
+            continue
+        fi
+        pairs=()
+        for key in "${JSON_KEYS[@]}"; do
+            [ "$(conf_get "$project" "$component" "$key")" = "${WANTED[$id/$key]}" ] || pairs+=("$key")
+        done
+        [ "${#pairs[@]}" -eq 0 ] || plan+=("update $id: ${pairs[*]}")
+    done
+    if [ "${#plan[@]}" -gt 0 ]; then
+        echo "katap apply will:"
+        printf '  %s\n' "${plan[@]}"
+        if [ "$yes" = false ]; then
+            local answer=''
+            { printf 'Continue? [y/N] ' > /dev/tty && IFS= read -r answer < /dev/tty; } 2>/dev/null \
+                || die "no terminal to confirm on; nothing was changed. Run: katap apply --yes"
+            case "$answer" in y|Y|yes|YES) ;; *) die "nothing was changed." ;; esac
+        fi
+    fi
     declare -A new_component=()
     local projects=() seen=' '
     for id in "${WANTED_LIST[@]}"; do
@@ -1381,6 +1548,18 @@ cmd_apply() {
                 set_conf_keys "$(conf_file "$project" "$component")" "${pairs[@]}"
                 [ -n "${new_component[$id]+set}" ] || updated+=("$id: ${pairs[*]%%=*}")
             fi
+            # Katap v1's keys, which no longer mean anything: left in place, a
+            # .conf would still claim the server checks attestations.
+            local conf
+            conf="$(conf_file "$project" "$component")"
+            if grep -qE '^(source_repo|provenance)=' "$conf"; then
+                local status=0
+                grep -vE '^(source_repo|provenance)=' "$conf" > "$conf.v1" || status=$?
+                [ "$status" -le 1 ] || die "could not read $conf; it is unchanged."
+                chmod --reference="$conf" "$conf.v1" 2>/dev/null || true
+                mv "$conf.v1" "$conf"
+                updated+=("$id: removed v1's source_repo and provenance")
+            fi
             if [ -z "${new_component[$id]+set}" ] && [ "$before" != "${WANTED[$id/domains]}" ]; then
                 drift+=("$id: its domains changed; edit $(project_dir "$project")/site.caddy to match, then run 'katap edge reload'. Values generated from the old domain (APP_URL, API_BASE_URL) stay as they are in $(secrets_dir "$project")/$component.env.")
             fi
@@ -1413,9 +1592,8 @@ cmd_apply() {
 }
 
 # What is left for the operator after apply: the A records, the values only they
-# know, what apply did not touch, and the one command to run on their laptop. All
-# of it is printed from validated values; nothing here is meant to be run blindly
-# except the last line, which carries only the validated host.
+# know, what apply did not touch, and the commands that come next. All of it is
+# printed from validated values.
 apply_report() {
     local id project component d missing spec key generator want have list
     [ "${#created[@]}" -eq 0 ] || { echo "Created:"; printf '  %s\n' "${created[@]}"; }
@@ -1458,47 +1636,342 @@ apply_report() {
             [ -n "${WANTED[$p/$c/type]+set}" ] || unmanaged+=("$p/$c")
         done
     done
-    [ "${#unmanaged[@]}" -eq 0 ] || { echo "Not in $KATAP_PROJECTS_FILE (left as they are; apply never removes anything):"; printf '  %s\n' "${unmanaged[@]}"; }
+    if [ "${#unmanaged[@]}" -gt 0 ]; then
+        echo "Not in $KATAP_PROJECTS_FILE (left as they are; apply never removes anything):"
+        printf '  %s\n' "${unmanaged[@]}"
+        echo "  One that was never deployed is removed with: katap remove <project> <component> --confirm <project>"
+    fi
 
-    echo "Connect every application's repository, from your own computer (it uses your ssh and gh logins):"
-    printf '  curl -fsSL https://raw.githubusercontent.com/jaylordibe/katap/main/connect.sh | bash -s -- root@%s\n' \
-        "${WANTED_HOST:-<this server>}"
+    echo "Next, for each component:"
+    echo "  katap env <project> <component>          fill in its settings"
+    echo "  katap deploy-key <project> <component>   its deploy key, and the secrets to add to its GitHub repository"
 }
 
-# --- release-info ---------------------------------------------------------------
+# --- env, deploy-key, remove ---------------------------------------------------
 
-# What connect.sh needs, as JSON: the release this host runs, its host key, and
-# each component katap.json declares. Data only, built by jq from validated
-# values; connect.sh validates all of it again.
-cmd_release_info() {
-    [ "$#" -eq 0 ] || die "usage: katap release-info"
-    [ -f "$KATAP_RELEASE_FILE" ] || die "no $KATAP_RELEASE_FILE: install Katap with install.sh first."
-    local tag commit hostkey
-    tag="$(file_get "$KATAP_RELEASE_FILE" tag)"
-    commit="$(file_get "$KATAP_RELEASE_FILE" commit)"
-    [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] && [[ "$commit" =~ ^[0-9a-f]{40}$ ]] \
-        || die "$KATAP_RELEASE_FILE does not name a release; run install.sh again."
-    [ -e "$KATAP_ROOT/.git" ] || die "$KATAP_ROOT is not a git checkout, so its release cannot be proved; run install.sh again."
-    require_clean_tool
-    load_projects_file
-    [ -n "$WANTED_HOST" ] || die "set host (this server's public IPv4) in $KATAP_PROJECTS_FILE."
-    hostkey="$(cut -d' ' -f1-2 "$KATAP_HOST_KEY_FILE" 2>/dev/null || true)"
-    [[ "$hostkey" =~ ^ssh-ed25519\ [A-Za-z0-9+/]+=*$ ]] || die "could not read this host's ed25519 key ($KATAP_HOST_KEY_FILE)."
+# Opens a component's settings in an editor, then names what is still empty.
+cmd_env() {
+    [ "$#" -eq 2 ] || die "usage: katap env <project> <component>"
+    require_component "$1" "$2"
+    local file missing
+    file="$(secrets_dir "$1")/$2.env"
+    [ -f "$file" ] || die "no $file yet; run katap apply first."
+    "${VISUAL:-${EDITOR:-nano}}" "$file"
+    missing="$(empty_required "$1" "$2" | tr '\n' ' ')"
+    if [ -n "$missing" ]; then
+        echo "Still empty (deploys are refused until they are set): $missing"
+    else
+        echo "Every required value is set. A change reaches the running application on its next deploy."
+    fi
+}
 
-    local id project component rows=()
-    for id in "${WANTED_LIST[@]}"; do
-        project="${id%%/*}"
-        component="${id#*/}"
-        [ -f "$(conf_file "$project" "$component")" ] || die "$id is not created yet; run 'katap apply' first."
-        rows+=("$(jq -cn --arg project "$project" --arg component "$component" \
-            --arg environment "${WANTED[$id/environment]}" --arg repo "${WANTED[$id/source_repo]}" \
-            --arg image "${WANTED[$id/image]}" --arg image_migrate "${WANTED[$id/image_migrate]}" \
-            --arg domain "$(cut -d' ' -f1 <<<"${WANTED[$id/domains]}")" \
-            --arg smoke_path "$(conf_get "$project" "$component" smoke_path)" \
-            '$ARGS.named')")
+# The forced command that binds a deploy key to one component of one project in
+# one environment. The binding lives here, on the server, never in a request.
+key_binding() { printf 'restrict,command="%s/bin/katap ssh-dispatch %s %s %s"' "$KATAP_ROOT" "$1" "$2" "$3"; }
+
+# Matches the authorized_keys line of <environment> <project> <component>'s key,
+# whichever tool path wrote it. Names are [a-z0-9-], so they are regex-safe.
+key_pattern() { printf 'ssh-dispatch %s %s %s" ' "$1" "$2" "$3"; }
+
+# Rewrites the deploy user's authorized_keys under a lock: every line matching
+# <drop> (an extended regex) removed, then <add> appended when given. Built in the
+# file's own directory and renamed, so sshd never reads half of it; a read error
+# changes nothing.
+rewrite_authorized_keys() {
+    local drop="$1" add="${2:-}" file="$KATAP_AUTHORIZED_KEYS" dir tmp lock status=0
+    dir="$(dirname "$file")"
+    mkdir -p "$dir"
+    chmod 700 "$dir"
+    [ -f "$file" ] || (umask 077 && : > "$file")
+    exec {lock}>"$dir/.katap-keys.lock"
+    flock -w 60 "$lock" || die "another katap command is changing $file; nothing was changed."
+    tmp="$(mktemp "$dir/.authorized_keys.XXXXXX")"
+    CLEANUP+=("$tmp")
+    grep -vE -- "$drop" "$file" > "$tmp" || status=$?
+    [ "$status" -le 1 ] || die "could not read $file; nothing was changed."
+    [ -z "$add" ] || printf '%s\n' "$add" >> "$tmp"
+    chmod 600 "$tmp"
+    mv "$tmp" "$file"
+    exec {lock}>&-
+}
+
+# Makes a component's deploy key: authorises its public half for deploys of this
+# component only, and prints the private half once, with the other values the
+# repository's workflow needs. Nothing of the private key stays on this host.
+cmd_deploy_key() {
+    local replace=false args=() arg
+    for arg in "$@"; do
+        case "$arg" in
+            --replace) replace=true ;;
+            *) args+=("$arg") ;;
+        esac
     done
-    printf '%s\n' "${rows[@]}" | jq -s --arg tag "$tag" --arg commit "$commit" --arg host "$WANTED_HOST" --arg hostkey "$hostkey" \
-        '{tag: $tag, commit: $commit, host: $host, hostkey: $hostkey, components: .}'
+    [ "${#args[@]}" -eq 2 ] || die "usage: katap deploy-key <project> <component> [--replace]"
+    local project="${args[0]}" component="${args[1]}"
+    require_owner deploy-key
+    require_component "$project" "$component"
+    load_projects_file
+    [ -n "$WANTED_HOST" ] || die "set host (this server's public IPv4 address) in $KATAP_PROJECTS_FILE first."
+
+    local environment hostkey binding file
+    environment="$(conf_get "$project" "$component" environment)"
+    case "$environment" in
+        production|staging) ;;
+        *) die "$(conf_file "$project" "$component"): environment= must be production or staging." ;;
+    esac
+    hostkey="$(cut -d' ' -f1-2 "$KATAP_HOST_KEY_FILE" 2>/dev/null || true)"
+    [[ "$hostkey" =~ ^ssh-ed25519\ [A-Za-z0-9+/]+=*$ ]] || die "could not read this server's ed25519 host key ($KATAP_HOST_KEY_FILE)."
+    binding="$(key_binding "$environment" "$project" "$component")"
+    file="$KATAP_AUTHORIZED_KEYS"
+
+    if grep -qE "$(key_pattern "$environment" "$project" "$component")" "$file" 2>/dev/null && [ "$replace" = false ]; then
+        die "$project/$component already has a $environment deploy key. To replace it (the old one stops working at once): katap deploy-key $project $component --replace"
+    fi
+
+    local work
+    work="$(mktemp -d)"
+    CLEANUP+=("$work")
+    chmod 700 "$work"
+    ssh-keygen -q -t ed25519 -N '' -C "katap $project/$component $environment" -f "$work/key"
+    rewrite_authorized_keys "$(key_pattern "$environment" "$project" "$component")" "$binding $(cat "$work/key.pub")"
+    # A v1 key bound to several components also deploys this one; it is the
+    # operator's to remove, since it still speaks for the others.
+    if grep -qE "ssh-dispatch $environment $project ([a-z0-9-]+,)*$component(,[a-z0-9-]+)+\"|ssh-dispatch $environment $project ([a-z0-9-]+,)+$component\"" "$file"; then
+        echo "Note: an older key in $file is bound to $project/$component together with other"
+        echo "components (ssh-dispatch $environment $project <a>,<b>). It still deploys this one; remove that line once"
+        echo "each of those components has its own key."
+        echo
+    fi
+
+    local prefix=KATAP_ release='' url='' domains
+    [ "$environment" = production ] || prefix=KATAP_STAGING_
+    if [ -f "$KATAP_RELEASE_FILE" ]; then
+        release="$(file_get "$KATAP_RELEASE_FILE" commit) # $(file_get "$KATAP_RELEASE_FILE" tag)"
+    fi
+    domains="$(conf_get "$project" "$component" domains)"
+    # A wildcard names no host to check.
+    [ -z "$domains" ] || [[ "$domains" == \** ]] || url="https://${domains%% *}$(conf_get "$project" "$component" smoke_path)"
+
+    cat <<EOF
+A $environment deploy key for $project/$component is authorised on this server. It
+can deploy and roll back $project/$component and nothing else.
+
+Add these as repository secrets in GitHub: open the repository, then
+Settings → Secrets and variables → Actions → New repository secret.
+
+${prefix}SSH_KEY   (every line, including the BEGIN and END lines)
+$(cat "$work/key")
+
+${prefix}HOST
+$WANTED_HOST
+
+${prefix}KNOWN_HOSTS
+$WANTED_HOST $hostkey
+
+The private key above is shown once and is not kept on this server. Clear
+your terminal once it is saved in GitHub.
+
+Then add this step to the repository's workflow, in a job after the one that
+builds and pushes the image, with permissions: packages: read (see
+docs/deploying.md and examples/github-workflow.yml):
+
+      - uses: jaylordibe/katap@${release:-<commit of the Katap release this server runs>}
+        with:
+          host: \${{ secrets.${prefix}HOST }}
+          known-hosts: \${{ secrets.${prefix}KNOWN_HOSTS }}
+          ssh-key: \${{ secrets.${prefix}SSH_KEY }}
+          project: $project
+          component: $component
+          image: \${{ needs.build.outputs.image }}
+EOF
+    [ -z "$(conf_get "$project" "$component" image_migrate)" ] \
+        || echo "          migrate-image: \${{ needs.build.outputs.migrate-image }}"
+    [ -z "$url" ] || echo "          url: $url"
+}
+
+# Removes components that were never deployed: a typo in katap.json, or one
+# created by mistake. Anything that ever served, or holds data, is refused:
+# removing those is deliberate work for a person, never for this command.
+# Removes <component>'s site block from <site> when it is exactly the block apply
+# wrote; a block edited since is left in place, with a note, rather than guessed at.
+remove_site_block() {
+    local project="$1" component="$2" site="$3" type domains port block content
+    [ -f "$site" ] || return 0
+    type="$(conf_get "$project" "$component" type)"
+    domains="$(conf_get "$project" "$component" domains)"
+    if [ -z "$domains" ] || [ ! -f "$KATAP_ROOT/templates/$type.site" ]; then
+        ! grep -q "^# $component (" "$site" || echo "Note: $site still has a block for $project/$component; remove it by hand."
+        return 0
+    fi
+    port="$(file_get "$KATAP_ROOT/templates/$type.conf" port)"
+    domains="${domains// /, }"
+    block="$(sed -e "s/__C__/$component/g" -e "s/__DOMAINS__/$domains/" \
+        -e "s/__UPSTREAM__/$project-$component:$port/" "$KATAP_ROOT/templates/$type.site")"
+    content="$(cat "$site")"
+    if [[ "$content" == *"$block"* ]]; then
+        content="${content/"$block"/}"
+        # Drop the blank lines the removal leaves at either end.
+        content="$(printf '%s\n' "$content" | sed -e '/./,$!d' | tac | sed -e '/./,$!d' | tac)"
+        printf '%s' "$content${content:+$'\n'}" > "$site"
+    else
+        echo "Note: $project/$component's block in $site was edited after apply wrote it; remove it by hand."
+    fi
+}
+
+cmd_remove() {
+    local args=() confirm=''
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --confirm)
+                confirm="${2:-}"
+                if [ "$#" -ge 2 ]; then shift 2; else shift; fi
+                ;;
+            *) args+=("$1"); shift ;;
+        esac
+    done
+    [ "${#args[@]}" -ge 1 ] && [ "${#args[@]}" -le 2 ] && [ -n "$confirm" ] \
+        || die "usage: katap remove <project> [<component>] --confirm <project>"
+    local project="${args[0]}" components=() component
+    require_owner remove
+    require_project "$project"
+    [ "$confirm" = "$project" ] || die "--confirm must repeat the project name."
+    if [ "${#args[@]}" -eq 2 ]; then
+        require_component "$project" "${args[1]}"
+        components=("${args[1]}")
+    else
+        mapfile -t components < <(components_of "$project")
+    fi
+
+    [ ! -f "$KATAP_PROJECTS_FILE" ] || load_projects_file
+    lock_project "$project"
+    local state history containers volumes
+    state="$(state_dir "$project")"
+    history="$state/history"
+    # Docker not answering is a refusal: an empty list must mean nothing ran.
+    containers="$("$KATAP_DOCKER" ps -a --filter "label=com.docker.compose.project=$project" --format '{{.Label "com.docker.compose.service"}}')" \
+        || die "could not list $project's containers; nothing was removed."
+    volumes="$("$KATAP_DOCKER" volume ls --filter "label=com.docker.compose.project=$project" --format '{{.Label "com.docker.compose.volume"}}')" \
+        || die "could not list $project's volumes; nothing was removed."
+    for component in "${components[@]}"; do
+        [ -z "${WANTED[$project/$component/type]+set}" ] \
+            || die "$project/$component is in $KATAP_PROJECTS_FILE; remove it there first, or the next apply creates it again."
+        ! released "$project" "$component" || die "$project/$component has a release serving; it was deployed, so this command will not remove it."
+        ! awk -v c="$component" '$3 == c { found = 1 } END { exit !found }' "$history" 2>/dev/null \
+            || die "$project/$component has been deployed, or a deploy was attempted (see $history); this command will not remove it."
+        ! grep -qE "^$component(-[a-z0-9-]+)?$" <<<"$containers" || die "$project/$component has containers; this command removes only what never ran."
+        ! grep -qE "^$component(-[a-z0-9-]+)?$" <<<"$volumes" || die "$project/$component has data volumes; this command never removes data."
+    done
+
+    # Removing the last component removes the project's directories whole, so
+    # nothing in them may belong to anything else: a component whose files were
+    # deleted by hand still has its secrets, history and volumes there.
+    local left removing=" ${components[*]} "
+    left="$(components_of "$project" | grep -vxF -f <(printf '%s\n' "${components[@]}") || true)"
+    if [ -z "$left" ]; then
+        [ -z "$containers$volumes" ] || die "$project still has containers or volumes ($(tr '\n' ' ' <<<"$containers$volumes")); this command never removes data."
+        [ ! -s "$history" ] || die "$project has deployed before (see $history); this command will not remove it."
+        local f name
+        for f in "$state"/images.* "$(secrets_dir "$project")"/*; do
+            case "$f" in
+                "$state"/*) [ ! -s "$f" ] || die "$project has release state ($f); this command will not remove it."; continue ;;
+            esac
+            name="$(basename "$f")"
+            name="${name%%.*}"
+            name="${name%-db-tls}"
+            [[ "$removing" == *" $name "* ]] || die "$project has secrets of a component that is not being removed ($f); this command will not remove them."
+        done
+    fi
+
+    local dir secrets site
+    dir="$(project_dir "$project")"
+    secrets="$(secrets_dir "$project")"
+    site="$dir/site.caddy"
+    for component in "${components[@]}"; do
+        remove_site_block "$project" "$component" "$site"
+        rm -f -- "${dir:?}/${component:?}.yml" "${dir:?}/${component:?}.conf" \
+            "${secrets:?}/${component:?}.env" "${secrets:?}/${component:?}.db.env" "${secrets:?}/${component:?}.redis.env"
+        rm -rf -- "${secrets:?}/${component:?}-db-tls"
+        if [ -f "$KATAP_AUTHORIZED_KEYS" ]; then
+            rewrite_authorized_keys "$(key_pattern '(production|staging)' "$project" "$component")"
+            ! grep -qE "ssh-dispatch [a-z]+ $project ([a-z0-9-]+,)*$component(,[a-z0-9-]+)*\"" "$KATAP_AUTHORIZED_KEYS" \
+                || echo "Note: an older key in $KATAP_AUTHORIZED_KEYS is bound to $project/$component together with other components; remove that line by hand."
+        fi
+        log "removed $project/$component."
+    done
+    if [ -z "$left" ]; then
+        rm -rf -- "${KATAP_PROJECTS:?}/${project:?}" "${KATAP_SRV:?}/secrets/${project:?}" \
+            "${KATAP_SRV:?}/state/${project:?}" "${KATAP_SRV:?}/state/.dispatch/${project:?}"
+        rmdir "${KATAP_SRV:?}/backups/${project:?}" 2>/dev/null || true
+        log "removed project $project."
+    fi
+    exec 9>&-
+    edge_reload || die "the edge rejected the remaining sites; the previous configuration keeps serving."
+}
+
+# --- images ---------------------------------------------------------------------
+
+# The image repositories <project>... name, one per line.
+repo_names() {
+    local p c
+    for p in "$@"; do
+        for c in $(components_of "$p"); do
+            conf_get "$p" "$c" image; echo
+            conf_get "$p" "$c" image_migrate; echo
+        done
+    done | sed '/^$/d' | sort -u
+}
+
+# Removes images of Katap's components that no release needs any more. Kept: what
+# serves now, a deploy in progress, the last $KATAP_RELEASES_KEPT deploys of each
+# component (rollback targets), and every release a kept database dump records
+# (restore targets). Each project is locked without waiting: a busy one is
+# skipped, and every image of its repositories kept, so housekeeping never holds
+# up a deploy or a scheduled job. Images of anything else on the host are left
+# alone; dangling layers are pruned.
+cmd_images() {
+    [ "${1:-}" = prune ] && [ "$#" -eq 1 ] || die "usage: katap images prune"
+    [[ "$KATAP_RELEASES_KEPT" =~ ^[0-9]{1,4}$ ]] && [ "$KATAP_RELEASES_KEPT" -ge 1 ] \
+        || die "KATAP_RELEASES_KEPT must be a whole number of at least 1 (it is '$KATAP_RELEASES_KEPT')."
+    local project projects=() locked=() busy=() fds=() fd
+    mapfile -t projects < <(all_projects)
+    for project in "${projects[@]}"; do
+        ensure_state "$project"
+        exec {fd}>"$(state_dir "$project")/.lock"
+        if flock -n "$fd"; then
+            fds+=("$fd")
+            locked+=("$project")
+        else
+            exec {fd}>&-
+            busy+=("$project")
+            log "$project is busy; its images are kept this time."
+        fi
+    done
+
+    # Every repository named by any project, and the ones a busy project names:
+    # an image of those is never removed this run.
+    local keep repos busy_repos component f line removed=0
+    repos="$(repo_names "${projects[@]}")"
+    busy_repos="$(repo_names "${busy[@]}")"
+    keep="$(
+        for project in "${locked[@]}"; do
+            cat "$(state_dir "$project")"/images.* 2>/dev/null || true
+            for component in $(components_of "$project"); do
+                awk -v c="$component" '$2 == "deploy" && $3 == c { $1 = $2 = $3 = ""; print }' \
+                    "$(state_dir "$project")/history" 2>/dev/null | tail -n "$KATAP_RELEASES_KEPT" | tr ' ' '\n'
+            done
+            for f in "$KATAP_SRV/backups/$project"/*.dump.images; do [ ! -f "$f" ] || cat "$f"; done
+        done | sed -n 's/^IMAGE_[A-Z0-9_]*=//p' | sort -u
+    )"
+    while IFS= read -r line; do
+        [ -n "$line" ] && [ "${line##*@}" != '<none>' ] || continue
+        grep -qxF -- "${line%@*}" <<<"$repos" || continue
+        ! grep -qxF -- "${line%@*}" <<<"$busy_repos" || continue
+        ! grep -qxF -- "$line" <<<"$keep" || continue
+        if "$KATAP_DOCKER" image rm "$line" >/dev/null 2>&1; then removed=$((removed + 1)); fi
+    done < <("$KATAP_DOCKER" image ls --digests --format '{{.Repository}}@{{.Digest}}' 2>/dev/null || true)
+    "$KATAP_DOCKER" image prune --force >/dev/null 2>&1 || true
+    for fd in "${fds[@]}"; do exec {fd}>&-; done
+    log "removed $removed image(s) no release needs."
 }
 
 # --- ssh-dispatch ---------------------------------------------------------------
@@ -1506,7 +1979,7 @@ cmd_release_info() {
 # The forced command of an application's deploy key:
 #   restrict,command="/srv/katap/bin/katap ssh-dispatch <environment> <project> <component>[,...]"
 # It admits exactly `deploy` and `rollback` of those components; every argument is
-# validated again by them.
+# validated again by them. `katap deploy-key` writes that line.
 cmd_ssh_dispatch() {
     # The binding comes from the key's forced command, never from the request.
     local environment="${1:-}" bound_project="${2:-}" bound_components="${3:-}"
@@ -1515,7 +1988,7 @@ cmd_ssh_dispatch() {
         *) die "refused: this key has no environment (authorized_keys: command=\"…/katap ssh-dispatch <production|staging> <project> <component>\")." ;;
     esac
     [[ "$bound_project" =~ $PROJECT_RE ]] && [[ "$bound_components" =~ ^[a-z][a-z0-9]{0,19}(,[a-z][a-z0-9]{0,19})*$ ]] \
-        || die "refused: this key names no project and component; run host/provision.sh again with --ci-project and --ci-component."
+        || die "refused: this key names no project and component; make a new one with: katap deploy-key <project> <component> --replace"
 
     local request="${SSH_ORIGINAL_COMMAND:-}"
     [[ "$request" =~ ^[A-Za-z0-9\ ._:/@=-]+$ ]] || die "refused: the request contains characters outside the allowed set."
@@ -1538,6 +2011,25 @@ cmd_ssh_dispatch() {
         esac
     done
     words+=("env=$environment")
+
+    # The registry login for this deploy comes on standard input, never in the
+    # request: the request is logged, the login is not. At most one line,
+    # `registry <user> <token>`, read within 10 seconds and 512 bytes and before
+    # any lock is taken, so a client that never closes its input holds nothing.
+    # Only a GitHub Actions job token (ghs_…) is accepted: it expires with the job.
+    local login='' status=0
+    IFS= read -r -t 10 -n 512 login || status=$?
+    [ "$status" -le 128 ] || [ -z "$login" ] || die "refused: the registry login did not arrive within 10 seconds."
+    login="${login%$'\r'}"
+    if [ -n "$login" ]; then
+        local word user token extra
+        read -r word user token extra <<<"$login"
+        [ "$word" = registry ] && [ -z "$extra" ] && [ "$login" = "registry $user $token" ] \
+            && [[ "$user" =~ $REGISTRY_USER_RE ]] && [[ "$token" =~ $JOB_TOKEN_RE ]] \
+            || die "refused: standard input must be one line, 'registry <user> <GitHub Actions token>'."
+        login="$user $token"
+    fi
+
     local client="${SSH_CONNECTION:-}"
     client="${client%% *}"
     command -v logger >/dev/null \
@@ -1566,6 +2058,16 @@ cmd_ssh_dispatch() {
         die "refused: this key ($bound_project/{$bound_components}) dispatched less than ${cooldown}s ago; try again shortly."
     fi
 
+    # The login reaches the worker in a 0600 file in this 0700 directory, which
+    # the worker reads once and removes: never an argument, never the environment
+    # of anything but the worker's first instruction.
+    local login_file=''
+    if [ -n "$login" ]; then
+        login_file="$(mktemp "$dir/.registry.XXXXXX")"
+        printf '%s\n' "$login" > "$login_file"
+        login=''
+    fi
+
     # The work outlives the SSH session: a cancelled workflow or a dropped
     # connection must never stop a deploy between its steps. It runs with HUP and
     # PIPE ignored and its output in a log, which the session follows while it lasts.
@@ -1574,7 +2076,8 @@ cmd_ssh_dispatch() {
     (
         trap '' HUP PIPE
         status=0
-        "$KATAP_SELF" "${words[@]}" >"$log" 2>&1 || status=$?
+        KATAP_REGISTRY_FILE="$login_file" "$KATAP_SELF" "${words[@]}" >"$log" 2>&1 || status=$?
+        [ -z "$login_file" ] || rm -f "$login_file"
         echo "$status" > "$log.status"
         touch "$last"
     ) </dev/null &
@@ -1612,7 +2115,10 @@ main() {
         restore) cmd_restore "$@" ;;
         check) cmd_check "$@" ;;
         apply) cmd_apply "$@" ;;
-        release-info) cmd_release_info "$@" ;;
+        env) cmd_env "$@" ;;
+        deploy-key) cmd_deploy_key "$@" ;;
+        remove) cmd_remove "$@" ;;
+        images) cmd_images "$@" ;;
         ssh-dispatch) cmd_ssh_dispatch "$@" ;;
         help|-h|--help) awk 'NR > 2 && /^#/ { sub(/^# ?/, ""); print; next } NR > 2 { exit }' "$KATAP_ROOT/bin/katap" ;;
         *) die "unknown command '$command'; see 'katap help'." ;;

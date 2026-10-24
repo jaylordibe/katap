@@ -2,11 +2,11 @@
 
 `/srv/katap.json` says which projects and components the server runs. `katap apply`
 creates what is missing and keeps the rest in line with it. Edit the file as root,
-then apply as the deploy user:
+then apply:
 
 ```bash
 sudo nano /srv/katap.json
-sudo -u deploy /srv/katap/bin/katap apply
+katap apply
 ```
 
 ## The file
@@ -28,14 +28,13 @@ sudo -u deploy /srv/katap/bin/katap apply
 
 | Key | Required | Meaning |
 |---|---|---|
-| `host` | for DNS and connect | The server's public IPv4 address. Printed in the DNS records; the address applications deploy to |
+| `host` | for DNS and deploy keys | The server's public IPv4 address. Printed in the DNS records, and in `katap deploy-key`'s secrets: the address applications deploy to |
 | `projects.<project>` | | Lowercase letters, digits and hyphens, starting with a letter (30 at most). Each project gets its own network, database and Redis per component |
 | `.<component>` | | Lowercase letters and digits, no hyphen (20 at most) |
 | `type` | yes | `laravel-api`, `nestjs-api`, `spa` or `node-ssr` (a file in `templates/`) |
 | `repo` | yes | The GitHub repository that builds the image, `owner/name`. Only its own publish workflow's builds deploy. One repository deploys one component per environment |
 | `domains` | no | Where it is served. None: internal only |
 | `environment` | no | `production` (default) or `staging`. Put a staging copy in its own project, as above |
-| `provenance` | no | `attested` (default): only images GitHub attests were built by `repo`'s `publish-image.yml`. `none`: for a private repository on a plan without attestations; anything pushed to the image repository can then deploy |
 | `image` | no | The image repository. Default `ghcr.io/<repo>`, lowercased |
 
 Never put a secret in this file; secrets live in `/srv/secrets`. The file is owned
@@ -51,10 +50,13 @@ Before writing anything, apply checks the whole file:
 - that each domain belongs to one component across every project, including components made by hand, and is not still served by another component's `.conf` or `site.caddy`;
 - that no existing component changes type, and no repository is listed twice for one environment.
 
-The first problem stops it, with nothing written. Then, for each project:
+The first problem stops it, with nothing written. Then it lists what it will
+create or change, and asks before writing anything. With no terminal to ask on,
+it needs `katap apply --yes`. With nothing to create or change, it asks nothing.
+Then, for each project:
 
 - **A new component** is created exactly as `katap add` would: its compose file, its `.conf` and a block in `site.caddy`. Then its secrets are generated as `katap secrets` would. A laravel-api's `APP_FRONTEND_URL` and `CORS_ALLOWED_ORIGINS`, and a nestjs-api's `WEB_BASE_URL` and `CORS_ORIGIN`, come from the project's one spa or node-ssr component with domains. With none or several, they stay for you to fill in.
-- **An existing component** has only the keys this file owns rewritten in its `.conf`: `image`, `image_migrate`, `source_repo`, `environment`, `domains` and `provenance`. Its type never changes.
+- **An existing component** has only the keys this file owns rewritten in its `.conf`: `image`, `image_migrate`, `environment` and `domains`. Its type never changes.
 
 Then it reloads the edge (validated first; nothing happens while the edge is
 down), and prints:
@@ -62,7 +64,7 @@ down), and prints:
 - the values still empty (a deploy is refused while one is);
 - anything to check by hand;
 - components the file does not mention;
-- the laptop command that connects every application (see [Connecting applications](connecting-apps.md)).
+- what to do next: `katap env` and `katap deploy-key` for each component (see [Deploying](deploying.md)).
 
 Running it again changes nothing.
 
@@ -93,8 +95,23 @@ does not parse at all); a problem in another project's part holds only that
 project. A rollback never reads it: the way back does not depend on a file being
 edited.
 
-Run apply as the deploy user (`sudo -u deploy`); it refuses to run as anyone who
-does not own `/srv/projects`, so a project is never left owned by root.
+Apply runs as the deploy user, which the `katap` command does for you; run as
+anyone who does not own `/srv/projects`, it refuses, so a project is never left
+owned by root.
+
+## Removing a mistake
+
+A component created by mistake (a typo in a project name, say) and never
+deployed: remove it from `/srv/katap.json` first, then
+
+```bash
+katap remove <project> <component> --confirm <project>
+```
+
+Without a component, every component of the project goes, and then the project.
+It removes the compose file, the `.conf`, the site block, the generated settings
+and the deploy key, and reloads the edge. It refuses anything that has served a
+release, has containers or holds data: removing those is deliberate work, by hand.
 
 ## Application settings
 
@@ -112,11 +129,10 @@ does not own `/srv/projects`, so a project is never left owned by root.
 | `node-ssr` | None. Add the runtime variables your server reads | Your application |
 | `spa` | None. A static site reads no runtime settings; see [build-time settings](reference.md#build-time-and-runtime-settings) | Your application |
 
-**Edit the file** as the deploy user (*server SSH session*):
-`sudo -u deploy nano /srv/secrets/<project>/<component>.env`. Add the values the
-starter's documentation asks for, such as mail credentials and the settings for a
-storage provider. Run `katap apply` again to list required values that are still
-empty, by name only.
+**Edit the file** (*server SSH session*): `katap env <project> <component>`. It
+opens the file in an editor, then lists the required values still empty, by name
+only. Add the values the starter's documentation asks for, such as mail
+credentials and the settings for a storage provider.
 
 **Katap only checks that marked values aren't empty.** It doesn't check that a
 value is valid, that a mail provider accepts the credentials, or that a bucket
@@ -140,50 +156,24 @@ such as the database, are left alone unless their own configuration changed.
 
 ### Applying a settings change without a new build
 
-Redeploy the build that's running now. Don't redeploy `main`: `main` is a moving tag
-and may point to a newer build. The Deploy workflow takes a **tag**, not a digest, so
-you need the running build's `sha-<full commit>` tag. Katap records only the
-digest, and its deploy log keeps just the first 12 characters of the commit. The
-full commit comes from the image's attestation.
-
-*Server SSH session, as `deploy`* (`sudo -iu deploy`). The placeholders are
-`shop`/`api` and `your-org/shop-api`:
+Deploy the release that is serving now again, on the server. It is already
+there, so nothing is pulled (*server SSH session*, for `shop`/`api`):
 
 ```bash
-grep '^IMAGE_API' /srv/state/shop/images.env    # IMAGE_API=ghcr.io/your-org/shop-api@sha256:…, plus IMAGE_API_MIGRATE for a nestjs-api
-REF="$(sed -n 's/^IMAGE_API=//p' /srv/state/shop/images.env)"
-COMMIT="$(GH_TOKEN="$(sed -n 's/^KATAP_GH_TOKEN=//p' /etc/katap/katap.env | tail -n 1)" \
-  gh attestation verify "oci://$REF" --repo your-org/shop-api \
-  --signer-workflow your-org/shop-api/.github/workflows/publish-image.yml --format json \
-  | jq -r '.[0].verificationResult.signature.certificate.sourceRepositoryDigest')"
-echo "commit: $COMMIT"
+katap deploy shop api "$(sed -n 's/^IMAGE_API=//p' /srv/state/shop/images.env)"
 ```
 
-That prints the full 40-character commit, from the same field Katap reads. Before
-using its tag, confirm that the tag still names the running digest:
+A nestjs-api also passes its migrate image:
+`migrate="$(sed -n 's/^IMAGE_API_MIGRATE=//p' /srv/state/shop/images.env)"`.
 
-```bash
-echo "running: ${REF#*@}"
-docker buildx imagetools inspect "ghcr.io/your-org/shop-api:sha-$COMMIT" | grep '^Digest:'
-```
-
-- **The digests match:** deploy with **Run workflow**, choosing the same environment and the tag `sha-` followed by that commit.
-- **A nestjs-api** derives its migrate image from the same tag. Check `ghcr.io/your-org/shop-api-migrate:sha-<commit>` the same way against `IMAGE_API_MIGRATE`.
-- **Any digest differs, or a command fails:** stop. That tag doesn't reproduce the running build.
-
-This is a normal deploy. It verifies provenance again, takes a pre-deploy dump,
-runs the template's pre-deploy steps again (migrations, which apply nothing when
-none are pending, and steps such as laravel-api's permissions sync), rolls out with
-healthchecks and the smoke check, and rolls back automatically if the release
-never becomes healthy.
-
-**Limits:**
-- For a component with `"provenance": "none"` there's no attestation, so the commit can't be recovered this way. Use the commit from the Deploy run that put this build live: its log prints the digest (`Deploying: …`), and its inputs show the tag. If that tag was `main`, find the publish run whose summary shows the same digest.
-- If the `sha-` tag has been deleted from the registry, the Deploy workflow can't select that build at all.
+This is a normal deploy: a pre-deploy dump, the template's pre-deploy steps
+(migrations, which apply nothing when none are pending), the rollout with
+healthchecks and the smoke check, and an automatic rollback if the release never
+becomes healthy.
 
 ## Without the file
 
 `katap add <project> <type> <component> [domain...]` and `katap secrets <project>
-<component>` still create one component by hand. You then set `image=` and
-`source_repo=` in its `.conf` yourself. Apply leaves such components alone; it only
+<component>` still create one component by hand. You then set `image=` in its
+`.conf` yourself. Apply leaves such components alone; it only
 refuses to give one of their domains to another component.

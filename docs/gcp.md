@@ -41,7 +41,7 @@ Action or your own workflow. Katap doesn't provide or test that.
 
 Keep two kinds of keys apart:
 
-- **Your administrator key**: a metadata SSH key, or OS Login. Use it to install, apply and run `connect.sh`.
+- **Your administrator key**: a metadata SSH key, or OS Login. Use it to install Katap and run `katap`.
 - **Katap's deploy keys**: local to the VM, in `~deploy/.ssh/authorized_keys`, each restricted to one component.
 
 Never put your administrator private key, or any key added through metadata or OS
@@ -52,7 +52,7 @@ Login, into a GitHub secret. See [The SSH keys involved](../README.md#the-ssh-ke
 With OS Login off, the guest environment creates the local account named in a
 metadata key and installs that key for it. To use such an account with Katap:
 
-- Check that it has passwordless sudo: `ssh <user>@<address> sudo -n true`.
+- Check that it has sudo: `ssh <user>@<address> sudo true`.
 - Don't add a metadata key for the username `deploy`. Google notes that keys written directly to `authorized_keys` may be overwritten by the guest agent for accounts it manages, and Katap's deploy keys live in `deploy`'s `authorized_keys`.
 
 ### OS Login
@@ -63,20 +63,19 @@ and UID differ from the OS Login accounts. The `deploy` user is such a local
 account, so deploys keep working. With OS Login on, metadata SSH keys are ignored.
 See [About OS Login](https://docs.cloud.google.com/compute/docs/oslogin).
 
-Two parts of Katap have limits under OS Login. Both come from how Katap's scripts
-behave:
-
-- **`install.sh --harden-ssh`** refuses unless an `authorized_keys` *file* exists for the sudo user or for root. OS Login supplies keys without such a file, so with an OS Login account the check refuses unless root has one. Hardening also turns off keyboard-interactive login, which two-step verification prompts may rely on (**unverified**: test it before relying on it). Skip `--harden-ssh` and use OS Login's own controls instead.
-- **`connect.sh`** runs `ssh` with `BatchMode=yes` and `sudo -n`. It can't answer an OS Login two-step verification prompt or a sudo password. With OS Login 2FA on, run `connect.sh` as a local administrator account with a key and passwordless sudo, or follow [Doing it by hand](connecting-apps.md#doing-it-by-hand).
+One part of Katap has a limit under OS Login: **`install.sh --harden-ssh`**
+refuses unless an `authorized_keys` *file* exists for the sudo user or for root.
+OS Login supplies keys without such a file, so with an OS Login account the check
+refuses unless root has one. Hardening also turns off keyboard-interactive login,
+which two-step verification prompts may rely on (**unverified**: test it before
+relying on it). Skip `--harden-ssh` and use OS Login's own controls instead.
 
 **Permissions for the human administrator.** These are IAM roles granted to *your*
 Google account, not to the VM (see
 [Set up OS Login](https://docs.cloud.google.com/compute/docs/oslogin/set-up-oslogin)):
-- `roles/compute.osAdminLogin`, on the project or the instance: login with sudo, which installing Katap and running `connect.sh` need. `roles/compute.osLogin` alone gives login without sudo.
+- `roles/compute.osAdminLogin`, on the project or the instance: login with sudo, which installing Katap and running `katap` need. `roles/compute.osLogin` alone gives login without sudo.
 - `roles/iam.serviceAccountUser`, granted **on the VM's attached service account**, when the VM has one. Google requires it for every user who connects to such a VM.
 - `roles/iap.tunnelResourceAccessor`, only if you connect through IAP.
-
-Check that sudo doesn't ask for a password with `sudo -n true`.
 
 **These grants are separate from the VM service account's own permissions**
 (below). `roles/iam.serviceAccountUser` lets *you* act as that service account. It
@@ -95,8 +94,8 @@ action (see
 So choosing "Allow full access to all Cloud APIs":
 
 - grants no IAM permission;
-- gives the server no GitHub access: it still needs `KATAP_GH_TOKEN` to deploy components that verify provenance, and a registry login for private images;
-- gives GitHub Actions no access to the VM: deploys still use the deploy keys from `connect.sh`.
+- gives the server no GitHub access, which it doesn't need: each deploy brings its own token for a private image;
+- gives GitHub Actions no access to the VM: deploys use the deploy keys from `katap deploy-key`.
 
 ## Backups to Cloud Storage
 

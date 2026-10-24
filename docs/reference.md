@@ -2,21 +2,21 @@
 
 ## Commands
 
-`/srv/katap/bin/katap help` prints them all; the list lives at the top of
-[`bin/katap`](../bin/katap). Run them as the deploy user.
+`katap help` prints them all; the list lives at the top of
+[`bin/katap`](../bin/katap). The `katap` command the installer puts in
+`/usr/local/bin` runs them as the deploy user, who owns every project.
 
 ## Layout
 
 ```text
 install.sh                     the one-line installer (served from main; installs a release)
-connect.sh                     connects application repositories (runs on your computer)
 bin/katap                      the CLI (bash 5; runs on the server)
 action.yml, action/            the deploy action applications use
-edge/                          the shared Caddy: compose.yml, Caddyfile, edge.env (defaults)
+edge/                          the shared Caddy: compose.yml, Caddyfile, edge.env (defaults), Cloudflare's origin-pull CA
 templates/<type>.*             compose file, deploy settings, secret spec and site block per type
 host/provision.sh              prepares a server; host/systemd/ holds its timers
 lib/                           smoke check, PostgreSQL entrypoint, TLS and app role
-examples/                      publish-image.yml and deploy.yml for application repositories
+examples/                      github-workflow.yml: build, push and deploy, for application repositories
 tests/                         static, unit and end-to-end tests
 ```
 
@@ -49,10 +49,8 @@ On the server:
 
 ## What each template expects from an image
 
-Every application repository needs:
-- **Its own `Dockerfile`.** Katap and `examples/publish-image.yml` don't create one.
-- **The publish workflow at exactly `.github/workflows/publish-image.yml`.** The server checks that the attestation was signed by that path, and refuses any other.
-- **Real tests in that workflow.** The example's `test` job only prints a message, so replace it.
+Every application repository needs its own `Dockerfile`, and a workflow that
+builds and pushes the image: see [Deploying](deploying.md).
 
 | Template | Must serve | Healthcheck needs | Smoke check |
 |---|---|---|---|
@@ -79,20 +77,20 @@ contains `wget` (alpine-based Node images do). Katap's generated settings set
 
 ### laravel-api and nestjs-api
 
-Use their own `Dockerfile` and `publish-image.yml`, as shipped. A `nestjs-api`
-component also needs the `-migrate` image that its workflow publishes alongside.
+Use their own `Dockerfile`, as shipped. A `nestjs-api` component also needs the
+`-migrate` image, built from the `migrate` target of the same commit.
 An arbitrary Laravel or NestJS image doesn't meet these templates' contracts.
 
 ### Build-time and runtime settings
 
-- **A static SPA** has no server process to read settings, so values such as the API's address are fixed when the image is built. Pass them as build arguments in `publish-image.yml`. A change means a new build.
+- **A static SPA** has no server process to read settings, so values such as the API's address are fixed when the image is built. Pass them as build arguments in the workflow that builds the image. A change means a new build.
 - **A server-rendered app or an API** reads runtime settings from its `.env` file on the server. A change means a new deploy: see [Application settings](projects-file.md#application-settings).
 
 A generic example. The variable names are placeholders: use the names your
 application's build actually reads.
 
 ```yaml
-# .github/workflows/publish-image.yml, in the "Build and push" step
+# the workflow's "Build and push" step
         with:
           context: .
           build-args: |
@@ -169,15 +167,21 @@ In this mode, Caddy:
 - takes the client's address from `CF-Connecting-IP`.
 
 1. *Cloudflare dashboard:* set **SSL/TLS** encryption mode to **Full (strict)**.
-2. *Cloudflare dashboard:* create an origin certificate under **SSL/TLS → Origin Server → Origin Certificates → Create Certificate**. Cover every domain the server serves and choose the PEM format. Save the certificate as `origin.pem` and the private key as `origin.key`. Cloudflare shows the key only once. Browsers don't trust this certificate: only Cloudflare does. Cloudflare doesn't send expiry reminders for it ([Origin CA](https://developers.cloudflare.com/ssl/origin-configuration/origin-ca/)).
-3. *Cloudflare dashboard:* download the Authenticated Origin Pulls CA certificate (the [`authenticated_origin_pull_ca.pem`](https://developers.cloudflare.com/ssl/static/authenticated_origin_pull_ca.pem) file Cloudflare's documentation links), and save it as `cf-origin-pull-ca.pem`. Then turn on **SSL/TLS → Origin Server → Authenticated Origin Pulls → Global**.
-4. *Server SSH session:* create the three files in `/srv/edge/certs` as the deploy user, for example `sudo -u deploy nano /srv/edge/certs/origin.key`. Then lock down the key: `sudo -u deploy chmod 600 /srv/edge/certs/origin.key`.
-5. *Server SSH session:* set `TLS_MODE=cloudflare` in `/srv/edge/edge.env` (`sudo -u deploy nano /srv/edge/edge.env`), then run `sudo -u deploy /srv/katap/bin/katap edge up`.
-6. *Cloudflare dashboard:* switch the DNS records to **Proxied**.
+2. *Cloudflare dashboard:* create an origin certificate under **SSL/TLS → Origin Server → Origin Certificates → Create Certificate**, covering every domain the server serves, in PEM format. Keep the page open: Cloudflare shows the private key only once. Browsers don't trust this certificate, only Cloudflare does, and Cloudflare sends no expiry reminders for it ([Origin CA](https://developers.cloudflare.com/ssl/origin-configuration/origin-ca/)).
+3. *Server SSH session:*
+   ```bash
+   katap edge cloudflare
+   ```
+   Paste the certificate, then the private key, when it asks. Or pass two files: `katap edge cloudflare origin.pem origin.key`. It:
+   - checks that the key belongs to the certificate;
+   - installs both, with Cloudflare's origin-pull CA certificate (shipped with Katap, valid until 2029);
+   - restarts the edge in Cloudflare mode, or puts the previous mode back if it fails;
+   - then sets `TRUST_CLOUDFLARE_HEADERS=true` for every nestjs-api, and names the components whose next deploy picks it up.
+4. *Cloudflare dashboard:* turn on **SSL/TLS → Origin Server → Authenticated Origin Pulls → Global**, then switch the DNS records to **Proxied**.
 
-After switching to or from `cloudflare`, update a nestjs-api's
-`TRUST_CLOUDFLARE_HEADERS` by hand: it reflects the mode at the time its secrets
-were generated.
+**Back to Let's Encrypt:** `katap edge acme`. It sets `TRUST_CLOUDFLARE_HEADERS=false`
+first, then switches the edge, and names the components to deploy now: until
+they are, their running release still trusts a header any client can send.
 
 **Checks.** Each one proves one thing. A failed connection only counts as evidence
 when it fails for the expected reason.
@@ -209,7 +213,7 @@ when it fails for the expected reason.
    - **A `200`** means origin pulls aren't enforced: check `TLS_MODE` and `katap edge up`.
    - **Exit code 60** means step 3 hasn't passed yet.
    - **A connection failure (exit code 7 or 28)** is the network, not origin pulls.
-5. **Non-Cloudflare addresses are dropped.** Caddy also drops any request whose source isn't in Cloudflare's ranges, but only after the TLS handshake. Without Cloudflare's client certificate you can't get that far, so this layer can't be tested from outside. Check the setting instead (*server*): `sudo -u deploy grep '^TLS_MODE=' /srv/edge/edge.env` prints `TLS_MODE=cloudflare`.
+5. **Non-Cloudflare addresses are dropped.** Caddy also drops any request whose source isn't in Cloudflare's ranges, but only after the TLS handshake. Without Cloudflare's client certificate you can't get that far, so this layer can't be tested from outside. Check the setting instead (*server*): `grep '^TLS_MODE=' /srv/edge/edge.env` prints `TLS_MODE=cloudflare`.
 
 On the server, check the certificate's names and expiry:
 `openssl x509 -in /srv/edge/certs/origin.pem -noout -subject -enddate -ext subjectAltName`.
@@ -231,12 +235,12 @@ network (`CADDY_IP`). Caddy replaces any client-sent `X-Forwarded-For` with the
 address it actually saw.
 
 - **nestjs-api** trusts exactly `CADDY_IP` (`TRUST_PROXY`).
-- **laravel-api** gets `TRUSTED_PROXIES=0.0.0.0/0`, deliberately. Its base image's nginx and Laravel parse that variable differently, and one all-addresses CIDR is the only value both accept while keeping the real client address and HTTPS detection. Nothing outside the server can reach the API container.
+- **laravel-api** trusts exactly `CADDY_IP` (`TRUSTED_PROXIES`), read by its base image's nginx. This needs a laravel-api build from commit `0077bff` or later, which also refuses a `/0` network at start. A component created before Katap v2 has `TRUSTED_PROXIES=0.0.0.0/0`: change it to `CADDY_IP` (`katap env <project> <component>`) when it first deploys such a build.
 
 ## Testing Katap
 
 ```bash
-tests/run.sh          # shellcheck, the contract, secrets, apply, provenance, ssh-dispatch, the action, install.sh, connect.sh, provisioning, smoke check, edge
+tests/run.sh          # shellcheck, the contract, secrets, apply, image pulls, ssh-dispatch, the action, deploy keys, install.sh, provisioning, smoke check, edge
 E2E=1 tests/run.sh    # plus a real deploy on local Docker: build laravel-api, apply, deploy, roll back, back up, restore
 ```
 

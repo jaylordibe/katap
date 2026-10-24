@@ -1,0 +1,110 @@
+# An application repository's workflow: build the image, push it to GitHub's
+# registry, deploy it with Katap. Copy it to .github/workflows/ in the
+# repository, set the three values marked CHANGE, and add the secrets that
+# `katap deploy-key <project> <component>` printed on the server.
+#
+# The build is GitHub's standard one ("Publishing Docker images" in GitHub's
+# docs): the repository's own Dockerfile, pushed to ghcr.io under the commit.
+# Only the last step is Katap's. A repository that already builds its image in
+# its own workflow keeps that, and adds only the deploy job below.
+
+name: Build and deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# One release at a time, in push order: a later push never deploys before an
+# earlier one has finished.
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  build:
+    name: Build, scan and push
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.name.outputs.image }}@${{ steps.build.outputs.digest }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Name the image
+        id: name
+        run: echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          push: true
+          pull: true
+          tags: ${{ steps.name.outputs.image }}:sha-${{ github.sha }}
+          # A frontend that bakes values in at build time takes them here, e.g.:
+          # build-args: |
+          #   PUBLIC_API_URL=https://api.example.com
+
+      # A fixable HIGH or CRITICAL vulnerability stops the release here.
+      - name: Scan the pushed image
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        env:
+          TRIVY_USERNAME: ${{ github.actor }}
+          TRIVY_PASSWORD: ${{ github.token }}
+        with:
+          image-ref: ${{ steps.name.outputs.image }}@${{ steps.build.outputs.digest }}
+          format: table
+          exit-code: '1'
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+
+      # A nestjs-api also builds its `migrate` target, under the same commit:
+      # - name: Build and push the migrate image
+      #   id: migrate
+      #   uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+      #   with:
+      #     context: .
+      #     target: migrate
+      #     push: true
+      #     tags: ${{ steps.name.outputs.image }}-migrate:sha-${{ github.sha }}
+      # and adds to the job's outputs:
+      #   migrate-image: ${{ steps.name.outputs.image }}-migrate@${{ steps.migrate.outputs.digest }}
+
+  deploy:
+    name: Deploy
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      packages: read
+    steps:
+      - name: Deploy with Katap
+        # CHANGE: the commit `katap deploy-key` printed, the release your server runs.
+        uses: jaylordibe/katap@0000000000000000000000000000000000000000 # vX.Y.Z
+        with:
+          host: ${{ secrets.KATAP_HOST }}
+          known-hosts: ${{ secrets.KATAP_KNOWN_HOSTS }}
+          ssh-key: ${{ secrets.KATAP_SSH_KEY }}
+          project: example # CHANGE: the project in /srv/katap.json
+          component: api # CHANGE: the component in /srv/katap.json
+          image: ${{ needs.build.outputs.image }}
+          # migrate-image: ${{ needs.build.outputs.migrate-image }}   # nestjs-api
+          # url: https://api.example.com/api/health/readiness         # checked after the deploy

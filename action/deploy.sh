@@ -5,9 +5,11 @@
 # public URL.
 #
 # It decides nothing the server does not check again. The server's forced command
-# binds this key to one project and its components, and the server verifies the
-# digest's repository and build provenance against its own settings before it
-# pulls anything.
+# binds this key to one project and component, and the server checks the digest's
+# repository against its own settings before it pulls anything. To pull a private
+# image, the server gets this job's own registry token on the SSH session's
+# standard input: never in the request, which the server logs, and never kept
+# there, because the token expires with this job.
 #
 # Input (environment): KATAP_HOST, KATAP_USER, KATAP_SSH_KEY, KATAP_KNOWN_HOSTS,
 # KATAP_PROJECT, KATAP_COMPONENT, KATAP_IMAGE, KATAP_MIGRATE_IMAGE, KATAP_REGISTRY,
@@ -93,11 +95,26 @@ ssh-keygen -l -f "$work/known_hosts" >/dev/null 2>&1 || die "known-hosts is empt
 printf '%s\n' "$KATAP_SSH_KEY" > "$work/key"
 chmod 600 "$work/key"
 
+# The registry login the server pulls with: only a GitHub Actions job token, and
+# only for ghcr.io, the one registry it is valid for.
+# The same patterns as bin/katap's, which tests/run.sh checks.
+REGISTRY_USER_RE='^[A-Za-z0-9][A-Za-z0-9_-]{0,99}(\[bot\])?$'
+JOB_TOKEN_RE='^ghs_[A-Za-z0-9]{20,255}$'
+login=''
+if [ "$REGISTRY" = ghcr.io ] && [[ "${KATAP_REGISTRY_TOKEN:-}" =~ $JOB_TOKEN_RE ]] \
+    && [[ "${KATAP_REGISTRY_USER:-}" =~ $REGISTRY_USER_RE ]]; then
+    login="registry $KATAP_REGISTRY_USER $KATAP_REGISTRY_TOKEN"
+elif [ "$REGISTRY" = ghcr.io ] && [[ "${KATAP_REGISTRY_TOKEN:-}" =~ $JOB_TOKEN_RE ]]; then
+    echo "::warning::registry-user '${KATAP_REGISTRY_USER:-}' is not a GitHub user name, so the registry login is not sent; the server pulls a private image only if it is already there."
+elif [ "$REGISTRY" = ghcr.io ] && [ -n "${KATAP_REGISTRY_TOKEN:-}" ]; then
+    echo "::warning::registry-token is not this job's GitHub token (ghs_…), so it is not sent; the server pulls a private image only if it is already there."
+fi
+
 echo "Deploying: $request"
 # The server's forced command reads this as SSH_ORIGINAL_COMMAND and refuses
-# anything outside the key's project and components. The deploy keeps running on
+# anything outside the key's project and component. The deploy keeps running on
 # the server if this connection drops.
-"$SSH" -i "$work/key" -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=20 \
+printf '%s\n' "$login" | "$SSH" -i "$work/key" -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=20 \
     -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$work/known_hosts" \
     -o ForwardAgent=no -o ServerAliveInterval=30 \
     "${KATAP_USER:-deploy}@$KATAP_HOST" "$request"

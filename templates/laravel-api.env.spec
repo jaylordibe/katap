@@ -45,12 +45,10 @@ REDIS_PASSWORD=same:REDIS_PASSWORD
 CACHE_STORE=literal:redis
 QUEUE_CONNECTION=literal:redis
 SESSION_DRIVER=literal:redis
-# One token both parsers accept: the base image's nginx and Laravel read this
-# variable differently, and only a single CIDR satisfies both. Nothing outside this
-# host can reach the container; public components of OTHER projects on the shared
-# edge network can, and could set their own client address (docs/reference.md,
-# "Trusted proxies", and docs/security.md, "Known limits").
-TRUSTED_PROXIES=literal:0.0.0.0/0
+# The edge's own address: the only proxy that connects to this container. The
+# base image's nginx takes the client address from X-Forwarded-For only when the
+# request comes from it, and refuses a /0 network at start.
+TRUSTED_PROXIES=literal:{caddy_ip}
 PASSPORT_PRIVATE_KEY=rsa-private:passport
 PASSPORT_PUBLIC_KEY=rsa-public:passport
 MAIL_MAILER=required

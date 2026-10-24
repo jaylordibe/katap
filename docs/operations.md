@@ -1,24 +1,21 @@
 # Day to day
 
-Run these on the server as the deploy user, from the tool directory:
-
-```bash
-sudo -iu deploy
-cd /srv/katap
-```
+Run these on the server. The `katap` command runs as the deploy user, who owns
+every project; `docker` needs `sudo` from your own account.
 
 | Task | Command |
 |---|---|
-| Add a project or component | Add it to `/srv/katap.json` (as root), then `bin/katap apply`; see [The projects file](projects-file.md) |
-| Roll back | `bin/katap rollback shop api`: back to the release before the one serving; run it again to go further back. It never runs migrations backwards, so keep migrations expand-only |
-| One-off command | `bin/katap run shop api-artisan <args>`: as the application user, never root |
-| Logs / status | `docker compose -p shop logs -f api` · `docker ps --filter label=com.docker.compose.project=shop` (running containers only; check every expected service appears) |
-| Back up now | `bin/katap backup shop`. Also nightly, by timer; 14 of each kind are kept per component (`KATAP_BACKUP_KEEP`) |
+| Add a project or component | Add it to `/srv/katap.json` (as root), then `katap apply`; see [The projects file](projects-file.md) |
+| Roll back | `katap rollback shop api`: back to the release before the one serving; run it again to go further back. The last 5 deploys of each component stay on the server (`KATAP_RELEASES_KEPT`), so rolling back to them needs no registry; further back, a private image needs a registry login (see [Troubleshooting](troubleshooting.md#deploying)). It never runs migrations backwards, so keep migrations expand-only |
+| One-off command | `katap run shop api-artisan <args>`: as the application user, never root |
+| Logs / status | `sudo docker compose -p shop logs -f api` · `sudo docker ps --filter label=com.docker.compose.project=shop` (running containers only; check every expected service appears) |
+| Back up now | `katap backup shop`. Also nightly, by timer; 14 of each kind are kept per component (`KATAP_BACKUP_KEEP`) |
 | Off-server copies | Not on by default; see [What a backup covers](#what-a-backup-covers) |
-| Restore | `bin/katap restore shop api /srv/backups/shop/<file>.dump --confirm shop` |
-| Change a site | Edit `/srv/projects/<project>/site.caddy`, then `bin/katap edge reload` |
-| Change the TLS mode or edge address | Set it in `/srv/edge/edge.env` (it overrides `edge/edge.env` key by key), then `bin/katap edge up` |
+| Restore | `katap restore shop api /srv/backups/shop/<file>.dump --confirm shop` |
+| Change a site | Edit `/srv/projects/<project>/site.caddy`, then `katap edge reload` |
+| Change the TLS mode or edge address | Set it in `/srv/edge/edge.env` (it overrides `edge/edge.env` key by key), then `katap edge up` |
 | Scheduled work | Each project's per-minute run is cut off after 10 minutes (`KATAP_CRON_TIMEOUT`); put long work on the queue |
+| Free disk space | `katap images prune`: removes images no release needs. Also nightly, after the backups; a project busy at that moment keeps its images until the next night |
 | Upgrade Katap | Run the installer again; see [Updating Katap](updating.md) |
 
 Back up `/srv/katap.json`, `/srv/projects` and `/srv/secrets` together, or keep the
@@ -131,8 +128,7 @@ schema, and use the pre-deploy dump with `restore` when that isn't enough.
 |---|---|---|
 | **Admit** | The key's forced command allows only its own component. One dispatch of a component at a time, and not again within a minute of the last | Refused; nothing changed |
 | **Validate** | The tool is the installed release; the component's `.conf` matches `katap.json`; the digest belongs to its `image=`; no required secret is blank | Refused; nothing changed |
-| **Verify** | `gh attestation verify`: built by `source_repo`'s `publish-image.yml`, from `main` for production. Runtime and migrate images come from one commit | Refused; nothing changed |
-| **Pull** | `docker pull` by digest | Nothing changed |
+| **Pull** | `docker pull` by digest, only if the image isn't on the server already. A private image is pulled with the deploy's own GitHub Actions token, never stored | Refused; nothing changed |
 | **Dump** | `pg_dump` of the component's database, kept with the nightly dumps | Refused; nothing changed |
 | **Migrate** | One-shots in order. Laravel: `migrate`, then `permissions`. Nest: the migrate image (Prisma deploy + RBAC sync) | The current release keeps serving; migrations that already ran stay applied |
 | **Roll out** | Services recreated in order (Laravel: worker, then API), waiting for each healthcheck. Caddy holds requests across the swap | **Automatic rollback** to the previous images; the schema stays migrated. On a component's first deploy there is nothing to roll back to. If the rollback itself fails, the log says `ROLLBACK FAILED` and the component may be down |
@@ -153,6 +149,13 @@ was taken**. It stops the component and dumps the current data first. It restore
 into a new database and swaps it in only when complete, so a failed restore changes
 nothing. It also empties the component's Redis, whose queued jobs and caches
 described the replaced data.
+
+That release's images are kept on the server for as long as a dump on the server
+names them. A dump copied back from off-server, or one restored on a rebuilt
+server, may name a private image the server no longer has: `restore` then
+refuses before it stops anything, and needs a one-off registry login
+(`sudo -u deploy docker login ghcr.io` with a `read:packages` token, then
+`sudo -u deploy docker logout ghcr.io` after the restore).
 
 > [!IMPORTANT]
 > **Test a restore before you need one.** A backup that has never been restored is

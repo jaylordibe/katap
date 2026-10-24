@@ -5,13 +5,13 @@ author: jaylordibe
 # Used from an application repository's own workflow, inside the GitHub
 # environment that holds that application's deploy key:
 #
-#   - uses: jaylordibe/katap@<commit of a release> # v1.x.y
+#   - uses: jaylordibe/katap@<commit of a release> # vX.Y.Z
 #
 # Pin it by commit, never by a tag: this action receives the deploy key, and a
 # tag can be moved. It runs no other action, so that commit is all the code it
-# runs. The server, not this action, decides what may deploy: it checks the
-# digest against its own project settings and verifies the image's build
-# provenance before anything is pulled.
+# runs. The server, not this action, decides what may deploy: the key's binding
+# and the image repository come from its own settings. `katap deploy-key` on the
+# server prints this step with its values filled in.
 
 inputs:
   host:
@@ -21,7 +21,7 @@ inputs:
     description: The deploy user provision.sh created.
     default: deploy
   ssh-key:
-    description: The private half of this application's deploy key (authorised with provision.sh --ci-key).
+    description: The private half of this component's deploy key (made with katap deploy-key).
     required: true
   known-hosts:
     description: The server's known_hosts line(s), taken once from the server itself. Never scanned at deploy time.
@@ -45,7 +45,7 @@ inputs:
     description: User for that registry.
     default: ${{ github.actor }}
   registry-token:
-    description: Token that can read the images (packages read).
+    description: Token that can read the images (packages read). The job's own token, which the server also uses, once, to pull a private image.
     default: ${{ github.token }}
   url:
     description: Optional public URL to check after the deploy (HTTP 200, no redirects followed).

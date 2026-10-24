@@ -45,15 +45,22 @@
 # so an application trusting Caddy's fixed address gets the real client. Behind
 # Cloudflare that peer is a Cloudflare edge, so the caller is taken from
 # CF-Connecting-IP instead — safe only because tls_cloudflare admits nobody else.
+# Outside Cloudflare mode anyone can connect, so Cloudflare's client-address
+# headers are removed: an application still trusting them gets none to trust.
 
 (client_ip_acme) {
+	header_up -CF-Connecting-IP
+	header_up -True-Client-IP
 }
 
 (client_ip_internal) {
+	header_up -CF-Connecting-IP
+	header_up -True-Client-IP
 }
 
 (client_ip_cloudflare) {
 	header_up X-Forwarded-For {http.request.header.CF-Connecting-IP}
+	header_up -True-Client-IP
 }
 
 # --- What every site gets -----------------------------------------------------

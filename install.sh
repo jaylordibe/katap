@@ -17,9 +17,7 @@
 #   - a release older than this installer supports.
 # Read a release's notes before moving to it, a new major version above all.
 #
-# Options: see usage below (`--help`). The GitHub token is asked for on the
-# terminal; to answer without one, export KATAP_GH_TOKEN and pipe into
-# `sudo --preserve-env=KATAP_GH_TOKEN bash` (never put the token on a command line).
+# Options: see usage below (`--help`). It asks nothing: no token, no prompt.
 set -euo pipefail
 
 usage() {
@@ -93,6 +91,14 @@ main() {
     fi
     [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "'$tag' is not a release (expected vX.Y.Z)."
     version_at_least "${tag#v}" "$oldest" || die "$tag is older than this installer supports ($oldest); install it by hand as its own README says."
+
+    # A new major version changes how deploys work, so moving to one (or back from
+    # one) is never a side effect of re-running the installer: it is named.
+    local installed=''
+    [ ! -f "$release_file" ] || installed="$(sed -n 's/^tag=//p' "$release_file" | tail -n 1)"
+    if [ -z "$version" ] && [[ "$installed" =~ ^v([0-9]+)\. ]] && [ "${BASH_REMATCH[1]}" != "$(cut -d. -f1 <<<"${tag#v}")" ]; then
+        die "this server runs $installed and the latest release is $tag, a new major version that changes how deploys work. Read its notes (docs/updating.md), then run the installer with --version $tag. Katap was not changed."
+    fi
 
     # The commit the tag names on GitHub now: an annotated tag's ^{} line, or the
     # tag itself when it is lightweight.

@@ -7,12 +7,17 @@ Requires=docker.service
 Type=oneshot
 User=deploy
 # Settings (KATAP_BACKUP_KEEP, KATAP_RCLONE_REMOTE, …) live in /etc/katap/katap.env,
-# which bin/katap reads itself: not loaded here, so the GitHub token in it never
-# reaches the environment of every process this unit starts.
+# which bin/katap reads itself: not loaded here, so whatever else that file holds
+# never reaches the environment of every process this unit starts.
 # Every project is attempted even when one fails; the unit then fails, which
 # `systemctl --failed` and the journal show. Bounded, so a stuck dump cannot keep
 # the unit active and silently skip the following nights.
 TimeoutStartSec=4h
+# ExecStopPost runs under the stop timeout, which would otherwise be 90 seconds.
+TimeoutStopSec=30min
 ExecStart=/srv/katap/bin/katap backup --all
-# Release images no longer serving: a rollback pulls its image again by digest.
-ExecStartPost=-/usr/bin/docker image prune --all --force --filter until=336h
+# Images no release needs any more. Rollback and restore targets are kept, so
+# neither ever needs the registry. ExecStopPost runs even on a night a backup
+# failed, so a failing backup never lets images fill the disk; a failed prune
+# fails the unit too.
+ExecStopPost=/srv/katap/bin/katap images prune
