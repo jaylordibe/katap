@@ -23,10 +23,27 @@ jobs:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
+          path: katap
           # Every release tag: the suite runs earlier releases' actions against
           # this server (one major version, one request form).
           fetch-depth: 0
+      # Beside it, as on a developer's machine: the suite checks the templates
+      # against the starters' own contracts (the settings nestjs-api requires at
+      # boot), and that the starters never mention Katap.
+      - name: Checkout nestjs-api
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: jaylordibe/nestjs-api
+          path: nestjs-api
+          persist-credentials: false
+      - name: Checkout laravel-api
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: jaylordibe/laravel-api
+          path: laravel-api
+          persist-credentials: false
       - name: Run the suite
+        working-directory: katap
         run: tests/run.sh
 
   actionlint:
