@@ -19,10 +19,22 @@ release replaces only Katap itself:
 - a change to `edge/` takes effect at `katap edge up`.
 
 **The applications' pins can move on their own.** Within a major version, the
-request the deploy step sends never changes form, so any v2 deploy step works
-with any v2 server, in either order. Dependabot's `github-actions` updates move
-each repository's `jaylordibe/katap@<commit>` pin to new releases. The server
-checks a request's form, not the step's release, and refuses anything else.
+request the deploy step sends never changes form, so any v2 deploy step from
+v2.0.3 works with any v2 server from v2.0.3, in either order. Dependabot's
+`github-actions` updates move each repository's `jaylordibe/katap@<commit>` pin
+to new releases. The server checks a request's form, not the step's release, and
+refuses anything else.
+
+**v2.0.3 is the floor, on both sides.** In 2026 GitHub changed the form of the
+job token the step hands the server for a private image's pull (`ghs_<app id>_<JWT>`,
+about 520 characters). Releases before v2.0.3 recognise only the old form:
+- an earlier **step** never sends the new token, so a private image the server
+  does not already have fails to pull ("registry-token is not this job's GitHub
+  token");
+- an earlier **server** refuses the new token, and with it the deploy
+  ("standard input must be one line").
+
+Upgrade the server first, then move each pin to v2.0.3 or later.
 
 ## From v1 to v2
 

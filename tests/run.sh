@@ -451,6 +451,8 @@ exec docker "\$@"
 EOF
 chmod +x "$WORK/image-docker"
 TOKEN_GHS="ghs_$(printf 'A%.0s' $(seq 1 36))"
+# GitHub's job token since 2026: ghs_<app id>_<JWT>, about 520 characters.
+TOKEN_JWT="ghs_1234567_$(printf 'eyJ%.0s' $(seq 1 60)).$(printf 'Ab-_%.0s' $(seq 1 60)).$(printf 'x9%.0s' $(seq 1 40))"
 # ideploy [VAR=value...] -- <katap deploy args>
 ideploy() {
     local vars=()
@@ -579,6 +581,14 @@ check "a registry login on standard input reaches the worker, in a file only its
 check "…and that file is gone once the worker ends" bash -c "! ls '$K/srv/state/.dispatch/shop/'.registry.* 2>/dev/null"
 check "…and the token is in no argument, no log and no environment" \
     bash -c "! grep -qF '$TOKEN_GHS' '$WORK/dispatched' '$WORK/syslog' '$WORK/dispatched-env' '$K/srv/state/.dispatch/shop/'*.log"
+printf 'registry octocat %s\n' "$TOKEN_JWT" > "$WORK/stdin-jwt"
+STDIN="$WORK/stdin-jwt" dispatch "deploy shop api $D64" >/dev/null 2>&1
+check "GitHub's current job token (ghs_<app id>_<JWT>, ~520 characters) reaches the worker whole" \
+    bash -c "[ \"\$(cat '$WORK/dispatched-login')\" = 'octocat $TOKEN_JWT' ]"
+printf 'registry octocat ghs_%s\n' "$(head -c 8200 /dev/zero | tr '\0' A)" > "$WORK/stdin-long"
+STDIN="$WORK/stdin-long" refuses "a login too long to read whole is refused, never cut to fit" "longer than 8191 characters" dispatch "deploy shop api $D64"
+printf 'registry octocat ghs_%s/x\n' "$(printf 'A%.0s' $(seq 1 36))" > "$WORK/stdin-slash"
+STDIN="$WORK/stdin-slash" refuses "a token with a character outside a job token's is refused" "must be one line" dispatch "deploy shop api $D64"
 printf 'registry octocat ghp_%s\n' "$(printf 'A%.0s' $(seq 1 36))" > "$WORK/stdin-pat"
 STDIN="$WORK/stdin-pat" refuses "a personal access token is refused: only a job's own token, which expires with the job" "must be one line" dispatch "deploy shop api $D64"
 printf 'hello\n' > "$WORK/stdin-junk"
@@ -990,6 +1000,12 @@ sed -n 's/^stdin=//p' "$WORK/ssh.log" > "$WORK/stdin-from-action"
 STDIN="$WORK/stdin-from-action" dispatch "deploy shop api $D64" >/dev/null 2>&1 || true
 check "the server accepts exactly the login the action sends" \
     bash -c "[ \"\$(cat '$WORK/dispatched-login' 2>/dev/null)\" = 'octocat $TOKEN_GHS' ]"
+act KATAP_REGISTRY_TOKEN="$TOKEN_JWT" KATAP_REGISTRY_USER=octocat >/dev/null 2>&1 || true
+check "GitHub's current job token (ghs_<app id>_<JWT>) is sent too" grep -qxF "stdin=registry octocat $TOKEN_JWT" "$WORK/ssh.log"
+sed -n 's/^stdin=//p' "$WORK/ssh.log" > "$WORK/stdin-jwt-from-action"
+STDIN="$WORK/stdin-jwt-from-action" dispatch "deploy shop api $D64" >/dev/null 2>&1 || true
+check "…and the server accepts it as the action sends it" \
+    bash -c "[ \"\$(cat '$WORK/dispatched-login' 2>/dev/null)\" = 'octocat $TOKEN_JWT' ]"
 # Any action of this major version deploys to any server of it: v2.0.0's own
 # deploy.sh, run as it was released, is accepted by this dispatcher.
 if git -c safe.directory="$REPO" -C "$REPO" cat-file -e v2.0.0:action/deploy.sh 2>/dev/null; then
@@ -1069,7 +1085,7 @@ check "it prints the other two secrets, from this server's own settings and host
     says "$key_out" KATAP_HOST KATAP_KNOWN_HOSTS "203.0.113.10 $(cut -d' ' -f1-2 "$WORK/serverkey.pub")"
 check "…and the two variables naming this component, and the URL checked after a deploy" \
     bash -c "grep -qE '^KATAP_PROJECT +shop\$' <<<\"\$1\" && grep -qE '^KATAP_COMPONENT +api\$' <<<\"\$1\" && grep -qE '^KATAP_URL +https://api.shop.test/api/health/ready\$' <<<\"\$1\"" _ "$key_out"
-check "…and which major version the workflow's pin may be" says "$key_out" "This server runs Katap v2.0.0" "may be any v2 release"
+check "…and which major version the workflow's pin may be" says "$key_out" "This server runs Katap v2.0.0" "may be any v2 release from v2.0.3"
 # The secrets and variables the example workflow reads are exactly the ones
 # deploy-key tells you to add: one list, checked here, never two that drift.
 workflow_names() { sed -n "/^  $1:/,/^  [a-z-]*:\$/p" "$REPO/examples/github-workflow.yml" | grep -oE '(secrets|vars)\.KATAP_[A-Z_]+' | sed 's/^[a-z]*\.//' | sort -u; }

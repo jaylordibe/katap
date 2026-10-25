@@ -101,7 +101,7 @@ Each deploy job in [`examples/github-workflow.yml`](../examples/github-workflow.
 holds one `jaylordibe/katap` step. Its inputs are the repository's secrets and
 variables of step 3, and the image the `publish` job pushed, by digest.
 
-- **Pinned by commit,** never by a tag: the step receives the deploy key, and a tag can be moved. With Dependabot's `github-actions` updates on (a `.github/dependabot.yml`), the pin moves to each new Katap release; any release of your server's major version works with it (`katap deploy-key` names the major). See [Updating Katap](updating.md).
+- **Pinned by commit,** never by a tag: the step receives the deploy key, and a tag can be moved. With Dependabot's `github-actions` updates on (a `.github/dependabot.yml`), the pin moves to each new Katap release; any release from v2.0.3 of your server's major version works with it (`katap deploy-key` names the major). See [Updating Katap](updating.md).
 - **Private images need nothing extra.** The step hands the server its job's own GitHub token, on the SSH connection's input, for the one pull. It is never stored, and it expires with the job. Each deploy job holds only `permissions: packages: read`: the server receives what the token may do.
 - **The deploy keeps running on the server** if the workflow is cancelled or the connection drops. Its log is in `/srv/state/.dispatch/<project>/`.
 

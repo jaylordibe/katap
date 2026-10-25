@@ -111,7 +111,8 @@ jobs:
       - name: Deploy with Katap
         # Pinned by commit: this step receives the deploy key. Dependabot's
         # github-actions updates, when the repository has them on, move it to each
-        # new Katap release; any release of your server's major version works.
+        # new Katap release; any release from v2.0.3 of your server's major version
+        # works (docs/updating.md).
         uses: jaylordibe/katap@316f59b4ecaee13ddafe638eb24aa4cd99fc39b1 # v2.0.0
         with:
           host: ${{ secrets.KATAP_HOST }}

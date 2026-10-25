@@ -99,7 +99,7 @@ chmod 600 "$work/key"
 # only for ghcr.io, the one registry it is valid for.
 # The same patterns as bin/katap's, which tests/run.sh checks.
 REGISTRY_USER_RE='^[A-Za-z0-9][A-Za-z0-9_-]{0,99}(\[bot\])?$'
-JOB_TOKEN_RE='^ghs_[A-Za-z0-9]{20,255}$'
+JOB_TOKEN_RE='^ghs_[A-Za-z0-9._-]{36,}$'
 login=''
 if [ "$REGISTRY" = ghcr.io ] && [[ "${KATAP_REGISTRY_TOKEN:-}" =~ $JOB_TOKEN_RE ]] \
     && [[ "${KATAP_REGISTRY_USER:-}" =~ $REGISTRY_USER_RE ]]; then

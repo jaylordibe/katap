@@ -150,9 +150,14 @@ duration_seconds() {
 COMPONENT_RE='^[a-z][a-z0-9]{0,19}$'
 # The registry login a deploy may carry: a GitHub user (or app bot, or Enterprise
 # Managed User) and a GitHub Actions job token. action/deploy.sh sends exactly
-# these; tests/run.sh checks the two copies are the same.
+# these; tests/run.sh checks the two copies are the same. GitHub's job tokens are
+# opaque and vary in length: `ghs_` and 36 letters and digits until 2026, now
+# `ghs_<app id>_<JWT>`, about 520 characters. The pattern keeps the prefix (a job
+# token, never a personal one) and a character set that cannot leave its word.
+# No upper bound in it: musl's regex refuses a bound above 255; ssh-dispatch's
+# read limit is the bound.
 REGISTRY_USER_RE='^[A-Za-z0-9][A-Za-z0-9_-]{0,99}(\[bot\])?$'
-JOB_TOKEN_RE='^ghs_[A-Za-z0-9]{20,255}$'
+JOB_TOKEN_RE='^ghs_[A-Za-z0-9._-]{36,}$'
 DOMAIN_RE='^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$'
 # owner/name, as GitHub allows: no dots in the owner, and a name that is not only dots.
 REPO_RE='^[A-Za-z0-9-]+/[A-Za-z0-9_.-]*[A-Za-z0-9_-][A-Za-z0-9_.-]*$'
@@ -2050,8 +2055,9 @@ build and its migrate-image output).
 EOF
     fi
     # A request's form never changes within a major version (docs/updating.md), so
-    # the workflow's pin need not match this server's release.
-    [ -z "$tag" ] || echo "This server runs Katap $tag; the workflow's jaylordibe/katap pin may be any ${tag%%.*} release."
+    # the workflow's pin need not match this server's release, from v2.0.3: the
+    # first to carry GitHub's current job token.
+    [ -z "$tag" ] || echo "This server runs Katap $tag; the workflow's jaylordibe/katap pin may be any ${tag%%.*} release from v2.0.3."
 }
 
 # Removes components that were never deployed: a typo in katap.json, or one
@@ -2274,8 +2280,9 @@ cmd_images() {
 #
 # The request's form (its words, and the login on standard input) is a contract
 # with every Katap action of this major version: it never changes within one, so
-# any v2 action deploys to any v2 server (docs/updating.md). A change to it is a
-# new major version.
+# any v2 action deploys to any v2 server, from v2.0.3 on both sides, the first to
+# accept GitHub's current job token (docs/updating.md). A change to it is a new
+# major version.
 cmd_ssh_dispatch() {
     # The binding comes from the key's forced command, never from the request.
     local environment="${1:-}" bound_project="${2:-}" bound_components="${3:-}"
@@ -2310,12 +2317,14 @@ cmd_ssh_dispatch() {
 
     # The registry login for this deploy comes on standard input, never in the
     # request: the request is logged, the login is not. At most one line,
-    # `registry <user> <token>`, read within 10 seconds and 512 bytes and before
-    # any lock is taken, so a client that never closes its input holds nothing.
+    # `registry <user> <token>`, read within 10 seconds and 8192 characters (a
+    # line that fills them is refused, never cut to fit) and before any lock is
+    # taken, so a client that never closes its input holds nothing.
     # Only a GitHub Actions job token (ghs_…) is accepted: it expires with the job.
     local login='' status=0
-    IFS= read -r -t 10 -n 512 login || status=$?
+    IFS= read -r -t 10 -n 8192 login || status=$?
     [ "$status" -le 128 ] || [ -z "$login" ] || die "refused: the registry login did not arrive within 10 seconds."
+    [ "${#login}" -lt 8192 ] || die "refused: the registry login is longer than 8191 characters."
     login="${login%$'\r'}"
     if [ -n "$login" ]; then
         local word user token extra
