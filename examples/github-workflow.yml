@@ -113,7 +113,7 @@ jobs:
         # github-actions updates, when the repository has them on, move it to each
         # new Katap release; any release from v2.0.3 of your server's major version
         # works (docs/updating.md).
-        uses: jaylordibe/katap@316f59b4ecaee13ddafe638eb24aa4cd99fc39b1 # v2.0.0
+        uses: jaylordibe/katap@fb59955eb99312e3366f78e0c5017dc797e3665e # v2.0.3
         with:
           host: ${{ secrets.KATAP_HOST }}
           known-hosts: ${{ secrets.KATAP_KNOWN_HOSTS }}
@@ -134,7 +134,7 @@ jobs:
       packages: read
     steps:
       - name: Deploy with Katap
-        uses: jaylordibe/katap@316f59b4ecaee13ddafe638eb24aa4cd99fc39b1 # v2.0.0
+        uses: jaylordibe/katap@fb59955eb99312e3366f78e0c5017dc797e3665e # v2.0.3
         with:
           host: ${{ secrets.KATAP_STAGING_HOST }}
           known-hosts: ${{ secrets.KATAP_STAGING_KNOWN_HOSTS }}
