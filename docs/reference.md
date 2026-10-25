@@ -87,7 +87,8 @@ An arbitrary Laravel or NestJS image doesn't meet these templates' contracts.
 ### Build-time and runtime settings
 
 - **A static SPA** has no server process to read settings, so values such as the API's address are fixed when the image is built. Pass them as build arguments in the workflow that builds the image. A change means a new build.
-- **A server-rendered app or an API** reads runtime settings from its `.env` file on the server. A change means a new deploy: see [Application settings](projects-file.md#application-settings).
+- **An API** reads runtime settings from its `.env` file on the server. A change means a new deploy: see [Application settings](projects-file.md#application-settings).
+- **A server-rendered app** has both. What reaches the browser is fixed at build time (Next.js inlines every `NEXT_PUBLIC_*` value into the bundle): pass it as a build argument, written in the workflow or as a repository variable. What only the server reads (the API's internal address, a session secret) is a runtime setting on the server, in `katap env`. A browser value is public by nature; a secret never goes in a build argument.
 
 A generic example. The variable names are placeholders: use the names your
 application's build actually reads.

@@ -143,8 +143,12 @@ For a component that ran, in this order:
 |---|---|---|
 | `laravel-api` | `MAIL_MAILER`, `MAIL_FROM_ADDRESS`; `APP_FRONTEND_URL` and `CORS_ALLOWED_ORIGINS` when the project has no single frontend | [laravel-api DEPLOYMENT.md](https://github.com/jaylordibe/laravel-api/blob/main/DEPLOYMENT.md), "Environment contract" and "Object storage contract" |
 | `nestjs-api` | `EMAIL_PROVIDER`, `EMAIL_FROM`, `SMS_PROVIDER`, `STORAGE_PROVIDER`, `TURNSTILE_WEB_SECRET`, `TURNSTILE_MOBILE_SECRET`, `SEED_ADMIN_EMAIL`, `SEED_USER_EMAIL`; `WEB_BASE_URL` and `CORS_ORIGIN` when the project has no single frontend | [nestjs-api deployment contract](https://github.com/jaylordibe/nestjs-api/blob/main/docs/deployment/README.md), "Environment contract" |
-| `node-ssr` | None. Add the runtime variables your server reads | Your application |
+| `node-ssr` | None. Add the runtime variables your server reads; values built into the browser bundle are [build-time settings](reference.md#build-time-and-runtime-settings) | Your application |
 | `spa` | None. A static site reads no runtime settings; see [build-time settings](reference.md#build-time-and-runtime-settings) | Your application |
+
+A provider must be a real one: in production, nestjs-api refuses `stub` for
+`EMAIL_PROVIDER` and `SMS_PROVIDER` (a stub writes one-time codes to the log), so
+fill them with a provider and its credentials before the first deploy.
 
 **Edit the file** (*server SSH session*): `katap env <project> <component>`. It
 opens the file in an editor, then lists the required values still empty, by name

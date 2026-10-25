@@ -162,7 +162,8 @@ deploys it:
 - if a required setting is still empty, the deploy is refused and names it;
 - if the new release fails its health check, the previous one comes back automatically.
 
-**First deploy only:** create your first admin user. See
+**First deploy:** deploy the API before the frontend, then create its first
+accounts. A failed deploy prints the command that shows why. See
 [First deploy](docs/deploying.md#first-deploy).
 
 > [!TIP]

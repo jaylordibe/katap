@@ -1490,14 +1490,14 @@ check "a rollback waiting on a deploy goes back from the release that deploy put
 # one before it, and the state still names that one.
 echo "IMAGE_API=$(rel 11)" > "$K/srv/state/shop/images.env"
 : > "$WORK/fake.log"
-refuses "a release that never becomes healthy is rolled back to the one before it" "failed and was rolled back" \
+refuses "a release that never becomes healthy is rolled back to the one before it, and the deploy says how to see why" "failed and was rolled back. See why on the server: sudo docker compose -p shop logs --tail=80 api" \
     env FAKE_UP_FAIL_DIGEST="$(digest 1)" KATAP_DOCKER="$WORK/fake-docker" KATAP_SRV="$K/srv" "$K/bin/katap" deploy shop api "$D64"
 check "…by starting the release before it again" test "$(grep -c ' up -d --wait' "$WORK/fake.log")" -ge 2
 check "…which the state still names" grep -qxF "IMAGE_API=$(rel 11)" "$K/srv/state/shop/images.env"
 check "…and the failed release is recorded" bash -c "tail -n 1 '$K/srv/state/shop/history' | grep -qE ' failed api IMAGE_API=$D64'"
 failed_before="$(grep -c ' failed api ' "$K/srv/state/shop/history")"
 refuses "when the release before it does not come back either, the deploy says the component may be down" \
-    "and so did putting the release before it back" \
+    "and so did putting the release before it back: the component may be down. See why on the server: sudo docker compose -p shop logs --tail=80 api" \
     env FAKE_UP_FAIL=1 KATAP_DOCKER="$WORK/fake-docker" KATAP_SRV="$K/srv" "$K/bin/katap" deploy shop api "$D64"
 check "…and still records the failed release" test "$(grep -c ' failed api ' "$K/srv/state/shop/history")" = "$((failed_before + 1))"
 
@@ -1568,7 +1568,7 @@ check "…and pulls and starts nothing" bash -c "! grep -qE ' (run|pull) ' '$WOR
 
 history_before="$(cat "$K/srv/state/shop/history")"
 : > "$K/srv/state/shop/images.env"
-refuses "a first deploy that never becomes healthy has nothing to roll back to" "no earlier release to roll back to" \
+refuses "a first deploy that never becomes healthy has nothing to roll back to, and says how to see why" "no earlier release to roll back to. See why on the server: sudo docker compose -p shop logs --tail=80 api" \
     env FAKE_UP_FAIL=1 KATAP_DOCKER="$WORK/fake-docker" KATAP_SRV="$K/srv" "$K/bin/katap" deploy shop api "$D64"
 check "…and is still recorded, so remove never takes it for a component that never ran" \
     bash -c "tail -n 1 '$K/srv/state/shop/history' | grep -qE '^[0-9TZ:-]+ failed api IMAGE_API=$D64'"

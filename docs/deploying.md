@@ -57,10 +57,15 @@ The image goes to `ghcr.io/<owner>/<repository>`, lowercased: that is the image
 Katap expects for a component's `repo`, unless `image` in `/srv/katap.json`
 says otherwise.
 
-Nothing in the workflow names your server or project: those come from the
-repository's secrets and variables. A push to `main` deploys production; a push to
-`staging` deploys staging, each only once its variables are set. Until then the
-workflow builds and pushes, and deploys nothing.
+Nothing in the example names your server or project: those come from the
+repository's secrets and variables, so the file is copied unchanged. A push to
+`main` deploys production; a push to `staging` deploys staging, each only once its
+variables are set. Until then the workflow builds and pushes, and deploys nothing.
+
+A workflow written for one repository may name its project and component in the
+step instead (`project: shop`, `component: api`) and drop the variables and the
+`vars.KATAP_PROJECT != ''` condition: the three secrets are then all the
+repository holds. Either way, the key decides what may deploy.
 
 ## 3. The deploy key, secrets and variables
 
@@ -107,12 +112,31 @@ variables of step 3, and the image the `publish` job pushed, by digest.
 
 ## First deploy
 
-- **laravel-api:** create the Passport personal access client, which sign-in needs:
-  ```bash
-  katap run shop api-artisan passport:client --personal --name='API Personal Access Client' --provider=users --no-interaction
-  ```
-  Never run `db:seed` or `UserSeeder` in production: it creates test users with a published password.
-- **nestjs-api:** for a component named `api`, `katap run shop api-migrate yarn prisma:seed` creates the admin from `SEED_ADMIN_*` and an ordinary account from `SEED_USER_*`. Running it again leaves both as they are.
+In this order:
+
+1. **The API first.** A frontend that calls it from the server (`node-ssr`) may
+   fail its health check while the API is missing.
+2. **Its first accounts**, once, on the server:
+   - **laravel-api:** create the Passport personal access client, which sign-in needs:
+     ```bash
+     katap run shop api-artisan passport:client --personal --name='API Personal Access Client' --provider=users --no-interaction
+     ```
+     Never run `db:seed` or `UserSeeder` in production: it creates test users with a published password.
+   - **nestjs-api:** for a component named `api`, `katap run shop api-migrate yarn prisma:seed` creates the admin from `SEED_ADMIN_*` and an ordinary account from `SEED_USER_*`. Running it again leaves both as they are.
+3. **Then the frontend.**
+
+**A deploy that fails** says why it stopped. A refusal (an empty setting, a
+key for another component, an image it could not pull) names the cause and
+changes nothing. A release that never becomes healthy is rolled back, and the
+failure prints the command that shows why, to run on the server:
+
+```bash
+sudo docker compose -p shop logs --tail=80 api
+```
+
+The most common first-deploy cause is a setting the application refuses at boot:
+the log names it. Fix it with `katap env shop api`, then re-run the workflow.
+Each refusal and failure is in [Troubleshooting](troubleshooting.md).
 
 ## Replacing a deploy key
 

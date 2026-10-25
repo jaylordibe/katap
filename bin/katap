@@ -1068,6 +1068,14 @@ rollout() {
     smoke "$project" "$component"
 }
 
+# The command that shows why a release never became healthy: its services' own
+# logs, which name the cause (a setting the application refuses, a crash). Printed,
+# never run: an application's log can hold secrets, and this output reaches the
+# deploy job's log, which anyone who can read the repository can read.
+why_command() {
+    echo "sudo docker compose -p $1 logs --tail=80 $(conf_get "$1" "$2" rollout)"
+}
+
 # One lock per project, held by deploy, rollback, restore, backup and cron, so none
 # of them ever runs against a project another one is changing.
 lock_project() {
@@ -1247,11 +1255,11 @@ release() {
             log "the new release is not healthy; rolling back to the release before it."
             echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) failed $component $(tr '\n' ' ' <<<"$lines")" >> "$state/history"
             rollout "$project" "$component" "$current" \
-                || die "$mode of '$project/$component' failed, and so did putting the release before it back: the component may be down. Its logs: sudo docker compose -p $project logs $component."
-            die "$mode of '$project/$component' failed and was rolled back."
+                || die "$mode of '$project/$component' failed, and so did putting the release before it back: the component may be down. See why on the server: $(why_command "$project" "$component")"
+            die "$mode of '$project/$component' failed and was rolled back. See why on the server: $(why_command "$project" "$component")"
         fi
         echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) failed $component $(tr '\n' ' ' <<<"$lines")" >> "$state/history"
-        die "$mode of '$project/$component' failed; there is no earlier release to roll back to."
+        die "$mode of '$project/$component' failed; there is no earlier release to roll back to. See why on the server: $(why_command "$project" "$component")"
     fi
 
     mv "$candidate" "$current"
