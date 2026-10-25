@@ -112,7 +112,7 @@ variables of step 3, and the image the `publish` job pushed, by digest.
   katap run shop api-artisan passport:client --personal --name='API Personal Access Client' --provider=users --no-interaction
   ```
   Never run `db:seed` or `UserSeeder` in production: it creates test users with a published password.
-- **nestjs-api:** for a component named `api`, `katap run shop api-migrate yarn prisma:seed` creates the admin from `SEED_ADMIN_*`.
+- **nestjs-api:** for a component named `api`, `katap run shop api-migrate yarn prisma:seed` creates the admin from `SEED_ADMIN_*` and an ordinary account from `SEED_USER_*`. Running it again leaves both as they are.
 
 ## Replacing a deploy key
 

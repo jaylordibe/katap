@@ -136,10 +136,10 @@ check "every link and anchor in README.md and docs/ resolves, and every docs ref
 # a `.required()` with no condition) is one the template generates or marks
 # required: a key missing here means a nestjs-api that never starts.
 if [ -f "$REPO/../nestjs-api/src/config/env.validation.ts" ]; then
-    check "the nestjs-api template provides every setting nestjs-api always requires" \
-        python3 "$REPO/tests/check_nestjs_settings.py" "$REPO/../nestjs-api/src/config/env.validation.ts" "$REPO/templates/nestjs-api.env.spec"
+    check "the nestjs-api template provides every setting nestjs-api always requires, its seeder's included" \
+        python3 "$REPO/tests/check_nestjs_settings.py" "$REPO/../nestjs-api/src/config/env.validation.ts" "$REPO/templates/nestjs-api.env.spec" "$REPO/../nestjs-api/prisma/seed.ts"
 else
-    not_ok "the nestjs-api template provides every setting nestjs-api always requires" "no nestjs-api checkout beside this one"
+    not_ok "the nestjs-api template provides every setting nestjs-api always requires, its seeder's included" "no nestjs-api checkout beside this one"
 fi
 check "laravel-api and nestjs-api never mention Katap (they publish images; how they are deployed is not theirs)" \
     bash -c "for r in laravel-api nestjs-api; do [ ! -d '$REPO/../'\$r ] || ! grep -rIil katap '$REPO/../'\$r --exclude-dir=.git --exclude-dir=node_modules --exclude-dir=vendor || exit 1; done"
