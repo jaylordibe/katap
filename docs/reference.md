@@ -120,9 +120,9 @@ A build argument ends up in the image, so never pass a secret this way.
 
 - **One A record per domain**, pointing at the server's IPv4 address. `katap apply` prints the list. Every name a component serves must be in its `domains` in `katap.json`.
 - **No AAAA records.** The edge listens on IPv4 only, so IPv6 visitors would fail.
-- **`www`:** either its own A record, or a CNAME such as `www.example.com → example.com`. A CNAME only points DNS somewhere; it's not an HTTP redirect. The server must still serve `www`, which needs one of these:
-  - list `www.example.com` in the component's `domains`, so it's served directly with its own certificate;
-  - or list only one name there and add a redirect block for the other to `site.caddy`. The `spa` template's site block shows one.
+- **`www`:** either its own A record, or a CNAME such as `www.example.com → example.com`. A CNAME only points DNS somewhere; it's not an HTTP redirect. List both names in the component's `domains`, then either:
+  - serve both from its block in `site.caddy`, as generated; both answer the same pages;
+  - or pick one as canonical: list it first in `domains`, serve only it from the proxying block, and give the other a block that redirects to it. The `spa` template's site block shows one. Point the deploy's `url` at the canonical name: the smoke check follows no redirects.
 
 **Check:** `dig +short A example.com` prints `203.0.113.10` for a DNS-only record.
 A Cloudflare-proxied record prints Cloudflare's addresses instead.

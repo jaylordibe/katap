@@ -5,7 +5,7 @@ __DOMAINS__ {
 }
 
 # A canonical-host redirect, if the SPA declares www as canonical (sitemap, og:url):
-# list only www above, and add
+# keep www first in katap.json's domains, list only www above, and add
 #
 # example.com {
 # 	import katap_site

@@ -136,7 +136,7 @@ For a component that ran, in this order:
 (mode 0600, owned by `deploy`), from its template's `templates/<type>.env.spec`:
 
 - **Generated** values are made once on the server: keys, database and Redis passwords, Passport keys and so on. Never change them on a running application: a new `APP_KEY` or database password breaks existing data and logins.
-- **Derived** values come from `katap.json`: `APP_URL` from the first domain, and the frontend URL and CORS origins from the project's single `spa` or `node-ssr` component with domains.
+- **Derived** values come from `katap.json`: `APP_URL` from the first domain, and from the project's single `spa` or `node-ssr` component with domains, the frontend URL (its first domain) and the CORS origins (all of them). List a site's canonical name first: an API builds its emailed links from the frontend URL.
 - **Yours to supply** are left empty under a `# katap:required` marker, and a deploy is refused while any of them is empty.
 
 | Template | Required values you supply | Where accepted values are documented |
